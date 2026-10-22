@@ -1,0 +1,22 @@
+[project]
+name = "cupdraw-backend"
+version = "0.1.0"
+description = "霸王茶姬杯贴自动绘制助手 - 本地 Web 后端"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.159.1",
+    "uvicorn==0.54.0",
+    "pydantic==2.14.1",
+    "MaaFw==5.14.3",
+    "numpy==1.26.4",
+    "opencv-python==4.11.0.86",
+    "Pillow>=10,<12",
+    "python-multipart==0.0.20",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx==0.28.1"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
