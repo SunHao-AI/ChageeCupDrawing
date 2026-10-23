@@ -117,3 +117,14 @@ def image_rect_to_screen(
         w=local.w,
         h=local.h,
     )
+
+
+def image_point_to_screen(
+    x: float, y: float, image_w: int, image_h: int, client: ClientArea
+) -> tuple[float, float]:
+    """截图图像坐标的点换算到屏幕坐标（浮点，不取整）。"""
+    if image_w <= 0 or image_h <= 0:
+        raise ValueError("截图尺寸必须为正数")
+    sx = client.width / image_w
+    sy = client.height / image_h
+    return x * sx + client.origin_x, y * sy + client.origin_y

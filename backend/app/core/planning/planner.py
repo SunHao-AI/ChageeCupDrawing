@@ -13,9 +13,11 @@ from PIL import Image
 
 from app.core.imaging.binarize import process_image_hq
 from app.core.pathing.geometry import binary_to_mask, nearest_order_paths, path_length, scale_paths
+from app.core.pathing.hatch import compute_background, tone_area, tone_contour_paths, tone_field
 from app.core.pathing.render import render_paths
 from app.core.pathing.strategies import (
     STRATEGY_TOPOLOGY,
+    STRATEGY_TONE,
     StrategyContext,
     build_paths,
     normalize_strategy,
@@ -64,6 +66,7 @@ def build_drawing_plan(
     topology_rescue: bool = True,
     target_recall: float = 0.985,
     threshold_mode: bool = False,
+    hatch_levels: int = 10,
 ) -> DrawingPlan:
     # User's calibration sample is ~3 px wide on a ~560 px cup canvas, so v5 uses
     # 3 px as the default rather than v4's 7 px assumption.
@@ -72,20 +75,38 @@ def build_drawing_plan(
     inner_w = max(24, int(canvas_w) - margin * 2)
     inner_h = max(36, int(canvas_h) - margin * 2)
 
-    binary_inner, work_mask, ss = process_image_hq(
+    strategy_key = normalize_strategy(strategy)
+    need_gray = strategy_key == STRATEGY_TONE
+
+    result = process_image_hq(
         original, inner_w, inner_h, image_mode, threshold, contrast, fit_mode,
         line_expand, supersample, detail_keep, auto_trim, threshold_mode,
+        return_work_gray=need_gray,
     )
+    if need_gray:
+        binary_inner, work_mask, ss, work_gray = result  # type: ignore[misc]
+    else:
+        binary_inner, work_mask, ss = result  # type: ignore[misc]
+        work_gray = None
+
     ctx = StrategyContext(
         brush_width_work=float(bw * ss),
         simplify_px_work=max(0.10, float(simplify_px) * ss),
         fill_density=fill_density,
         thin_finish=thin_finish,
     )
-    strategy_key = normalize_strategy(strategy)
 
-    local_work = [p for p in build_paths(strategy_key, work_mask, ctx) if p]
-    local_paths = scale_paths(local_work, 1.0 / ss, margin, margin)
+    if strategy_key == STRATEGY_TONE and work_gray is not None:
+        # 照片素描直接消费灰度：掩膜策略会把中间调烧成实心碎线，灰度信息
+        # 必须保留给等值线分层。二值掩膜此时只作为合成预览的底图。
+        levels = max(6, min(24, int(hatch_levels)))
+        bg = compute_background(work_gray)
+        tone = tone_area(tone_field(work_gray, levels, background=bg), levels, background=bg)
+        local_work = tone_contour_paths(tone, ctx.simplify_px_work, background=bg)
+    else:
+        local_work = build_paths(strategy_key, work_mask, ctx)
+    local_paths = [p for p in local_work if p]
+    local_paths = scale_paths(local_paths, 1.0 / ss, margin, margin)
 
     # Return both the conversion target and the simulated real-brush result at the
     # exact same canvas size so the user can compare detail loss directly.

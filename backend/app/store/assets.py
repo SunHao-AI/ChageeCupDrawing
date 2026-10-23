@@ -43,7 +43,7 @@ def save_source_image(tmp_path: Path, project_dir: Path) -> SavedImage:
                     f"图像长边 {max(width, height)} px 超过上限 {MAX_IMAGE_LONG_SIDE} px"
                 )
             ext = SUPPORTED_FORMATS[fmt]
-            target = project_dir / f"source.{ext}"
+            target = project_dir / f"source_v1.{ext}"
             if fmt == "JPEG":
                 img.convert("RGB").save(target, format="JPEG", quality=95)
             else:

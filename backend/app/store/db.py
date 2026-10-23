@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS project (
     image_path TEXT NOT NULL,
     image_width INTEGER NOT NULL,
     image_height INTEGER NOT NULL,
+    source_version INTEGER NOT NULL DEFAULT 1,
+    parent_version INTEGER,
     created_at TEXT NOT NULL
 );
 
@@ -77,7 +79,32 @@ CREATE TABLE IF NOT EXISTS preset (
     params TEXT NOT NULL,
     builtin INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS edit_draft (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    base_version INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    instruction TEXT NOT NULL,
+    roi_json TEXT,
+    provider TEXT NOT NULL,
+    draft_path TEXT NOT NULL,
+    diff_path TEXT,
+    created_at TEXT NOT NULL,
+    applied_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_edit_project
+    ON edit_draft(project_id, created_at DESC);
 """
+
+# 旧库升级用：SCHEMA 里的 CREATE TABLE IF NOT EXISTS 不会给已存在的表补列。
+_COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
+    "project": [
+        ("source_version", "INTEGER NOT NULL DEFAULT 1"),
+        ("parent_version", "INTEGER"),
+    ],
+}
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -87,12 +114,23 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_columns(conn: sqlite3.Connection) -> None:
+    for table, columns in _COLUMN_MIGRATIONS.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            continue
+        for name, ddl in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
 def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = connect(db_path)
     try:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        _migrate_columns(conn)
         conn.commit()
     finally:
         conn.close()

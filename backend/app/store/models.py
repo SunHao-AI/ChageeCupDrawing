@@ -22,6 +22,8 @@ class Project:
     image_width: int
     image_height: int
     created_at: str
+    source_version: int = 1
+    parent_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -60,3 +62,40 @@ class Preset:
     name: str
     params: dict
     builtin: bool
+
+
+@dataclass(frozen=True)
+class EditDraft:
+    id: str
+    project_id: str
+    base_version: int
+    channel: str
+    instruction: str
+    roi: dict | None
+    provider: str
+    draft_path: str
+    diff_path: str | None
+    created_at: str
+    applied_at: str | None
+
+
+@dataclass(frozen=True)
+class TaskRecord:
+    id: str
+    plan_id: str
+    exec_params: dict
+    status: str
+    cursor_path: int
+    stop_reason: str | None
+    error_code: str | None
+    started_at: str | None
+    finished_at: str | None
+
+
+@dataclass(frozen=True)
+class TaskEvent:
+    seq: int
+    task_id: str
+    type: str
+    payload: dict
+    ts: str

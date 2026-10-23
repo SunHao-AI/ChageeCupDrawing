@@ -100,13 +100,16 @@ def process_image_hq(
     detail_keep: float,
     auto_trim: bool,
     threshold_mode: bool = False,
-) -> tuple[Image.Image, np.ndarray, int]:
+    return_work_gray: bool = False,
+) -> tuple[Image.Image, np.ndarray, int] | tuple[Image.Image, np.ndarray, int, np.ndarray]:
     """Create a high-resolution ink mask and a target-size preview.
 
     Returns ``(target_binary_pil, work_mask, supersample)`` where work_mask uses
     255=ink and lives at ``target_size * supersample``. All vector planning happens
     at this larger size and coordinates are scaled down only at the end. This is the
-    main v5 anti-alias/detail-preservation change.
+    main v5 anti-alias/detail-preservation change. With ``return_work_gray`` the
+    work-resolution grayscale (after trim/fit/contrast) is appended for tone
+    contour planning.
     """
     ss = max(1, min(4, int(supersample)))
     ww, wh = max(16, int(target_w) * ss), max(24, int(target_h) * ss)
@@ -150,4 +153,6 @@ def process_image_hq(
     target_mask = _resize_mask_to_target(mask, target_w, target_h, keep)
     target_mask = _preserve_micro_components(mask, target_mask, ss)
     target_pil = Image.fromarray(np.where(target_mask > 0, 0, 255).astype(np.uint8), mode="L")
+    if return_work_gray:
+        return target_pil, mask, ss, gray
     return target_pil, mask, ss

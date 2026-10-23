@@ -18,6 +18,7 @@ STRATEGY_CENTERLINE = "centerline"
 STRATEGY_CONTOUR = "contour"
 STRATEGY_HSCAN = "hscan"
 STRATEGY_TOPOLOGY = "topology"
+STRATEGY_TONE = "tone"
 
 _STRATEGY_ALIASES = {
     "centerline": STRATEGY_CENTERLINE,
@@ -34,6 +35,8 @@ _STRATEGY_ALIASES = {
     "拓扑保真填充": STRATEGY_TOPOLOGY,
     "保真填充（推荐）": STRATEGY_TOPOLOGY,
     "保真填充": STRATEGY_TOPOLOGY,
+    "tone": STRATEGY_TONE,
+    "照片素描": STRATEGY_TONE,
 }
 
 

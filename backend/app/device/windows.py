@@ -41,6 +41,12 @@ def window_alive(hwnd: int) -> bool:
     return bool(_user32.IsWindow(ctypes.c_void_p(int(hwnd))))
 
 
+def foreground_hwnd() -> int:
+    _user32.GetForegroundWindow.argtypes = []
+    _user32.GetForegroundWindow.restype = ctypes.c_void_p
+    return _hwnd_value(_user32.GetForegroundWindow())
+
+
 def window_title(hwnd: int) -> str:
     _user32.GetWindowTextW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR, ctypes.c_int]
     _user32.GetWindowTextW.restype = ctypes.c_int

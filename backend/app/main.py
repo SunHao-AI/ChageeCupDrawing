@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -22,6 +23,8 @@ from app.config import (
 )
 from app.device.geometry import make_dpi_aware
 from app.device.service import DeviceService
+from app.executor.service import ExecutorService
+from app.services.editing import EditService
 from app.services.planning import PlanningService
 from app.store.store import Store
 
@@ -33,6 +36,7 @@ def create_app(
     *,
     device: DeviceService | None = None,
     planner: PlanningService | None = None,
+    executor_factory: Callable[[Store, DeviceService], ExecutorService] | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     if settings.session_token is None:
@@ -42,6 +46,7 @@ def create_app(
     store.init()
     planning = planner or PlanningService(settings.plan_timeout_s)
     devices = device or DeviceService()
+    drawing = (executor_factory or ExecutorService)(store, devices)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -56,6 +61,8 @@ def create_app(
     app.state.store = store
     app.state.planner = planning
     app.state.device = devices
+    app.state.executor = drawing
+    app.state.editor = EditService()
     install_error_handlers(app)
 
     @app.middleware("http")

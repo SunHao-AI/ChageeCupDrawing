@@ -75,6 +75,7 @@ async def create_project(
         "imageUrl": f"/api/projects/{project.id}/image",
         "width": project.image_width,
         "height": project.image_height,
+        "sourceVersion": project.source_version,
         "createdAt": project.created_at,
     }
 

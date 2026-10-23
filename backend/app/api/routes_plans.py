@@ -26,6 +26,10 @@ def _summary(record: PlanRecord) -> dict[str, object]:
         "status": "DONE",
         "strategy": record.strategy,
         "metrics": {key: record.metrics.get(key) for key in _METRIC_KEYS},
+        # 墨迹占比：识别「整图被判成墨」这类参数不匹配（如暗调照片 + 全局阈值）。
+        "inkRatio": record.metrics.get("inkRatio"),
+        # 实际生效的超采样倍率（源图分辨率不足时会自动降档）。
+        "workScale": record.metrics.get("workScale"),
         "targetSize": {"w": record.target_w, "h": record.target_h},
         "assets": {
             kind: f"/api/plans/{record.id}/assets/{kind}" for kind in ASSET_FILES

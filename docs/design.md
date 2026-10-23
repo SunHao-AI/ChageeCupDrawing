@@ -420,6 +420,11 @@ V6 把这套逻辑写在 `build_drawing_plan` 内部并直接返回 dataclass，
 | `E_NOT_IMPLEMENTED` | 501 | 预留能力未接入 |
 | `E_EXECUTOR_UNAVAILABLE` | 503 | 执行器线程异常退出 |
 | `E_PLAN_TIMEOUT` | 504 | 规划超时 |
+| `E_EDIT_NOT_UNDERSTOOD` | 422 | 编辑指令无法解析为结构化操作 |
+| `E_EDIT_INK_OUT_OF_RANGE` | 422 | 应用编辑草稿后墨量占比超出安全范围（<1% 或 >40%） |
+| `E_VERSION_STALE` | 409 | 编辑请求/应用基于过期的源图版本 |
+| `E_EDIT_APPLIED` | 409 | 编辑草稿已被应用，不可重复生效 |
+| `E_CONSENT_REQUIRED` | 403 | 未授权云端编辑即指定云端 provider（预留，随云端 provider 接入） |
 
 错误响应统一为 `{ errorCode, message, detail? }`，`message` 为可直接展示给用户的中文短句。
 
