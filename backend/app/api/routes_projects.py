@@ -158,6 +158,8 @@ def calibrate(project_id: str, payload: CalibrationRequest, request: Request) ->
         slider=payload.slider.model_dump() if payload.slider else None,
         undo=payload.undo.model_dump() if payload.undo else None,
         fold=payload.fold.model_dump() if payload.fold else None,
+        tools_open=payload.tools_open,
+        tools_collapsed=payload.tools_collapsed,
         device_kind=payload.device_kind,
         device_serial=payload.device_serial,
     )
@@ -175,4 +177,6 @@ def calibrate(project_id: str, payload: CalibrationRequest, request: Request) ->
         "slider": profile.slider,
         "undo": profile.undo,
         "fold": profile.fold,
+        "toolsOpen": profile.tools_open,
+        "toolsCollapsed": profile.tools_collapsed,
     }

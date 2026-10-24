@@ -70,6 +70,10 @@ class CalibrationRequest(CamelModel):
     undo: PointModel | None = None
     # 画板下方工具面板折叠按钮中心点：换笔间隙自动收起面板，让画布完整可见。
     fold: PointModel | None = None
+    # 面板展开/折叠两态工具位图（ToolbarProber 探测产物）：结构由 executor 保证，
+    # API 层不强校验、原样透传入库。
+    tools_open: dict | None = None
+    tools_collapsed: dict | None = None
 
 
 class PlanRequest(CamelModel):

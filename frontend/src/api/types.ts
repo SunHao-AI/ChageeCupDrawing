@@ -105,6 +105,9 @@ export interface Calibration {
   slider?: Rect | null
   undo?: { x: number; y: number } | null
   fold?: { x: number; y: number } | null
+  /** 面板展开/折叠两态工具位图（探测产物，结构由后端 executor 保证，原样透传）。 */
+  toolsOpen?: Record<string, unknown> | null
+  toolsCollapsed?: Record<string, unknown> | null
   /** 绘制目标类型与来源设备（mirror 时为手机序列号）。 */
   deviceKind?: DeviceKind
   deviceSerial?: string | null

@@ -523,3 +523,37 @@ def test_lineart_placeholder(client: TestClient) -> None:
     response = client.post("/api/lineart/generate", json={}, headers=WRITE_HEADERS)
     assert response.status_code == 501
     assert response.json()["errorCode"] == "E_NOT_IMPLEMENTED"
+
+
+# ---------- 双态工具位图透传（逐段笔宽 Task 2） ----------
+
+
+def test_calibration_accepts_tools_bitmaps(client: TestClient) -> None:
+    project = _upload(client)
+    tools_open = {"brush": {"x": 10, "y": 500}, "brushSelectedLum": 180.0}
+    response = client.post(
+        f"/api/projects/{project['projectId']}/calibration",
+        json={
+            "hwnd": GOOD_HWND,
+            "mode": "auto",
+            "toolsOpen": tools_open,
+            "toolsCollapsed": None,
+        },
+        headers=WRITE_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["toolsOpen"] == tools_open
+    assert body["toolsCollapsed"] is None
+
+    profile = client.app.state.store.latest_calibration(project["projectId"])
+    assert profile.tools_open == tools_open
+    assert profile.tools_collapsed is None
+
+
+def test_calibration_without_tools_bitmaps_returns_none(client: TestClient) -> None:
+    """旧前端不带新字段：照常保存，响应回 None（旧校准记录兼容）。"""
+    project = _upload(client)
+    body = _calibrate(client, project["projectId"])
+    assert body["toolsOpen"] is None
+    assert body["toolsCollapsed"] is None
