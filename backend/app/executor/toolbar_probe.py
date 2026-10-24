@@ -44,6 +44,11 @@ class ToolBitmap:
 
     人工兜底时，非 None 的字段优先于自动探测结果；只有缺失的亮度项才会被
     指纹流程重算，已给的亮度值始终保留。
+
+    亮度指纹只有「brush_selected_lum 与 brush_idle_lum 两个值都存在」时才算
+    完整指纹，才能参与选中态阈值比较；仅一侧有值时是部分指纹（例如人工只给
+    了 selected、计算出的 idle 因亮度差不足被置 None），只能用于控件坐标，
+    不得把 None 代入 (selected + idle) / 2 之类的亮度判定。
     """
 
     brush: tuple[float, float] | None
@@ -86,9 +91,12 @@ class ToolbarProber:
         self._canvas: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._band: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._candidates: list[tuple[int, int]] = []
-        # 探测开始前刻度带已有墨量（用户画布本有墨时，清理目标应回到该基线）。
-        self._band_baseline = 0.0
-        self._probe_drew = False
+        # 探测前的刻度带墨像素数：清理只需回到这个深度，绝不越过它去撤用户笔画。
+        self._band_baseline_px = 0
+        # 探测自己画出且真正改变像素的笔数（与撤销历史一一对应），以及已消耗的撤销次数。
+        self._probe_strokes = 0
+        self._probe_undos = 0
+        self._draw_seq = 0
 
     # ---------- 对外主流程 ----------
 
@@ -121,8 +129,10 @@ class ToolbarProber:
         check_stop()
         first_image = self._grab()
         self._candidates = self._make_candidates(first_image.shape)
-        self._band_baseline = ink_occupied_fraction(first_image, self._band)
-        self._probe_drew = False
+        self._band_baseline_px = self._band_ink_pixels(first_image)
+        self._probe_strokes = 0
+        self._probe_undos = 0
+        self._draw_seq = 0
 
         if fold is None:
             skip = self._skip_points(slider=slider, undo=undo, eraser=eraser, brush=brush)
@@ -424,6 +434,8 @@ class ToolbarProber:
             self._sleep(self._settle_s)
             occupied = self._band_occupied()
             if occupied < baseline * self.UNDO_DROP_RATIO:
+                # 这一击已消耗掉一笔探测笔迹，清理时不再重复撤销。
+                self._probe_undos += 1
                 return (float(point[0]), float(point[1]))
             if occupied < baseline * 0.9:
                 # 线被部分擦掉或意外消失：_ensure_drawing_tool 会切回绘制工具并
@@ -437,19 +449,30 @@ class ToolbarProber:
         self, skip: set[tuple[int, int]], check_stop: Callable[[], None]
     ) -> bool:
         """当前若非画笔态（试画无墨），扫描候选直到切到能落墨的工具。"""
-        self._draw_band_line()
-        if self._band_has_ink():
+        if self._draw_band_line():
             return True
         for point in self._candidates:
             if point in skip:
                 continue
             check_stop()
+            before = self._band_ink_pixels()
             self._click(*point)
             self._sleep(self._settle_s)
-            self._draw_band_line()
-            if self._band_has_ink():
+            self._note_undo_like_drop(before)
+            if self._draw_band_line():
                 return True
         return False
+
+    def _note_undo_like_drop(self, before: int) -> None:
+        """候选点击若把带内墨量砍掉大半，说明它其实消耗了一笔探测笔迹。
+
+        撤销按钮在探测早期尚未识别时可能被当作普通候选点到；漏记会让清理
+        阶段的预算多出一笔，从而吃掉用户早先的画。
+        """
+        if before <= 0:
+            return
+        if self._band_ink_pixels() < before * self.UNDO_DROP_RATIO:
+            self._probe_undos += 1
 
     # ---------- 4) 橡皮 / 画笔 ----------
 
@@ -470,8 +493,7 @@ class ToolbarProber:
         skip = self._skip_points(
             fold=fold, slider=slider, undo=undo, eraser=eraser, brush=brush
         )
-        self._draw_band_line()
-        has_ink = self._band_has_ink()
+        has_ink = self._draw_band_line()
         found_eraser: tuple[float, float] | None = None
         found_brush: tuple[float, float] | None = None
         if has_ink:
@@ -497,8 +519,10 @@ class ToolbarProber:
             if point in skip:
                 continue
             check_stop()
+            before = self._band_ink_pixels()
             self._click(*point)
             self._sleep(self._settle_s)
+            self._note_undo_like_drop(before)
             self._draw_band_line()
             if self._band_has_ink() == want_ink:
                 return (float(point[0]), float(point[1]))
@@ -558,13 +582,32 @@ class ToolbarProber:
 
     # ---------- 刻度带 ----------
 
-    def _draw_band_line(self) -> None:
+    def _draw_band_line(self) -> bool:
+        """在刻度带固定位置画一条测试线；返回该笔是否新增了墨。
+
+        落笔位置必须固定：橡皮判定依赖「重描后整条线消失」。只在像素确实
+        改变时计入探测笔数——没改变像素的试画（橡皮划过空白）不会留下撤销
+        历史，也不该在清理阶段多撤一次。
+        """
         bx = self._band[0] + 8
         by = self._band[1] + self._band[3] // 2
+        before = self._band_ink_pixels()
         self._ensure_foreground()
-        self._probe_drew = True
         self._stroke((bx, by), (bx + self.BAND_LINE_LEN, by))
         self._sleep(0.12)
+        after = self._band_ink_pixels()
+        if after != before:
+            self._probe_strokes += 1
+        return after > before
+
+    def _band_ink_pixels(self, image=None) -> int:
+        gray = self._grab() if image is None else image
+        gray = gray[..., 0] if gray.ndim == 3 else gray
+        x0, y0, w, h = self._band
+        region = gray[y0 : y0 + h, x0 : x0 + w]
+        if region.size == 0:
+            return 0
+        return int((region < self.INK_THRESHOLD).sum())
 
     def _band_occupied(self) -> float:
         return ink_occupied_fraction(self._grab(), self._band)
@@ -580,45 +623,33 @@ class ToolbarProber:
     def _clear_probe_ink(
         self, undo: tuple[float, float] | None, check_stop: Callable[[], None]
     ) -> None:
-        """撤销探测期间画在刻度带里的测试笔迹，避免污染后续笔宽标定。
+        """只撤销探测自己画出的笔数，撤到探测前的撤销历史深度为止。
 
-        重叠笔迹会让「撤一次」后画面回到墨状态（下方还有更早的笔迹），所以
-        仅看到刻度带变空还不够：在探测前刻度带本来就干净时，继续撤销直到
-        连续两次点击不再改变墨量，才算把探测历史清空。探测前有用户墨迹时
-        只撤回到原基线，避免吃掉用户自己的撤销历史。
+        预算式清理：精确点击「已落笔数 - 已消耗撤销数」次，绝不要求「带空后
+        再多点两次」，否则会越过探测起点、弹出用户早先画在画布别处的真实笔画。
+        撤销历史里混有探测自己的橡皮笔迹，撤到它们时带内墨量会回升，不能用
+        「单调下降」判据，只看最终刻度带是否回到基线墨量。
         """
-        if not self._probe_drew:
+        if self._probe_strokes <= 0:
             return
-        threshold = self._band_baseline + self._band_eps()
-        clean_before = self._band_baseline <= self._band_eps()
-        occupied = self._band_occupied()
-        if occupied <= threshold and not clean_before:
-            return
+        tolerance = self._band_baseline_px + int(self._band_eps() * 0.5 + 1)
         if undo is None:
+            if self._band_ink_pixels() <= tolerance:
+                return
             raise ProbeError(
                 "E_PROBE_UNCLEANED",
                 "探测笔迹无法清理（未识别撤销按钮），请人工清空刻度带或补标撤销",
             )
-        limit = max(32, 3 * len(self._candidates) + 8)
-        stable = 0
-        for _ in range(limit):
+        remaining = max(0, self._probe_strokes - self._probe_undos)
+        for _ in range(remaining):
             check_stop()
+            self._probe_undos += 1
             self._click(float(undo[0]), float(undo[1]))
             self._sleep(0.22)
-            after = self._band_occupied()
-            if not clean_before:
-                if after <= threshold:
-                    return
-            elif abs(after - occupied) <= self._band_eps() and after <= threshold:
-                stable += 1
-                if stable >= 2:
-                    return
-            else:
-                stable = 0
-            occupied = after
-        raise ProbeError(
-            "E_PROBE_UNCLEANED", "探测笔迹未能撤销干净（撤销点击无效或笔迹过多）"
-        )
+        if self._band_ink_pixels() > tolerance:
+            raise ProbeError(
+                "E_PROBE_UNCLEANED", "探测笔迹未能撤销干净（撤销点击无效或笔迹过多）"
+            )
 
     # ---------- 底层动作（可由子类替换以便测试） ----------
 

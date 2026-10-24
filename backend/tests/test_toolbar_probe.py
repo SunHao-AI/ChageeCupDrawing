@@ -9,7 +9,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from app.executor.ink_measure import ink_occupied_fraction
 from app.executor.toolbar_probe import ProbeError, ToolBitmap, ToolbarProber
 
 CANVAS = (40, 60, 300, 360)
@@ -147,16 +146,43 @@ class NoUndoBoard(ToolbarBoard):
 
 
 class SuppressingBoard(ToolbarBoard):
-    """(42,512) 点击会擦掉刻度带右半并切到橡皮，用于验证撤销探测的补描恢复。"""
+    """(42,512) 点击会切到橡皮并擦掉刻度带内约一半的现有墨迹。
+
+    擦除量刻意落在「部分丢失」区间（基线 40%~90% 之间），以触发撤销探测的
+    补描分支；擦除区域取自当前实际着墨列，确保与测试线真正重叠。
+    """
 
     SUPPRESS = (42, 512)
+    BAND_RECT = (46, 70, 200, 40)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.suppress_hits = 0
+        self.post_suppress_ink: list[int] = []
+
+    def _erase_half_band(self) -> None:
+        x0, y0, w, h = self.BAND_RECT
+        region = self.canvas_pixels[y0 : y0 + h, x0 : x0 + w]
+        dark_cols = np.flatnonzero((region < 160).any(axis=0))
+        if dark_cols.size == 0:
+            return
+        cut = int(dark_cols[dark_cols.size // 2])
+        region[:, cut + 1 :] = 255
 
     def handle_click(self, x: float, y: float) -> None:
         if abs(x - self.SUPPRESS[0]) <= 2 and abs(y - self.SUPPRESS[1]) <= 2:
+            self.suppress_hits += 1
             self.tool = "eraser"
-            self.canvas_pixels[70:110, 146:246] = 255
+            self._erase_half_band()
             return
         super().handle_click(x, y)
+
+    def apply_stroke(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        super().apply_stroke(x0, y0, x1, y1)
+        if self.suppress_hits:
+            x0b, y0b, wb, hb = self.BAND_RECT
+            region = self.canvas_pixels[y0b : y0b + hb, x0b : x0b + wb]
+            self.post_suppress_ink.append(int((region < 160).sum()))
 
 
 class EmptyBoard(ToolbarBoard):
@@ -396,6 +422,41 @@ def test_probe_cleans_band_and_stroke_history():
     assert board.tool == "brush"
 
 
+def test_probe_cleanup_keeps_user_strokes():
+    board = ToolbarBoard()
+    # 用户先画两笔（画布别处），刻度带仍干净。撤销按钮由人工给定，
+    # 以隔离「清理阶段预算」这条路径：折叠扫描不会盲点撤销消耗用户历史。
+    board.canvas_pixels[200:203, 100:160] = 0
+    board.strokes.append([(200, 203, 100, 160, np.full((3, 60), 255, dtype=np.uint8))])
+    board.canvas_pixels[300:303, 150:210] = 0
+    board.strokes.append([(300, 303, 150, 210, np.full((3, 60), 255, dtype=np.uint8))])
+    user_strokes = list(board.strokes)
+    assert board.band_ink() == 0.0
+
+    result = _run(board, open_bitmap=_manual(undo=(130, 515)))
+    assert result.brush is not None
+    assert result.undo == (130.0, 515.0)
+    # 探测只撤自己的笔迹：用户两笔必须完整留在撤销历史里。
+    assert board.strokes == user_strokes
+    assert board.band_ink() == 0.0
+    assert board.canvas_pixels[200:203, 100:160].max() == 0
+    assert board.canvas_pixels[300:303, 150:210].max() == 0
+
+
+def test_probe_cleanup_restores_band_baseline():
+    board = ToolbarBoard()
+    # 探测前刻度带里已有一笔用户墨迹（基线墨），撤销按钮人工给定。
+    board.canvas_pixels[88:93, 54:100] = 0
+    baseline_ink = board.band_ink()
+    assert baseline_ink > 0
+
+    result = _run(board, open_bitmap=_manual(undo=(130, 515)))
+    assert result.brush is not None
+    # 清理只撤探测自己新增的笔迹，带内墨量回到探测前基线。
+    assert abs(board.band_ink() - baseline_ink) < 1e-9
+    assert board.strokes == []
+
+
 def test_probe_keeps_manual_lum_and_only_nulls_computed():
     # 人工 selected 与自动 idle 差不足：只把计算所得 idle 置 None，保留人工值。
     board = ToolbarBoard()
@@ -430,8 +491,17 @@ def test_probe_ends_with_brush_when_lums_manual():
 def test_probe_restores_drawing_tool_before_supplement():
     board = SuppressingBoard()
     result = _run(board)
+    # 干扰点确实擦掉了测试线的一部分（基线 40%~90%），补描分支才会被触发。
+    assert board.suppress_hits >= 1
+    # 补描发生前工具仍是橡皮，补描后必须重新落墨：带内墨量回升。
+    assert board.post_suppress_ink
+    assert max(board.post_suppress_ink) > 0
+    # 补描后继续扫描，撤销按钮仍能被正确判定，且最终笔迹清理干净。
     assert result.undo is not None
     assert _inside(ToolbarBoard.UNDO, result.undo)
+    assert board.undos >= 1
+    assert board.band_ink() == 0.0
+    assert board.strokes == []
 
 
 def test_probe_rejects_manual_point_inside_canvas():
