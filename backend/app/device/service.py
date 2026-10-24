@@ -8,7 +8,14 @@ from app.device.geometry import (
     get_client_area,
     window_dpi_scale,
 )
-from app.device.windows import WindowInfo, foreground_hwnd, list_windows, window_alive, window_title
+from app.device.windows import (
+    WindowInfo,
+    activate_window,
+    foreground_hwnd,
+    list_windows,
+    window_alive,
+    window_title,
+)
 
 __all__ = [
     "CaptureError",
@@ -30,6 +37,9 @@ class DeviceService:
 
     def foreground(self) -> int:
         return foreground_hwnd()
+
+    def activate(self, hwnd: int) -> bool:
+        return activate_window(hwnd)
 
     def title(self, hwnd: int) -> str:
         return window_title(hwnd)

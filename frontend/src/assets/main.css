@@ -278,3 +278,95 @@ input[type="range"] {
   background: var(--ink-3);
   border-radius: 4px;
 }
+
+/* ---- 布局：侧栏 + 主区两栏，窄屏（<1024px）自动堆叠为单列 ----
+   各视图用 --split-side 指定侧栏宽度，避免每页重复写断点。 */
+.split {
+  display: grid;
+  grid-template-columns: var(--split-side, 320px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 1023px) {
+  .split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---- 可读性 + 防 iOS 聚焦放大 ----
+   不能用 (pointer: coarse) 单独判定：iPadOS Safari 默认「桌面级浏览」会把指针
+   伪装成 fine/hover（Apple WWDC19），整块会被跳过。iPad 全系最大视口是
+   iPad Pro 13″ 横屏 1376×1032pt（Apple HIG），故用 1376px 兜底，与 coarse
+   取或即可同时命中手机与真机 iPad 的横竖屏。 */
+@media (pointer: coarse), (max-width: 1376px) {
+  /* iOS/iPadOS Safari 对 font-size < 16px 的可编辑控件聚焦时会自动放大整页，
+     且失焦后不复位——所有输入类控件在触摸设备上必须 ≥16px。 */
+  input,
+  select,
+  textarea,
+  .select,
+  .input,
+  .instruction {
+    font-size: 16px;
+  }
+
+  /* 触屏视距更远，12px 以下的说明文字在小屏上难以阅读，统一提一档 */
+  body {
+    font-size: 15px;
+  }
+
+  .card-title,
+  .field-label,
+  .btn-sm,
+  .banner {
+    font-size: 13px;
+  }
+
+  .badge {
+    font-size: 12px;
+  }
+}
+
+/* ---- 触摸人体工学：可点目标加大到可稳定按住的尺寸 ----
+   同样并上 1376px：真机 iPad 用拇指操作，却在桌面级浏览下报告 fine/hover，
+   单靠 coarse 会漏掉它。窄桌面窗口命中只会让控件略大，无害。 */
+@media (pointer: coarse), (max-width: 1376px) {
+  .btn {
+    min-height: 40px;
+    padding: 10px 16px;
+  }
+
+  .btn-sm {
+    min-height: 36px;
+    padding: 8px 12px;
+  }
+
+  .tab {
+    padding: 10px 14px;
+  }
+
+  .segmented button {
+    padding: 10px 14px;
+  }
+
+  .switch input {
+    width: 44px;
+    height: 24px;
+    border-radius: 12px;
+  }
+
+  .switch input::after {
+    width: 18px;
+    height: 18px;
+  }
+
+  .switch input:checked::after {
+    transform: translateX(20px);
+  }
+
+  /* 滑杆把手由 UA 渲染，accent-color 之外再加高度让轨道更好按 */
+  input[type="range"] {
+    height: 32px;
+  }
+}

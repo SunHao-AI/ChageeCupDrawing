@@ -1,19 +1,26 @@
 import { get, post, postForm, request } from './client'
 import type {
+  AiProbeRequest,
+  AiSettingsInfo,
+  AiSettingsUpdate,
+  AiTestResult,
   Calibration,
+  DeviceList,
   EditApplyResult,
   EditDraft,
   EditProviderInfo,
   ExecParams,
+  MirrorStatus,
   PlanDetail,
   PlanParams,
   PlanSummary,
   Preset,
   Project,
   Rect,
+  RevertResult,
+  SourceVersion,
   TaskCreated,
   TaskSnapshot,
-  WindowInfo,
 } from './types'
 
 export interface CalibrationPayload {
@@ -21,6 +28,11 @@ export interface CalibrationPayload {
   mode: 'auto' | 'manual'
   rect?: Rect
   captureMethod?: 'maa' | 'win32'
+  deviceKind?: 'pc' | 'mirror'
+  deviceSerial?: string
+  slider?: Rect
+  undo?: { x: number; y: number }
+  fold?: { x: number; y: number }
 }
 
 export interface TaskCreatePayload {
@@ -31,7 +43,16 @@ export interface TaskCreatePayload {
 
 export const health = () => get<{ status: string; version: string }>('/health')
 
-export const listWindows = () => get<WindowInfo[]>('/windows')
+/** 设备与投屏目标：PC 窗口 + 已授权安卓设备 + 当前镜像状态。 */
+export const listDevices = () => get<DeviceList>('/devices')
+
+export const startMirror = (serial: string) =>
+  post<MirrorStatus>('/devices/mirror', { serial })
+
+export const registerMirror = (hwnd: number, serial: string, label = '') =>
+  post<MirrorStatus>('/devices/mirror/register', { hwnd, serial, label })
+
+export const stopMirror = () => request<MirrorStatus>('/devices/mirror', { method: 'DELETE' })
 
 /** 手动校准参考截图的直接地址（作为 <img src>）。 */
 export const windowCaptureUrl = (hwnd: number) => `/api/windows/${hwnd}/capture`
@@ -81,12 +102,36 @@ export interface EditPayload {
   roi?: Rect
   provider?: string
   baseVersion: number
+  channel?: 'auto' | 'semantic' | 'generative'
 }
 
 export const createEdit = (projectId: string, payload: EditPayload, signal?: AbortSignal) =>
-  post<EditDraft>(`/projects/${projectId}/edits`, payload, signal)
+  request<EditDraft>(`/projects/${projectId}/edits`, {
+    method: 'POST',
+    body: payload,
+    signal,
+    withKey: true,
+  })
 
 export const applyEdit = (editId: string) => post<EditApplyResult>(`/edits/${editId}/apply`, {})
 
 export const discardEdit = (editId: string) =>
   request<{ discarded: string }>(`/edits/${editId}`, { method: 'DELETE' })
+
+// ---------- 版本历史与复原（I22） ----------
+
+export const listVersions = (projectId: string) =>
+  get<SourceVersion[]>(`/projects/${projectId}/versions`)
+
+export const revertProject = (projectId: string, targetVersion: number) =>
+  post<RevertResult>(`/projects/${projectId}/revert`, { targetVersion })
+
+// ---------- AI 设置（I20 / I21） ----------
+
+export const getAiSettings = () => get<AiSettingsInfo>('/settings/ai')
+
+export const putAiSettings = (payload: AiSettingsUpdate) =>
+  request<AiSettingsInfo>('/settings/ai', { method: 'PUT', body: payload })
+
+export const testAiSettings = (payload?: AiProbeRequest) =>
+  request<AiTestResult>('/settings/ai/test', { method: 'POST', body: payload ?? {}, withKey: true })

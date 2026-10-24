@@ -41,6 +41,15 @@ class CanvasProfile:
     source: str
     confidence: float
     captured_at: str
+    # 自动变粗（粗细滑杆标定）：截图坐标系下的轨道区域 {"x","y","w","h"} 与撤销按钮 {"x","y"}。
+    slider: dict | None = None
+    undo: dict | None = None
+    # 画板下方工具面板折叠按钮中心点 {"x","y"}：换笔间隙自动收起面板。
+    fold: dict | None = None
+    # 绘制目标类型：pc=本机窗口；mirror=scrcpy 投屏窗口（注入与守护同 PC 窗口）；
+    # adb=直连预留。serial 标识来源设备，供设备丢失时给出准确提示。
+    device_kind: str = "pc"
+    device_serial: str | None = None
 
 
 @dataclass(frozen=True)

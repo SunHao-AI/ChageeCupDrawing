@@ -45,7 +45,8 @@ const cells = computed<MetricCell[]>(() => {
 <style scoped>
 .metrics {
   display: grid;
-  grid-template-columns: repeat(v-bind('cells.length'), 1fr);
+  /* 窄屏按可用宽度自动换行，避免指标格被挤成竖排 */
+  grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
   gap: 1px;
   background: var(--line-soft);
   border: 1px solid var(--line-soft);
@@ -62,6 +63,12 @@ const cells = computed<MetricCell[]>(() => {
   font-size: 11px;
   color: var(--text-faint);
   margin-bottom: 4px;
+}
+
+@media (pointer: coarse), (max-width: 1376px) {
+  .label {
+    font-size: 12px;
+  }
 }
 
 .value {

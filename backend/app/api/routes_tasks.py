@@ -109,11 +109,12 @@ async def task_events(task_id: str, request: Request) -> StreamingResponse:
 
             record = store.get_task(task_id)
             if record is not None and record.status in TERMINAL_STATUSES:
-                # task.done 可能晚于终态落库几毫秒，有界重试直到拿到或确认没有。
-                for _ in range(1 if seen_done else SSE_TERMINAL_DRAIN_TRIES):
+                # task.done 晚于终态状态落库（先 transition 后 emit）：没拿到
+                # done 之前必须持续等待而不是「无新事件就退出」，否则客户端
+                # 会在毫秒级窗口里错过 task.done。
+                tries = 0 if seen_done else SSE_TERMINAL_DRAIN_TRIES
+                while tries:
                     pending = store.list_events(task_id, cursor)
-                    if not pending:
-                        break
                     for event in pending:
                         cursor = event.seq
                         if event.type == "task.done":
@@ -121,6 +122,7 @@ async def task_events(task_id: str, request: Request) -> StreamingResponse:
                         yield _sse(event)
                     if seen_done:
                         break
+                    tries -= 1
                     await asyncio.sleep(SSE_POLL_S)
                 return
 

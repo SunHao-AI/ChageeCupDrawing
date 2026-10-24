@@ -1,3 +1,4 @@
+import { readAiKey } from '@/utils/aiKey'
 import type { ApiErrorBody } from './types'
 
 export const API_BASE = '/api'
@@ -36,14 +37,20 @@ async function parseError(response: Response): Promise<ApiError> {
 interface RequestOptions extends Omit<RequestInit, 'body'> {
   body?: unknown
   form?: FormData
+  /** 仅编辑/预检等确实需要模型的请求才携带 Key，避免随普通请求反复外发。 */
+  withKey?: boolean
 }
 
 function send(path: string, options: RequestOptions): Promise<Response> {
-  const { body, form, headers, ...rest } = options
+  const { body, form, headers, withKey, ...rest } = options
   const isWrite = rest.method !== undefined && rest.method !== 'GET'
   const finalHeaders = new Headers(headers)
   if (isWrite) finalHeaders.set(CSRF_HEADER, CSRF_VALUE)
   if (body !== undefined) finalHeaders.set('Content-Type', 'application/json')
+  if (withKey) {
+    const key = readAiKey()
+    if (key) finalHeaders.set('X-AI-Key', key)
+  }
 
   return fetch(`${API_BASE}${path}`, {
     ...rest,

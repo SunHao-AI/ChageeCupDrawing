@@ -1,0 +1,99 @@
+"""画板下方工具面板的开合控制。
+
+笔粗细滑杆只在面板展开时可点；绘制期间面板遮挡画布下部，用户希望默认收起、
+仅在换笔时短暂展开。开合状态从截图直接判定：
+
+  1. 折叠后画布可能扩大盖住滑杆区域——滑杆中心落在当前检测出的画布内 ⇒ 折叠；
+  2. 否则按滑杆轨道的墨迹占比：展开时轨道有深色段+圆点（占比 ≥3%），
+     收起后该位置是浅色空白（≈0），阈值取 1%。
+
+安全约束：点击前校验目标点不在画布内（防止在画布上点出墨点），点击后用状态
+复检确认生效；失败由调用方降级处理（保持当前笔宽继续画），绝不盲连点。
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Callable, Protocol
+
+from app.core.vision.canvas_detect import detect_canvas_rect
+from app.executor.ink_measure import ink_occupied_fraction
+
+# 滑杆轨道深色占比阈值：展开时深色段+圆点 ≥3%，收起后≈0，取中间值。
+PANEL_OPEN_OCCUPIED = 0.01
+SETTLE_S = 0.45
+MAX_CLICKS = 2
+
+
+class PanelProbe(Protocol):
+    """DrawingTarget 的图像视角适配：capture_image 直接给截图 ndarray。"""
+
+    def capture_image(self): ...
+    def foreground_matches(self) -> bool: ...
+    def activate(self) -> bool: ...
+
+
+class PanelController:
+    """按截图坐标操作折叠按钮；鼠标动作前经 to_screen 换算到屏幕坐标。"""
+
+    def __init__(
+        self,
+        *,
+        probe: PanelProbe,
+        mouse: object,
+        to_screen: Callable[[float, float], tuple[float, float]],
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._probe = probe
+        self._mouse = mouse
+        self._to_screen = to_screen
+        self._sleep = sleep
+
+    def is_open(self, slider_rect: dict) -> bool | None:
+        image = self._probe.capture_image()
+        if image is None:
+            return None
+        found = detect_canvas_rect(image)
+        cx = slider_rect["x"] + slider_rect["w"] / 2.0
+        cy = slider_rect["y"] + slider_rect["h"] / 2.0
+        if found is not None:
+            l, t, r, b = found
+            if l <= cx <= r and t <= cy <= b:
+                # 画布已盖住滑杆：只能是折叠态，此时区域内的墨迹是绘制笔画。
+                return False
+        rect = (slider_rect["x"], slider_rect["y"], slider_rect["w"], slider_rect["h"])
+        return ink_occupied_fraction(image, rect) >= PANEL_OPEN_OCCUPIED
+
+    def fold(self, slider_rect: dict, fold_point: dict) -> bool:
+        return self._set(slider_rect, fold_point, want_open=False)
+
+    def unfold(self, slider_rect: dict, fold_point: dict) -> bool:
+        return self._set(slider_rect, fold_point, want_open=True)
+
+    def _set(self, slider_rect: dict, fold_point: dict, *, want_open: bool) -> bool:
+        for _ in range(MAX_CLICKS):
+            state = self.is_open(slider_rect)
+            if state is None:
+                return False
+            if state == want_open:
+                return True
+            image = self._probe.capture_image()
+            if image is None:
+                return False
+            found = detect_canvas_rect(image)
+            if found is not None:
+                l, t, r, b = found
+                if l <= fold_point["x"] <= r and t <= fold_point["y"] <= b:
+                    # 按钮位置被（漂移后的）画布覆盖：点下去就是一个墨点，拒绝。
+                    return False
+            self._ensure_foreground()
+            sx, sy = self._to_screen(fold_point["x"], fold_point["y"])
+            getattr(self._mouse, "click")(sx, sy)
+            self._sleep(SETTLE_S)
+        state = self.is_open(slider_rect)
+        return state is not None and state == want_open
+
+    def _ensure_foreground(self) -> None:
+        if not self._probe.foreground_matches():
+            self._probe.activate()
+            self._sleep(0.15)

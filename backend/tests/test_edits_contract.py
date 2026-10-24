@@ -1,4 +1,4 @@
-"""VLM 编辑接口契约测试：I16–I19 + 语义金标准 + 版本链 + 墨量护栏。"""
+"""VLM 编辑接口契约测试：I16–I21 + 语义金标准 + 版本链 + 墨量护栏 + BYOK 分流。"""
 
 from __future__ import annotations
 
@@ -10,9 +10,12 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
+from app.api.routes_settings import _merge_probe_settings
+from app.api.schemas import AiProbeRequest
 from app.config import Settings
 from app.main import create_app
-from app.services.editing import EditOp, NoGenerativeProvider
+from app.services.editing import BuiltinSemanticProvider, EditOp, EditService, NoGenerativeProvider
+from app.services.settings_store import KEY_HEADER, AiSettings
 
 SESSION_TOKEN = "edits-test-token"
 WRITE_HEADERS = {"X-Requested-With": "cupdraw"}
@@ -53,6 +56,31 @@ class GenerativeProvider:
         self, image: Path, roi: dict | None, instruction: str, out_path: Path
     ) -> Path:
         raise NoGenerativeProvider("模型后端未配置")
+
+
+class CloudProvider:
+    """BYOK 云端 provider 桩：generate 直接复制源图，验证分流而非模型效果。"""
+
+    id = "cloud-fake"
+    label = "Cloud Fake"
+    supports = "generative"
+    cloud = True
+    needs_key = True
+
+    def parse(self, instruction: str) -> list[EditOp]:
+        raise AssertionError("云端 provider 不负责语义解析")
+
+    def apply(self, image: Path, ops: list[EditOp], out_path: Path) -> Path:
+        raise AssertionError("云端 provider 不应执行语义 apply")
+
+    def generate(
+        self, image: Path, roi: dict | None, instruction: str, out_path: Path
+    ) -> Path:
+        import shutil
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(image, out_path)
+        return out_path
 
 
 @pytest.fixture()
@@ -128,11 +156,12 @@ def test_draft_404_after_discard(client: TestClient, project: dict) -> None:
 
 
 def test_unparsed_instruction_returns_422(client: TestClient, project: dict) -> None:
+    # 默认装配已注册生成 provider，未配置时引导去设置页而不是「换说法」。
     status, body = _edit(
         client, project["projectId"], {"instruction": "帮我画得好看一点", "baseVersion": 1}
     )
     assert status == 422
-    assert body["errorCode"] == "E_EDIT_NOT_UNDERSTOOD"
+    assert body["errorCode"] == "E_PROVIDER_NOT_CONFIGURED"
 
 
 def test_roi_out_of_bounds_rejected(client: TestClient, project: dict) -> None:
@@ -249,6 +278,65 @@ def test_apply_after_project_deleted(client: TestClient, project: dict) -> None:
     assert apply.status_code == 404
 
 
+# ---------- I22 版本历史与复原 ----------
+
+
+def test_versions_and_revert_roundtrip(client: TestClient, project: dict) -> None:
+    project_id = project["projectId"]
+    before = client.get(f"/api/projects/{project_id}/versions")
+    assert before.status_code == 200
+    assert [v["version"] for v in before.json()] == [1]
+    assert before.json()[0]["label"] == "初始导入"
+    assert before.json()[0]["current"] is True
+
+    # 应用一次编辑 → v2，历史含两个版本，标签来自编辑指令。
+    _, body = _edit(client, project_id, {"instruction": "上移30", "baseVersion": 1})
+    applied = client.post(f"/api/edits/{body['editId']}/apply", json={}, headers=WRITE_HEADERS)
+    assert applied.status_code == 200, applied.text
+    history = client.get(f"/api/projects/{project_id}/versions").json()
+    assert [v["version"] for v in history] == [2, 1]
+    assert history[0]["label"] == "上移30"
+    assert history[1]["label"] == "初始导入"
+
+    # 复原到 v1：内容另存为 v3，历史保留 v2 可来回。
+    reverted = client.post(
+        f"/api/projects/{project_id}/revert",
+        json={"targetVersion": 1},
+        headers=WRITE_HEADERS,
+    )
+    assert reverted.status_code == 200, reverted.text
+    result = reverted.json()
+    assert result["sourceVersion"] == 3
+    assert result["revertedFrom"] == 1
+
+    history = client.get(f"/api/projects/{project_id}/versions").json()
+    assert [v["version"] for v in history] == [3, 2, 1]
+    assert history[0]["label"] == "复原至 v1"
+    assert history[0]["current"] is True
+
+    # v3 与 v1 的像素内容一致。
+    image_v3 = client.get(f"/api/projects/{project_id}/image")
+    store = client.app.state.store  # type: ignore[attr-defined]
+    files = sorted(store.project_dir(project_id).iterdir())
+    v1 = next(p for p in files if p.name == "source_v1.png")
+    assert np.array_equal(_ink_of(image_v3.content), _ink_of(v1.read_bytes()))
+
+    # 复原到当前版本被拒；不存在的版本 404。
+    same = client.post(
+        f"/api/projects/{project_id}/revert",
+        json={"targetVersion": 3},
+        headers=WRITE_HEADERS,
+    )
+    assert same.status_code == 409
+    missing = client.post(
+        f"/api/projects/{project_id}/revert",
+        json={"targetVersion": 9},
+        headers=WRITE_HEADERS,
+    )
+    assert missing.status_code == 404
+    assert missing.json()["errorCode"] == "E_VERSION_MISSING"
+
+
 # ---------- 语义金标准 ----------
 
 
@@ -326,3 +414,250 @@ def test_semantic_golden_standard(client: TestClient, project: dict) -> None:
         draft = client.get(body["draftUrl"])
         assert draft.status_code == 200
         assert _iou(_ink_of(draft.content), reference) >= 0.99, instruction
+
+
+# ---------- BYOK 分流矩阵（设计文档 ai-edit-provider §2） ----------
+
+_CLOUD_KEY = "sk-test-0123456789abcdef"
+
+
+@pytest.fixture()
+def cloud_client(client: TestClient) -> TestClient:
+    """注册云端 provider 桩；Key/授权保持未配置，由用例逐项开启。"""
+    client.app.state.editor = EditService(  # type: ignore[attr-defined]
+        [BuiltinSemanticProvider(), CloudProvider()],
+        settings=client.app.state.ai_settings,  # type: ignore[attr-defined]
+    )
+    return client
+
+
+def _configure_ai(client: TestClient, *, key: bool, consent: bool) -> None:
+    # Key 不再走请求体，改为每次请求带 X-AI-Key（浏览器侧持有）。
+    response = client.put(
+        "/api/settings/ai",
+        json={
+            "provider": "cloud-fake" if key else None,
+            "allowCloudEdit": consent,
+        },
+        headers=WRITE_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    if key:
+        client.headers[KEY_HEADER] = _CLOUD_KEY
+    else:
+        client.headers.pop(KEY_HEADER, None)
+
+
+def test_rule_hit_never_touches_cloud(cloud_client: TestClient, project: dict) -> None:
+    """规则命中的高频指令必须留在语义通道，即使云端已配置。"""
+    _configure_ai(cloud_client, key=True, consent=True)
+    status, body = _edit(
+        cloud_client, project["projectId"], {"instruction": "上移30", "baseVersion": 1}
+    )
+    assert status == 201, body
+    assert body["channel"] == "semantic"
+    assert body["provider"] == "builtin-semantic"
+
+
+def test_rule_miss_falls_back_to_generative(cloud_client: TestClient, project: dict) -> None:
+    _configure_ai(cloud_client, key=True, consent=True)
+    status, body = _edit(
+        cloud_client,
+        project["projectId"],
+        {"instruction": "把头发改密并加上春字艺术字", "baseVersion": 1},
+    )
+    assert status == 201, body
+    assert body["channel"] == "generative"
+    assert body["provider"] == "cloud-fake"
+    assert cloud_client.get(body["draftUrl"]).status_code == 200
+
+
+def test_generative_channel_bypasses_rules(cloud_client: TestClient, project: dict) -> None:
+    """显式 channel=generative 时即使规则可命中也走生成通道。"""
+    _configure_ai(cloud_client, key=True, consent=True)
+    status, body = _edit(
+        cloud_client,
+        project["projectId"],
+        {"instruction": "上移30", "baseVersion": 1, "channel": "generative"},
+    )
+    assert status == 201, body
+    assert body["channel"] == "generative"
+
+
+def test_semantic_channel_never_falls_back(cloud_client: TestClient, project: dict) -> None:
+    _configure_ai(cloud_client, key=True, consent=True)
+    status, body = _edit(
+        cloud_client,
+        project["projectId"],
+        {"instruction": "把头发改密", "baseVersion": 1, "channel": "semantic"},
+    )
+    assert status == 422
+    assert body["errorCode"] == "E_EDIT_NOT_UNDERSTOOD"
+
+
+def test_rule_miss_without_key_returns_422(cloud_client: TestClient, project: dict) -> None:
+    status, body = _edit(
+        cloud_client,
+        project["projectId"],
+        {"instruction": "把头发改密", "baseVersion": 1},
+    )
+    assert status == 422
+    assert body["errorCode"] == "E_PROVIDER_NOT_CONFIGURED"
+
+
+def test_rule_miss_without_consent_returns_403(cloud_client: TestClient, project: dict) -> None:
+    _configure_ai(cloud_client, key=True, consent=False)
+    status, body = _edit(
+        cloud_client,
+        project["projectId"],
+        {"instruction": "把头发改密", "baseVersion": 1},
+    )
+    assert status == 403
+    assert body["errorCode"] == "E_CONSENT_REQUIRED"
+
+
+def test_builtin_only_miss_stays_422(client: TestClient, project: dict) -> None:
+    """未注册任何生成 provider 时规则未命中维持 422「未理解」，而不是 501。"""
+    client.app.state.editor = EditService(  # type: ignore[attr-defined]
+        [BuiltinSemanticProvider()], settings=client.app.state.ai_settings  # type: ignore[attr-defined]
+    )
+    status, body = _edit(
+        client, project["projectId"], {"instruction": "把头发改密", "baseVersion": 1}
+    )
+    assert status == 422
+    assert body["errorCode"] == "E_EDIT_NOT_UNDERSTOOD"
+
+
+def test_explicit_cloud_provider_ignores_rules(cloud_client: TestClient, project: dict) -> None:
+    _configure_ai(cloud_client, key=True, consent=True)
+    status, body = _edit(
+        cloud_client,
+        project["projectId"],
+        {"instruction": "上移30", "baseVersion": 1, "provider": "cloud-fake"},
+    )
+    assert status == 201, body
+    assert body["channel"] == "generative"
+
+
+def test_providers_expose_cloud_flags(cloud_client: TestClient) -> None:
+    providers = {p["id"]: p for p in cloud_client.get("/api/edit/providers").json()}
+    assert providers["builtin-semantic"]["local"] is True
+    assert providers["builtin-semantic"]["needsKey"] is False
+    assert providers["cloud-fake"]["cloud"] is True
+    assert providers["cloud-fake"]["needsKey"] is True
+
+
+# ---------- I20 / I21 设置 ----------
+
+
+def test_ai_settings_roundtrip_never_accepts_key(client: TestClient) -> None:
+    """I20 只存 provider/模型/地址；请求体里的 Key 被忽略，接口不回显。"""
+    initial = client.get("/api/settings/ai")
+    assert initial.status_code == 200
+    assert initial.json()["hasKey"] is False
+
+    saved = client.put(
+        "/api/settings/ai",
+        json={
+            "provider": "cloud-fake",
+            "apiKey": _CLOUD_KEY,
+            "baseUrl": "http://127.0.0.1:11434/v1",
+            "allowCloudEdit": True,
+        },
+        headers=WRITE_HEADERS,
+    )
+    assert saved.status_code == 200
+    body = saved.json()
+    assert body["hasKey"] is False
+    assert body["apiKeyMasked"] is None
+    assert body["provider"] == "cloud-fake"
+    assert body["baseUrl"] == "http://127.0.0.1:11434/v1"
+    assert body["allowCloudEdit"] is True
+    assert _CLOUD_KEY not in saved.text
+
+    patched = client.put(
+        "/api/settings/ai",
+        json={"provider": "", "allowCloudEdit": False},
+        headers=WRITE_HEADERS,
+    )
+    body = patched.json()
+    assert body["hasKey"] is False
+    assert body["provider"] is None
+    assert body["allowCloudEdit"] is False
+
+
+def test_ai_settings_key_never_reaches_disk(client: TestClient, tmp_path: Path) -> None:
+    """Key 只存浏览器：即使旧客户端提交明文，也不能落盘。"""
+    client.put(
+        "/api/settings/ai",
+        json={"provider": "cloud-fake", "apiKey": _CLOUD_KEY, "allowCloudEdit": True},
+        headers=WRITE_HEADERS,
+    )
+    import json
+
+    raw = json.loads((tmp_path / "data" / "config.json").read_text(encoding="utf-8"))
+    assert raw.get("apiKey", "") == ""
+    assert _CLOUD_KEY not in (tmp_path / "data" / "config.json").read_text(encoding="utf-8")
+
+
+def test_stored_key_is_purged_on_startup(client: TestClient, tmp_path: Path) -> None:
+    """旧版本遗留的 Key 在启动时清除。"""
+    config = tmp_path / "data" / "config.json"
+    config.write_text(
+        '{"provider": "cloud-fake", "model": "m", "apiKey": "sk-old", "baseUrl": ""}',
+        encoding="utf-8",
+    )
+    client.app.state.ai_settings.purge_stored_key()  # type: ignore[attr-defined]
+    assert "sk-old" not in config.read_text(encoding="utf-8")
+
+
+def test_ai_test_endpoint_classifies(client: TestClient, cloud_client: TestClient) -> None:
+    empty = client.post("/api/settings/ai/test", json={}, headers=WRITE_HEADERS)
+    assert empty.status_code == 200
+    assert empty.json() == {"ok": False, "reason": "missing_key"}
+
+    _configure_ai(cloud_client, key=True, consent=True)
+    ok = cloud_client.post("/api/settings/ai/test", json={}, headers=WRITE_HEADERS)
+    assert ok.status_code == 200
+    assert ok.json() == {"ok": True, "provider": "cloud-fake"}
+
+    _configure_ai(cloud_client, key=True, consent=False)
+    gated = cloud_client.post("/api/settings/ai/test", json={}, headers=WRITE_HEADERS)
+    assert gated.json() == {"ok": False, "reason": "consent_required"}
+
+    # 选了中国服务但后端尚未接入：要明确报「未接入」，不能误报没选 provider。
+    cloud_client.put(
+        "/api/settings/ai",
+        json={"provider": "dashscope", "allowCloudEdit": True},
+        headers=WRITE_HEADERS,
+    )
+    unintegrated = cloud_client.post("/api/settings/ai/test", json={}, headers=WRITE_HEADERS)
+    assert unintegrated.json() == {"ok": False, "reason": "provider_not_integrated"}
+
+    # 表单值可直接参与预检（不必先保存）：把未接入的 provider 放进请求体。
+    _configure_ai(cloud_client, key=True, consent=True)
+    form_only = cloud_client.post(
+        "/api/settings/ai/test",
+        json={"provider": "dashscope", "baseUrl": "https://dashscope.aliyuncs.com"},
+        headers=WRITE_HEADERS,
+    )
+    assert form_only.json() == {"ok": False, "reason": "provider_not_integrated"}
+
+
+def test_probe_form_does_not_reuse_key_across_providers() -> None:
+    """换 provider 预检时不能沿用上一家的 Key 与地址。"""
+    saved = AiSettings(
+        provider="openai-compatible",
+        model="gpt-image-1.5",
+        api_key="sk-openai",
+        base_url="https://api.openai.com/v1",
+        allow_cloud_edit=True,
+    )
+    same = _merge_probe_settings(saved, AiProbeRequest(provider="openai-compatible"))
+    assert same.api_key == "sk-openai"
+    assert same.base_url == "https://api.openai.com/v1"
+
+    switched = _merge_probe_settings(saved, AiProbeRequest(provider="gemini-image"))
+    assert switched.api_key is None
+    assert switched.base_url is None
+    assert switched.allow_cloud_edit is True

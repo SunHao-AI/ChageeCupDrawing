@@ -67,6 +67,7 @@ def build_drawing_plan(
     target_recall: float = 0.985,
     threshold_mode: bool = False,
     hatch_levels: int = 10,
+    min_stroke_px: int = 0,
 ) -> DrawingPlan:
     # User's calibration sample is ~3 px wide on a ~560 px cup canvas, so v5 uses
     # 3 px as the default rather than v4's 7 px assumption.
@@ -102,7 +103,10 @@ def build_drawing_plan(
         levels = max(6, min(24, int(hatch_levels)))
         bg = compute_background(work_gray)
         tone = tone_area(tone_field(work_gray, levels, background=bg), levels, background=bg)
-        local_work = tone_contour_paths(tone, ctx.simplify_px_work, background=bg)
+        local_work = tone_contour_paths(
+            tone, ctx.simplify_px_work, background=bg,
+            min_stroke_px=int(min_stroke_px) * ss,
+        )
     else:
         local_work = build_paths(strategy_key, work_mask, ctx)
     local_paths = [p for p in local_work if p]

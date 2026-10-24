@@ -71,6 +71,12 @@ function onSlider(event: Event) {
   margin-top: 3px;
 }
 
+@media (pointer: coarse), (max-width: 1376px) {
+  .hint {
+    font-size: 12px;
+  }
+}
+
 .toggle-row {
   display: flex;
   flex-direction: column;

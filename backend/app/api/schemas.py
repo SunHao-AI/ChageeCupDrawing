@@ -38,6 +38,9 @@ class PlanParams(CamelModel):
     target_recall: float = Field(default=0.985, ge=0.95, le=0.998)
     # 照片素描策略的色调分层数：越大暗部层次越细、笔迹越多。
     hatch_levels: int = Field(default=10, ge=6, le=24)
+    # 照片素描碎线过滤：短于此长度（画布 px）的等值线视为「梯子横档」噪声丢弃。
+    # 0=不过滤（保留最密线条），越大画面越干净但细节越少。
+    min_stroke_px: int = Field(default=25, ge=0, le=120)
 
 
 class RectModel(BaseModel):
@@ -49,15 +52,38 @@ class RectModel(BaseModel):
     h: int = Field(gt=0)
 
 
+class PointModel(CamelModel):
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+
+
 class CalibrationRequest(CamelModel):
     hwnd: int = Field(gt=0)
     mode: Literal["auto", "manual"] = "auto"
     rect: RectModel | None = None
     capture_method: Literal["maa", "win32"] | None = None
+    # 绘制目标类型：pc=本机窗口，mirror=投屏窗口（adb 直连为后续预留）。
+    device_kind: Literal["pc", "mirror"] = "pc"
+    device_serial: str | None = Field(default=None, max_length=64)
+    # 自动变粗选填项（截图坐标系）：笔粗细滑杆轨道区域与撤销按钮中心点。
+    slider: RectModel | None = None
+    undo: PointModel | None = None
+    # 画板下方工具面板折叠按钮中心点：换笔间隙自动收起面板，让画布完整可见。
+    fold: PointModel | None = None
 
 
 class PlanRequest(CamelModel):
     params: PlanParams = Field(default_factory=PlanParams)
+
+
+class MirrorStartRequest(CamelModel):
+    serial: str = Field(min_length=1, max_length=64)
+
+
+class MirrorRegisterRequest(CamelModel):
+    hwnd: int = Field(gt=0)
+    serial: str = Field(min_length=1, max_length=64)
+    label: str = Field(default="", max_length=64)
 
 
 class PresetCreate(CamelModel):
@@ -75,6 +101,12 @@ class ExecParamsModel(CamelModel):
     no_coalesce: bool = True
     short_stroke_protect: bool = True
     short_stroke_threshold_px: float = Field(default=1.2, ge=0.0, le=20.0)
+    focus_guard: bool = True
+    cursor_takeover_px: float = Field(default=6.0, ge=2.0, le=100.0)
+    guard_poll_ms: float = Field(default=50.0, ge=10.0, le=500.0)
+    # 自动变粗：绘制前自动标定小程序粗细滑杆并分档换笔（需校准页框选滑杆）。
+    auto_width: bool = False
+    width_tiers: int = Field(default=5, ge=2, le=10)
 
 
 class TaskCreate(CamelModel):
@@ -95,3 +127,38 @@ class EditRequest(CamelModel):
     roi: RectModel | None = None
     provider: str | None = None
     base_version: int = Field(ge=1)
+    # auto：规则优先、生成兜底（设计文档 ai-edit-provider §2）。
+    channel: Literal["auto", "semantic", "generative"] = "auto"
+
+
+class RevertRequest(CamelModel):
+    """I22 复原到历史源图版本。"""
+
+    target_version: int = Field(ge=1)
+
+
+class AiSettingsUpdate(CamelModel):
+    """I20 写入 AI 配置（不含 Key）。
+
+    api_key 仅为兼容旧前端保留，服务端忽略且绝不落盘；Key 走请求头 X-AI-Key。
+    """
+
+    provider: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+    # OpenAI 兼容通道的服务地址；留空表示不启用该通道。
+    base_url: str | None = None
+    allow_cloud_edit: bool = False
+
+
+class AiProbeRequest(CamelModel):
+    """I21 预检：用表单当前值验证，无需先保存；缺省字段沿用已保存配置。
+
+    Key 从请求头 X-AI-Key 读取，请求体不再接收明文 Key。
+    """
+
+    provider: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    allow_cloud_edit: bool | None = None

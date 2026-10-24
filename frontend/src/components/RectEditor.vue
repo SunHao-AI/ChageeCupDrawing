@@ -95,6 +95,8 @@ onUnmounted(() => window.removeEventListener('pointerup', onPointerUp))
   width: 100%;
   user-select: none;
   cursor: crosshair;
+  /* 手指在画面上拖框时禁止浏览器平移/缩放页面 */
+  touch-action: none;
   background: var(--ink-0);
   border-radius: var(--radius-sm);
   overflow: hidden;

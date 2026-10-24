@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS canvas_profile (
     dpi_scale REAL NOT NULL DEFAULT 1.0,
     source TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 0.0,
+    slider_json TEXT,
+    undo_json TEXT,
+    fold_json TEXT,
     captured_at TEXT NOT NULL
 );
 
@@ -103,6 +106,16 @@ _COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "project": [
         ("source_version", "INTEGER NOT NULL DEFAULT 1"),
         ("parent_version", "INTEGER"),
+    ],
+    "canvas_profile": [
+        # 自动变粗需要：粗细滑杆轨道区域与撤销按钮位置（截图坐标系 JSON）。
+        ("slider_json", "TEXT"),
+        ("undo_json", "TEXT"),
+        # 画板下方工具面板的折叠按钮中心点（换笔间隙收起面板用）。
+        ("fold_json", "TEXT"),
+        # 多设备目标（B2）：pc / mirror / adb 与来源设备序列号。
+        ("device_kind", "TEXT NOT NULL DEFAULT 'pc'"),
+        ("device_serial", "TEXT"),
     ],
 }
 

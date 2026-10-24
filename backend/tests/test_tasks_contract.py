@@ -44,6 +44,9 @@ class FakeDevice:
     def alive(self, hwnd: int) -> bool:
         return self.alive_flag and hwnd == GOOD_HWND
 
+    def activate(self, hwnd: int) -> bool:
+        return True
+
     def foreground(self) -> int:
         return self._foreground
 
@@ -60,11 +63,16 @@ class FakeDevice:
         return 1.0
 
 
+# 模拟注入器视角下的光标：假鼠标写入，假探针读出，保证守护不误判接管。
+_CURSOR = {"pos": (0, 0)}
+
+
 class FakeMouse:
     def __init__(self) -> None:
         self.clicks: list[tuple[float, float]] = []
         self.drags: list[list[tuple[float, float]]] = []
         self.released = 0
+        _CURSOR["pos"] = (0, 0)
 
     def clear_escape_state(self) -> None:
         return None
@@ -74,13 +82,47 @@ class FakeMouse:
 
     def click(self, x: float, y: float, hold: float = 0.020) -> None:
         self.clicks.append((x, y))
+        _CURSOR["pos"] = (round(x), round(y))
 
     def drag_polyline(self, points, **kwargs) -> bool:
-        self.drags.append(list(points))
+        pts = list(points)
+        self.drags.append(pts)
+        if pts:
+            _CURSOR["pos"] = (round(pts[-1][0]), round(pts[-1][1]))
         return True
 
     def up(self) -> None:
         self.released += 1
+
+
+class FakeProbe:
+    """守护探针假实现：前台/可用性读 FakeDevice，光标读注入器落点；esc_flag 可外部置位。"""
+
+    def __init__(self, device: FakeDevice) -> None:
+        self.device = device
+        self.esc_flag = False
+
+    def clear_escape_state(self) -> None:
+        return None
+
+    def foreground_matches(self, hwnd: int) -> bool:
+        return self.device.foreground() == hwnd
+
+    def activate(self, hwnd: int) -> bool:
+        # 测试前台由 FakeDevice 手动控制，不模拟自动激活。
+        return False
+
+    def window_usable(self, hwnd: int) -> bool:
+        return self.device.alive(hwnd)
+
+    def cursor_pos(self) -> tuple[int, int]:
+        return _CURSOR["pos"]
+
+    def left_button_pressed(self) -> bool:
+        return False
+
+    def esc_pressed(self) -> bool:
+        return self.esc_flag
 
 
 class BlockingMouse(FakeMouse):
@@ -94,7 +136,36 @@ class BlockingMouse(FakeMouse):
     def drag_polyline(self, points, *, should_stop=None, **kwargs) -> bool:
         self.entered.set()
         self.release.wait(timeout=5.0)
+        pts = list(points)
+        if pts:
+            _CURSOR["pos"] = (round(pts[-1][0]), round(pts[-1][1]))
         return not (should_stop and should_stop())
+
+
+class YieldingMouse(FakeMouse):
+    """每条笔迹内部轮询停止标志，直到停止或超时，用于守护触发类测试。"""
+
+    def __init__(self, on_first_drag=None) -> None:
+        super().__init__()
+        self.on_first_drag = on_first_drag
+
+    def drag_polyline(self, points, *, should_stop=None, **kwargs) -> bool:
+        self.drags.append(list(points))
+        if self.on_first_drag and len(self.drags) == 1:
+            self.on_first_drag()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if should_stop and should_stop():
+                return False
+            time.sleep(0.01)
+        return True
+
+    def wait_released(self, timeout: float = 5.0) -> None:
+        # 线程 finally 里的 mouse.up() 晚于 STOPPED 落库，轮询等待收尾。
+        deadline = time.monotonic() + timeout
+        while self.released == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert self.released >= 1
 
 
 def _png() -> bytes:
@@ -137,7 +208,15 @@ def _make_client(tmp_path: Path, device: FakeDevice, mouse_factory):
         Settings(data_dir=tmp_path / "data", session_token=SESSION_TOKEN),
         device=device,
         planner=FakePlanner(),
-        executor_factory=lambda store, dev: ExecutorService(store, dev, mouse_factory=mouse_factory),
+        executor_factory=lambda store, dev: ExecutorService(
+            store,
+            dev,
+            mouse_factory=mouse_factory,
+            guard_probe=FakeProbe(device),
+            # 测试里不需要真实的 0.5s 前台稳定期。
+            arm_final_window_s=0.05,
+            arm_stable_s=0.05,
+        ),
     )
     client = TestClient(app)
     client.__enter__()
@@ -271,18 +350,88 @@ def test_stop_during_countdown_then_resume(tmp_path: Path, device: FakeDevice, m
         client.__exit__(None, None, None)
 
 
-def test_foreground_mismatch_fails(tmp_path: Path, device: FakeDevice, mouse_factory) -> None:
-    device._foreground = 99999  # 前台不是目标窗口
+def test_countdown_freezes_until_foreground(tmp_path: Path, device: FakeDevice, mouse_factory) -> None:
+    """倒计时末段目标不在前台：冻结等待并推 warning，切回后自动继续到完成。"""
+    device._foreground = 99999  # 目标不在前台
     client = _make_client(tmp_path, device, mouse_factory)
+    try:
+        plan_id = _ready_project(client)
+        created = client.post(
+            f"/api/plans/{plan_id}/tasks", json={"countdownMs": 300}, headers=WRITE_HEADERS
+        ).json()
+        task_id = created["taskId"]
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            events = [e.type for e in client.app.state.store.list_events(task_id)]
+            if "task.warning" in events:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("倒计时未按预期冻结推 warning")
+
+        assert client.get(f"/api/tasks/{task_id}").json()["status"] == "ARMING"
+        assert mouse_factory.made[0].drags == []
+
+        device._foreground = GOOD_HWND  # 用户切回目标窗口
+        final = _wait_terminal(client, task_id)
+        assert final["status"] == "DONE"
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_guard_focus_lost_stops_drawing(tmp_path: Path, device: FakeDevice) -> None:
+    """绘制中目标失焦：守护线程应立即停笔，STOPPED 且 stopReason=focus_lost。"""
+
+    def lost_focus() -> None:
+        device._foreground = 99999
+
+    mouse = YieldingMouse(on_first_drag=lost_focus)
+    client = _make_client(tmp_path, device, lambda: mouse)
     try:
         plan_id = _ready_project(client)
         created = client.post(
             f"/api/plans/{plan_id}/tasks", json={"countdownMs": 0}, headers=WRITE_HEADERS
         ).json()
         final = _wait_terminal(client, created["taskId"])
-        assert final["status"] == "FAILED"
-        assert final["errorCode"] == "E_FOREGROUND_MISMATCH"
-        assert mouse_factory.made[0].drags == []
+        assert final["status"] == "STOPPED"
+        assert final["stopReason"] == "focus_lost"
+        assert final["cursorPath"] == 0  # 第一条笔迹未完成即停
+        assert len(mouse.drags) == 1
+        mouse.wait_released()  # finally 中抬笔
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_guard_esc_stops_drawing(tmp_path: Path, device: FakeDevice) -> None:
+    """ESC 急停在守护线程并入后仍有效。"""
+    probe = FakeProbe(device)
+    mouse = YieldingMouse(on_first_drag=lambda: setattr(probe, "esc_flag", True))
+    app = create_app(
+        Settings(data_dir=tmp_path / "data", session_token=SESSION_TOKEN),
+        device=device,
+        planner=FakePlanner(),
+        executor_factory=lambda store, dev: ExecutorService(
+            store,
+            dev,
+            mouse_factory=lambda: mouse,
+            guard_probe=probe,
+            arm_final_window_s=0.05,
+            arm_stable_s=0.05,
+        ),
+    )
+    client = TestClient(app)
+    client.__enter__()
+    client.get("/api/health")
+    try:
+        plan_id = _ready_project(client)
+        created = client.post(
+            f"/api/plans/{plan_id}/tasks", json={"countdownMs": 0}, headers=WRITE_HEADERS
+        ).json()
+        final = _wait_terminal(client, created["taskId"])
+        assert final["status"] == "STOPPED"
+        assert final["stopReason"] == "esc"
+        mouse.wait_released()
     finally:
         client.__exit__(None, None, None)
 

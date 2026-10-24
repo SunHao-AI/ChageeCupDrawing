@@ -78,4 +78,14 @@ defineEmits<{ action: [] }>()
   color: var(--text-dim);
   margin-top: 2px;
 }
+
+@media (pointer: coarse), (max-width: 1376px) {
+  .title {
+    font-size: 14px;
+  }
+
+  .body {
+    font-size: 13px;
+  }
+}
 </style>

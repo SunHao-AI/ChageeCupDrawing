@@ -89,6 +89,7 @@ def _plan_worker(job: dict) -> dict:
         target_recall=params["targetRecall"],
         threshold_mode=params["thresholdMode"],
         hatch_levels=params.get("hatchLevels", 10),
+        min_stroke_px=params.get("minStrokePx", 25),
     )
     if not plan.paths:
         return {"ok": False, "error": "plan_empty"}

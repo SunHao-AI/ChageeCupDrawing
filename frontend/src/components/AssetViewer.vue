@@ -74,6 +74,12 @@ onUnmounted(() => {
   gap: 10px;
 }
 
+@media (max-width: 1023px) {
+  .thumbs {
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  }
+}
+
 .thumb {
   position: relative;
   display: flex;
@@ -108,6 +114,13 @@ onUnmounted(() => {
   font-size: 11px;
   color: var(--text-dim);
   text-align: center;
+}
+
+@media (pointer: coarse), (max-width: 1376px) {
+  .thumb-label,
+  .overlay-sub {
+    font-size: 12px;
+  }
 }
 
 .thumb.active .thumb-label {

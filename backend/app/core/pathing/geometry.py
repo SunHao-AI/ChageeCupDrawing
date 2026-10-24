@@ -61,32 +61,50 @@ def nearest_order_paths(paths: Paths) -> Paths:
 
     For the hundreds of paths typical of v5 this substantially cuts cursor travel.
     For very large jobs we fall back to the cheaper serpentine order.
+
+    The greedy scan is vectorized with numpy but reproduces the scalar loop
+    bit-exactly: candidates are scanned flattened as [d0_i, d1_i, ...] per path
+    with a strict "<" keep-first rule, so `argmin` (first minimum) on the
+    interleaved array matches the original tie semantics. Each arithmetic ufunc
+    rounds to IEEE double independently, mirroring Python float arithmetic.
     """
     paths = [p for p in paths if p]
     if len(paths) > 1800:
         return order_paths(paths)
+    n = len(paths)
     if not paths:
         return []
-    remaining = paths[:]
+    starts = np.asarray([p[0] for p in paths], dtype=np.float64)
+    ends = np.asarray([p[-1] for p in paths], dtype=np.float64)
     # Start near top-left so progress on the real canvas is visually predictable.
-    idx = min(range(len(remaining)), key=lambda i: (remaining[i][0][1], remaining[i][0][0]))
-    current = remaining.pop(idx)
-    out = [current]
-    cx, cy = current[-1]
-    while remaining:
-        best_i = 0
-        best_rev = False
-        best_d = float("inf")
-        for i, p in enumerate(remaining):
-            d0 = (p[0][0] - cx) ** 2 + (p[0][1] - cy) ** 2
-            d1 = (p[-1][0] - cx) ** 2 + (p[-1][1] - cy) ** 2
-            if d0 < best_d:
-                best_d, best_i, best_rev = d0, i, False
-            if d1 < best_d:
-                best_d, best_i, best_rev = d1, i, True
-        p = remaining.pop(best_i)
-        if best_rev:
-            p = list(reversed(p))
+    # lexsort on (x, y) is stable, so ties keep the lowest original index,
+    # matching min() over (first.y, first.x).
+    idx = int(np.lexsort((starts[:, 0], starts[:, 1]))[0])
+    taken = np.zeros(n, dtype=bool)
+    taken[idx] = True
+    out: Paths = [paths[idx]]
+    cx, cy = float(ends[idx, 0]), float(ends[idx, 1])
+    for _ in range(n - 1):
+        dx0 = starts[:, 0] - cx
+        dy0 = starts[:, 1] - cy
+        dx1 = ends[:, 0] - cx
+        dy1 = ends[:, 1] - cy
+        d0 = dx0 * dx0
+        d0 = d0 + dy0 * dy0
+        d1 = dx1 * dx1
+        d1 = d1 + dy1 * dy1
+        cand = np.empty((n, 2), dtype=np.float64)
+        cand[:, 0] = d0
+        cand[:, 1] = d1
+        cand[taken] = np.inf
+        flat = int(cand.argmin())
+        i, rev = flat >> 1, bool(flat & 1)
+        taken[i] = True
+        p = paths[i]
+        if rev:
+            p = p[::-1]
+            cx, cy = float(starts[i, 0]), float(starts[i, 1])
+        else:
+            cx, cy = float(ends[i, 0]), float(ends[i, 1])
         out.append(p)
-        cx, cy = p[-1]
     return out

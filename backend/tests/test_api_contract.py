@@ -46,6 +46,9 @@ class FakeDevice:
     def alive(self, hwnd: int) -> bool:
         return hwnd in (GOOD_HWND, BLANK_HWND)
 
+    def activate(self, hwnd: int) -> bool:
+        return True
+
     def title(self, hwnd: int) -> str:
         return "霸王茶姬"
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
@@ -102,6 +103,11 @@ def calibrate(project_id: str, payload: CalibrationRequest, request: Request) ->
     if not device.alive(payload.hwnd):
         raise ApiError(409, "E_WINDOW_LOST", "目标窗口已关闭")
 
+    # 截图 API 要求目标在前台（被遮挡时截到的是遮挡内容），先替用户把窗口带到
+    # 前台；给刚恢复/刚前置的窗口一点重绘时间再截图。
+    device.activate(payload.hwnd)
+    time.sleep(0.3)
+
     try:
         capture = device.capture(payload.hwnd, payload.capture_method)
     except CaptureError as exc:
@@ -149,6 +155,11 @@ def calibrate(project_id: str, payload: CalibrationRequest, request: Request) ->
         dpi_scale=dpi_scale,
         source=payload.mode,
         confidence=confidence,
+        slider=payload.slider.model_dump() if payload.slider else None,
+        undo=payload.undo.model_dump() if payload.undo else None,
+        fold=payload.fold.model_dump() if payload.fold else None,
+        device_kind=payload.device_kind,
+        device_serial=payload.device_serial,
     )
     return {
         "calibrationId": profile.id,
@@ -159,4 +170,9 @@ def calibrate(project_id: str, payload: CalibrationRequest, request: Request) ->
         "confidence": profile.confidence,
         "captureMethod": profile.capture_method,
         "detectedAt": profile.captured_at,
+        "deviceKind": profile.device_kind,
+        "deviceSerial": profile.device_serial,
+        "slider": profile.slider,
+        "undo": profile.undo,
+        "fold": profile.fold,
     }

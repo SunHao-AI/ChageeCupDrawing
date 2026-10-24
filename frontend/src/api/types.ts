@@ -25,6 +25,7 @@ export interface PlanParams {
   topologyRescue: boolean
   targetRecall: number
   hatchLevels: number
+  minStrokePx: number
 }
 
 /** 决定「怎么画」，可不重新规划直接调整。 */
@@ -36,6 +37,12 @@ export interface ExecParams {
   noCoalesce: boolean
   shortStrokeProtect: boolean
   shortStrokeThresholdPx: number
+  focusGuard: boolean
+  cursorTakeoverPx: number
+  guardPollMs: number
+  /** 自动变粗：绘制前标定小程序粗细滑杆并分档换笔。 */
+  autoWidth: boolean
+  widthTiers: number
 }
 
 export interface Rect {
@@ -49,6 +56,29 @@ export interface WindowInfo {
   hwnd: number
   title: string
   className: string
+}
+
+/** 绘制目标类型：pc=本机窗口，mirror=手机投屏窗口。 */
+export type DeviceKind = 'pc' | 'mirror'
+
+export interface AndroidDevice {
+  serial: string
+  model: string
+}
+
+export interface MirrorStatus {
+  serial: string | null
+  label: string
+  hwnd: number
+  running: boolean
+  window_title: string
+}
+
+export interface DeviceList {
+  pcWindows: WindowInfo[]
+  android: AndroidDevice[]
+  mirror: MirrorStatus
+  tools: { available: boolean; missing: string[] }
 }
 
 export interface Project {
@@ -71,6 +101,13 @@ export interface Calibration {
   confidence: number
   captureMethod: string
   detectedAt: string
+  /** 自动变粗标定：粗细滑杆轨道区域、撤销按钮与面板折叠按钮位置（截图坐标）。 */
+  slider?: Rect | null
+  undo?: { x: number; y: number } | null
+  fold?: { x: number; y: number } | null
+  /** 绘制目标类型与来源设备（mirror 时为手机序列号）。 */
+  deviceKind?: DeviceKind
+  deviceSerial?: string | null
 }
 
 export interface PlanMetrics {
@@ -183,6 +220,45 @@ export interface EditProviderInfo {
   label: string
   kind: EditChannel | 'both'
   local: boolean
+  cloud: boolean
+  needsKey: boolean
+}
+
+/** I20 AI 配置（Key 只回掩码）。 */
+export interface AiSettingsInfo {
+  provider: string | null
+  model: string
+  /** OpenAI 兼容 / 本地部署的服务地址；留空表示不启用该通道。 */
+  baseUrl: string
+  apiKeyMasked: string | null
+  hasKey: boolean
+  keyFromEnv: boolean
+  allowCloudEdit: boolean
+  envOverridesKey: boolean
+}
+
+export interface AiSettingsUpdate {
+  provider?: string | null
+  model?: string | null
+  /** undefined=保持已存 Key；''=清除。 */
+  apiKey?: string | null
+  baseUrl?: string | null
+  allowCloudEdit: boolean
+}
+
+export interface AiTestResult {
+  ok: boolean
+  provider?: string
+  reason?: string
+}
+
+/** I21 预检可直接带表单值，无需先保存；缺省字段沿用已保存配置。 */
+export interface AiProbeRequest {
+  provider?: string | null
+  model?: string | null
+  apiKey?: string | null
+  baseUrl?: string | null
+  allowCloudEdit?: boolean | null
 }
 
 export interface EditOp {
@@ -218,4 +294,23 @@ export interface EditApplyResult {
   width: number
   height: number
   edit: EditDraft
+}
+
+/** I22 源图版本历史项。 */
+export interface SourceVersion {
+  version: number
+  label: string
+  current: boolean
+  available: boolean
+}
+
+/** I22 复原结果：复原内容另存为新版本，版本号只增不减。 */
+export interface RevertResult {
+  projectId: string
+  sourceVersion: number
+  parentVersion: number | null
+  revertedFrom: number
+  imageUrl: string
+  width: number
+  height: number
 }

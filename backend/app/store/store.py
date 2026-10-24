@@ -168,6 +168,11 @@ class Store:
         dpi_scale: float,
         source: str,
         confidence: float,
+        slider: dict | None = None,
+        undo: dict | None = None,
+        fold: dict | None = None,
+        device_kind: str = "pc",
+        device_serial: str | None = None,
     ) -> CanvasProfile:
         profile = CanvasProfile(
             id=uuid.uuid4().hex,
@@ -183,12 +188,18 @@ class Store:
             source=source,
             confidence=float(confidence),
             captured_at=utc_now(),
+            slider=slider,
+            undo=undo,
+            fold=fold,
+            device_kind=device_kind,
+            device_serial=device_serial,
         )
         with self._write() as conn:
             conn.execute(
                 "INSERT INTO canvas_profile (id, project_id, hwnd, window_title, capture_method,"
-                " rect_x, rect_y, rect_w, rect_h, dpi_scale, source, confidence, captured_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " rect_x, rect_y, rect_w, rect_h, dpi_scale, source, confidence,"
+                " slider_json, undo_json, fold_json, device_kind, device_serial, captured_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     profile.id,
                     profile.project_id,
@@ -202,6 +213,11 @@ class Store:
                     profile.dpi_scale,
                     profile.source,
                     profile.confidence,
+                    json.dumps(slider) if slider else None,
+                    json.dumps(undo) if undo else None,
+                    json.dumps(fold) if fold else None,
+                    device_kind,
+                    device_serial,
                     profile.captured_at,
                 ),
             )
@@ -315,11 +331,14 @@ class Store:
         if not fields:
             return
         allowed = {
-            "status", "cursor_path", "stop_reason", "error_code", "started_at", "finished_at"
+            "status", "cursor_path", "stop_reason", "error_code", "started_at",
+            "finished_at", "exec_params",
         }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"非法任务字段：{sorted(unknown)}")
+        if "exec_params" in fields and isinstance(fields["exec_params"], dict):
+            fields["exec_params"] = json.dumps(fields["exec_params"], ensure_ascii=False)
         columns = ", ".join(f"{key} = ?" for key in fields)
         with self._write() as conn:
             conn.execute(
@@ -481,6 +500,40 @@ class Store:
         assert project is not None and updated is not None
         return project, updated
 
+    def revert_project(
+        self,
+        *,
+        project_id: str,
+        new_version: int,
+        image_path: Path,
+        image_width: int,
+        image_height: int,
+        parent_version: int,
+        expected_version: int,
+    ) -> Project | None:
+        """复原事务：以历史版本内容生成新版本（版本号只增不减，历史可回溯）。
+
+        expected_version 防止并发编辑后误复原，版本不匹配返回 None。
+        """
+        with self._write() as conn:
+            cur = conn.execute(
+                "UPDATE project SET image_path = ?, image_width = ?, image_height = ?,"
+                " source_version = ?, parent_version = ?"
+                " WHERE id = ? AND source_version = ?",
+                (
+                    str(image_path),
+                    int(image_width),
+                    int(image_height),
+                    int(new_version),
+                    int(parent_version),
+                    project_id,
+                    int(expected_version),
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+        return self.get_project(project_id)
+
     # ---------- 预设 ----------
 
     def create_preset(self, *, name: str, params: dict) -> Preset:
@@ -536,6 +589,10 @@ def _edit(row: sqlite3.Row) -> EditDraft:
 
 
 def _canvas(row: sqlite3.Row) -> CanvasProfile:
+    keys = row.keys()
+    slider_json = row["slider_json"] if "slider_json" in keys else None
+    undo_json = row["undo_json"] if "undo_json" in keys else None
+    fold_json = row["fold_json"] if "fold_json" in keys else None
     return CanvasProfile(
         id=row["id"],
         project_id=row["project_id"],
@@ -550,6 +607,11 @@ def _canvas(row: sqlite3.Row) -> CanvasProfile:
         source=row["source"],
         confidence=row["confidence"],
         captured_at=row["captured_at"],
+        slider=json.loads(slider_json) if slider_json else None,
+        undo=json.loads(undo_json) if undo_json else None,
+        fold=json.loads(fold_json) if fold_json else None,
+        device_kind=(row["device_kind"] if "device_kind" in keys and row["device_kind"] else "pc"),
+        device_serial=row["device_serial"] if "device_serial" in keys else None,
     )
 
 

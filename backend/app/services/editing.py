@@ -21,6 +21,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from app.services.settings_store import AiSettings, AiSettingsStore
+
 logger = logging.getLogger(__name__)
 
 ENTRY_POINT_GROUP = "cupdraw.edit_providers"
@@ -56,6 +58,26 @@ class UnknownProvider(EditError):
 
 class NoGenerativeProvider(EditError):
     """生成通道无任何已注册 provider（Milestone 3 前恒为真）。"""
+
+
+class ProviderNotConfigured(EditError):
+    """生成 provider 已注册但用户尚未配置 API Key。"""
+
+
+class CloudConsentRequired(EditError):
+    """云端 provider 需用户在设置页明示同意图片上传后才可用。"""
+
+
+class ProviderAuthError(EditError):
+    """API Key 无效、欠费或无权限。"""
+
+
+class ProviderTimeoutError(EditError):
+    """生成模型响应超时。"""
+
+
+class ProviderUnavailable(EditError):
+    """网络不可达、服务报错或返回内容无法解析。"""
 
 
 @dataclass(frozen=True)
@@ -102,6 +124,9 @@ class EditProvider(Protocol):
     id: str
     label: str
     supports: Literal["semantic", "generative", "both"]
+    # 云端 provider 需 API Key 且受云上传授权约束；本地 provider 两者皆 False。
+    cloud: bool = False
+    needs_key: bool = False
 
     def parse(self, instruction: str) -> list[EditOp]: ...
 
@@ -374,6 +399,8 @@ class BuiltinSemanticProvider:
     id = "builtin-semantic"
     label = "本地语义编辑"
     supports = "semantic"
+    cloud = False
+    needs_key = False
 
     def parse(self, instruction: str) -> list[EditOp]:
         return parse_instruction(instruction)
@@ -421,9 +448,33 @@ def discover_providers() -> list[EditProvider]:
     return providers
 
 
+@dataclass(frozen=True)
+class RouteDecision:
+    """分流结果：路由层据此选基准图（语义=最新规划掩膜，生成=灰度源图）。"""
+
+    channel: str
+    provider: EditProvider
+    ops: list[EditOp] | None
+
+
 class EditService:
-    def __init__(self, providers: list[EditProvider] | None = None) -> None:
-        self._providers = list(providers) if providers is not None else discover_providers()
+    def __init__(
+        self,
+        providers: list[EditProvider] | None = None,
+        settings: AiSettingsStore | None = None,
+    ) -> None:
+        self._settings = settings
+        if providers is None:
+            providers = discover_providers()
+            # 延迟导入：ai_providers 依赖本模块的错误类型，模块级导入会成环。
+            from app.services.ai_providers import generative_providers
+
+            providers = providers + generative_providers(settings)
+        self._providers = list(providers)
+
+    @property
+    def settings(self) -> AiSettingsStore | None:
+        return self._settings
 
     def providers(self) -> list[EditProvider]:
         return list(self._providers)
@@ -434,17 +485,96 @@ class EditService:
                 return provider
         raise UnknownProvider(f"未注册的编辑 provider：{provider_id}")
 
-    def _resolve(self, provider_id: str | None) -> EditProvider:
-        if provider_id:
-            return self.get(provider_id)
+    def _semantic_provider(self) -> EditProvider:
         for provider in self._providers:
             if provider.supports in ("semantic", "both"):
                 return provider
         raise EditNotUnderstood("没有可用的语义编辑 provider")
 
-    def is_semantic(self, provider_id: str | None) -> bool:
-        """路由用于决定基准图：语义通道以最新规划掩膜为基准（设计稿 2.1）。"""
-        return self._resolve(provider_id).supports in ("semantic", "both")
+    def _generative_provider(self, provider_id: str | None) -> EditProvider:
+        candidates = [p for p in self._providers if p.supports in ("generative", "both")]
+        if provider_id:
+            chosen = self.get(provider_id)
+            if chosen.supports not in ("generative", "both"):
+                raise NoGenerativeProvider(f"provider {provider_id} 不支持生成通道")
+            candidates = [chosen]
+        if not candidates:
+            raise NoGenerativeProvider("生成通道尚未接入任何图像编辑 provider")
+        ai = self._settings.load() if self._settings else None
+        # 用户显式选了尚未接入的服务时直接报错，避免静默改用别的 provider
+        # 导致预检显示通过、实际调用却发到错误的地址。
+        if provider_id is None and ai and ai.provider:
+            if ai.provider not in {p.id for p in self._providers}:
+                raise UnknownProvider(f"provider {ai.provider} 尚未接入")
+        ready = [p for p in candidates if self._usable(p, ai)]
+        if not ready:
+            raise ProviderNotConfigured("生成 provider 尚未配置 API Key，请到设置页填写")
+        configured = next(
+            (p for p in ready if ai and p.id == ai.provider),
+            ready[0],
+        )
+        self._check_consent(configured, ai)
+        return configured
+
+    @staticmethod
+    def _usable(provider: EditProvider, ai: AiSettings | None) -> bool:
+        # provider 可自行判断配置是否完整（如 OpenAI 兼容通道看 base_url）。
+        check = getattr(provider, "available", None)
+        if callable(check):
+            return bool(check(ai))
+        if not getattr(provider, "needs_key", False):
+            return True
+        return bool(ai and ai.api_key)
+
+    @staticmethod
+    def _check_consent(provider: EditProvider, ai: AiSettings | None) -> None:
+        if getattr(provider, "cloud", False) and not (ai and ai.allow_cloud_edit):
+            raise CloudConsentRequired("云端编辑需先授权图片上传，请到设置页开启")
+
+    def route(
+        self, instruction: str, provider_id: str | None, channel: str, roi: dict | None
+    ) -> RouteDecision:
+        """「规则优先、生成兜底」分流（设计文档 ai-edit-provider §2）。"""
+        if channel not in ("auto", "semantic", "generative"):
+            raise EditNotUnderstood(f"未知通道：{channel}")
+
+        if provider_id:
+            provider = self.get(provider_id)
+            if provider.supports in ("semantic", "both") and channel != "generative":
+                ops = [op.with_roi(roi) for op in provider.parse(instruction)]
+                return RouteDecision(channel="semantic", provider=provider, ops=ops)
+            return RouteDecision(
+                channel="generative",
+                provider=self._generative_provider(provider_id),
+                ops=None,
+            )
+
+        if channel == "generative":
+            return RouteDecision(
+                channel="generative",
+                provider=self._generative_provider(None),
+                ops=None,
+            )
+
+        ops: list[EditOp] | None = None
+        parse_failed = False
+        try:
+            ops = [op.with_roi(roi) for op in self._semantic_provider().parse(instruction)]
+        except EditNotUnderstood:
+            parse_failed = True
+
+        if not parse_failed:
+            # auto 与 semantic 在规则命中时一致；semantic 通道未命中直接报错。
+            return RouteDecision(channel="semantic", provider=self._semantic_provider(), ops=ops)
+
+        if channel == "semantic":
+            raise EditNotUnderstood(f"无法从指令中解析出可执行操作：{instruction!r}")
+        try:
+            provider = self._generative_provider(None)
+        except NoGenerativeProvider:
+            # 两条通道都不可用时维持 422「未理解」，501 留给显式请求生成通道的场景。
+            raise EditNotUnderstood(f"无法从指令中解析出可执行操作：{instruction!r}") from None
+        return RouteDecision(channel="generative", provider=provider, ops=None)
 
     def create_draft(
         self,
@@ -454,35 +584,38 @@ class EditService:
         roi: dict | None,
         provider_id: str | None,
         out_dir: Path,
+        channel: str = "auto",
     ) -> DraftResult:
-        provider = self._resolve(provider_id)
+        decision = self.route(instruction, provider_id, channel, roi)
         out_dir.mkdir(parents=True, exist_ok=True)
         draft_path = out_dir / "draft.png"
 
-        if provider.supports in ("semantic", "both"):
-            ops = [op.with_roi(roi) for op in provider.parse(instruction)]
-            provider.apply(base_image, ops, draft_path)
+        if decision.channel == "semantic":
+            ops = decision.ops
+            if ops is None:
+                ops = [op.with_roi(roi) for op in decision.provider.parse(instruction)]
+            decision.provider.apply(base_image, ops, draft_path)
             ink = load_ink(draft_path)
             diff_path = out_dir / "diff.png"
             make_diff_image(base_image, ink, diff_path)
             return DraftResult(
                 channel="semantic",
-                provider_id=provider.id,
+                provider_id=decision.provider.id,
                 parsed_ops=ops,
                 draft_path=draft_path,
                 diff_path=diff_path,
                 ink_ratio=float((ink > 0).mean()),
             )
 
-        if not any(p.supports in ("generative", "both") for p in self._providers):
-            raise NoGenerativeProvider("生成通道尚未接入任何图像编辑 provider")
-        generated = provider.generate(base_image, roi, instruction, draft_path)
+        generated = decision.provider.generate(base_image, roi, instruction, draft_path)
         ink = load_ink(generated)
+        diff_path = out_dir / "diff.png"
+        make_diff_image(base_image, ink, diff_path)
         return DraftResult(
             channel="generative",
-            provider_id=provider.id,
+            provider_id=decision.provider.id,
             parsed_ops=None,
             draft_path=generated,
-            diff_path=None,
+            diff_path=diff_path,
             ink_ratio=float((ink > 0).mean()),
         )

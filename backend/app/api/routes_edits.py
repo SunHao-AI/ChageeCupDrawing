@@ -1,7 +1,9 @@
-"""I16 编辑 provider 列表、I17 发起编辑、I18 应用草稿、I19 丢弃草稿。"""
+"""I16 编辑 provider 列表、I17 发起编辑、I18 应用草稿、I19 丢弃草稿、I22 版本历史/复原。"""
 
 from __future__ import annotations
 
+import json
+import re
 import shutil
 from pathlib import Path
 
@@ -10,16 +12,22 @@ from fastapi.responses import FileResponse
 from PIL import Image
 
 from app.api.errors import ApiError
-from app.api.schemas import EditRequest
+from app.api.schemas import EditRequest, RevertRequest
 from app.services.editing import (
+    CloudConsentRequired,
     EditNotUnderstood,
     EditService,
     NoGenerativeProvider,
+    ProviderAuthError,
+    ProviderNotConfigured,
+    ProviderTimeoutError,
+    ProviderUnavailable,
     UnknownProvider,
     load_ink,
 )
 from app.store.models import EditDraft, Project
 from app.store.store import Store
+from app.services.settings_store import KEY_HEADER, request_key
 
 router = APIRouter()
 
@@ -74,7 +82,9 @@ def list_providers(request: Request) -> list[dict[str, object]]:
             "id": provider.id,
             "label": provider.label,
             "kind": provider.supports,
-            "local": provider.id == "builtin-semantic",
+            "local": not getattr(provider, "cloud", False),
+            "cloud": getattr(provider, "cloud", False),
+            "needsKey": getattr(provider, "needs_key", False),
         }
         for provider in _service(request).providers()
     ]
@@ -96,13 +106,39 @@ def create_edit(project_id: str, payload: EditRequest, request: Request) -> dict
 
     edit_id = store.new_edit_id()
     service = _service(request)
-    try:
-        # 语义通道编辑最新规划掩膜（与预览一致），生成通道编辑源图（设计稿 2.1）。
+    instruction = payload.instruction.strip()
+    # Key 由浏览器随请求带来，只在本请求内可见；服务端不保存、不记日志。
+    with request_key(request.headers.get(KEY_HEADER)):
         try:
-            semantic = service.is_semantic(payload.provider)
+            return _create_draft(store, service, project, payload, edit_id, instruction)
+        except ApiError:
+            shutil.rmtree(store.edit_dir(edit_id), ignore_errors=True)
+            raise
+        except Exception:
+            shutil.rmtree(store.edit_dir(edit_id), ignore_errors=True)
+            raise
+
+
+def _create_draft(
+    store: Store,
+    service: EditService,
+    project: Project,
+    payload: EditRequest,
+    edit_id: str,
+    instruction: str,
+) -> dict[str, object]:
+    try:
+        try:
+            decision = service.route(instruction, payload.provider, payload.channel, None)
         except EditNotUnderstood as exc:
-            raise ApiError(422, "E_EDIT_NOT_UNDERSTOOD", "没有可用的语义编辑 provider") from exc
-        base_image = _semantic_base(store, project) if semantic else Path(project.image_path)
+            raise ApiError(422, "E_EDIT_NOT_UNDERSTOOD", "没有理解这条指令，请换一种说法", str(exc)) from exc
+
+        # 语义通道编辑最新规划掩膜（与预览一致），生成通道编辑源图（设计稿 2.1）。
+        base_image = (
+            _semantic_base(store, project)
+            if decision.channel == "semantic"
+            else Path(project.image_path)
+        )
 
         roi = None
         if payload.roi is not None:
@@ -114,10 +150,11 @@ def create_edit(project_id: str, payload: EditRequest, request: Request) -> dict
 
         result = service.create_draft(
             base_image=base_image,
-            instruction=payload.instruction.strip(),
+            instruction=instruction,
             roi=roi,
             provider_id=payload.provider,
             out_dir=store.edit_dir(edit_id),
+            channel=payload.channel,
         )
     except EditNotUnderstood as exc:
         shutil.rmtree(store.edit_dir(edit_id), ignore_errors=True)
@@ -127,6 +164,21 @@ def create_edit(project_id: str, payload: EditRequest, request: Request) -> dict
     except NoGenerativeProvider as exc:
         shutil.rmtree(store.edit_dir(edit_id), ignore_errors=True)
         raise ApiError(501, "E_NOT_IMPLEMENTED", str(exc)) from exc
+    except ProviderNotConfigured as exc:
+        shutil.rmtree(store.edit_dir(edit_id), ignore_errors=True)
+        raise ApiError(422, "E_PROVIDER_NOT_CONFIGURED", str(exc)) from exc
+    except CloudConsentRequired as exc:
+        shutil.rmtree(store.edit_dir(edit_id), ignore_errors=True)
+        raise ApiError(403, "E_CONSENT_REQUIRED", str(exc)) from exc
+    except ProviderAuthError as exc:
+        shutil.rmtree(store.edit_dir(edit_id), ignore_errors=True)
+        raise ApiError(401, "E_PROVIDER_AUTH", str(exc)) from exc
+    except ProviderTimeoutError as exc:
+        shutil.rmtree(store.edit_dir(edit_id), ignore_errors=True)
+        raise ApiError(504, "E_PROVIDER_TIMEOUT", str(exc)) from exc
+    except ProviderUnavailable as exc:
+        shutil.rmtree(store.edit_dir(edit_id), ignore_errors=True)
+        raise ApiError(502, "E_PROVIDER_UNAVAILABLE", str(exc)) from exc
     except ApiError:
         shutil.rmtree(store.edit_dir(edit_id), ignore_errors=True)
         raise
@@ -136,7 +188,7 @@ def create_edit(project_id: str, payload: EditRequest, request: Request) -> dict
 
     draft = store.create_edit_draft(
         edit_id=edit_id,
-        project_id=project_id,
+        project_id=project.id,
         base_version=project.source_version,
         channel=result.channel,
         instruction=payload.instruction.strip(),
@@ -247,3 +299,109 @@ def discard_edit(edit_id: str, request: Request) -> dict[str, object]:
     _editable_draft(store, edit_id)
     store.delete_edit_draft(edit_id)
     return {"discarded": edit_id}
+
+
+_VERSION_FILE = re.compile(r"^source_v(\d+)\.(png|jpg|jpeg)$", re.IGNORECASE)
+
+
+def _version_files(store: object, project_id: str) -> dict[int, Path]:
+    directory = store.project_dir(project_id)  # type: ignore[attr-defined]
+    found: dict[int, Path] = {}
+    if directory.is_dir():
+        for entry in directory.iterdir():
+            match = _VERSION_FILE.match(entry.name)
+            if match and entry.is_file():
+                found[int(match.group(1))] = entry
+    return found
+
+
+@router.get("/projects/{project_id}/versions")
+def list_versions(project_id: str, request: Request) -> list[dict[str, object]]:
+    """源图版本历史：磁盘上实际存在的 source_vN 文件 + 产生该版本的编辑指令。"""
+    store = request.app.state.store
+    project = store.get_project(project_id)
+    if project is None:
+        raise ApiError(404, "E_NOT_FOUND", "项目不存在")
+
+    files = _version_files(store, project_id)
+    # 应用记录按 base_version 归档：base_version=N-1 的已应用草稿产出了 vN。
+    produced: dict[int, str] = {}
+    for draft in store.list_edit_drafts(project_id):
+        if draft.applied_at is not None:
+            produced[draft.base_version + 1] = draft.instruction
+
+    versions: list[dict[str, object]] = []
+    for version in sorted(files, reverse=True):
+        label = "初始导入" if version == 1 else produced.get(version, "编辑")
+        meta = files[version].with_name(files[version].name + ".meta")
+        if meta.is_file():
+            try:
+                label = str(json.loads(meta.read_text(encoding="utf-8")).get("label", label))
+            except (ValueError, OSError):
+                pass
+        versions.append(
+            {
+                "version": version,
+                "label": label,
+                "current": version == project.source_version,
+                "available": files[version].is_file(),
+            }
+        )
+    return versions
+
+
+@router.post("/projects/{project_id}/revert")
+def revert_project(project_id: str, payload: RevertRequest, request: Request) -> dict[str, object]:
+    """复原到历史版本：把 vN 内容另存为新版本并切换指针（版本号只增，历史不丢）。"""
+    store = request.app.state.store
+    project = store.get_project(project_id)
+    if project is None:
+        raise ApiError(404, "E_NOT_FOUND", "项目不存在")
+    target = payload.target_version
+    if target == project.source_version:
+        raise ApiError(409, "E_INVALID_ARGUMENT", "已经是该版本")
+
+    files = _version_files(store, project_id)
+    source = files.get(target)
+    if source is None or not source.is_file():
+        raise ApiError(404, "E_VERSION_MISSING", f"版本 v{target} 的文件不存在")
+
+    new_version = max(files) + 1
+    new_path = store.project_dir(project_id) / f"source_v{new_version}.png"
+    try:
+        shutil.copyfile(source, new_path)
+        new_path.with_name(new_path.name + ".meta").write_text(
+            json.dumps({"label": f"复原至 v{target}", "from": target}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        with Image.open(new_path) as img:
+            width, height = img.size
+        reverted = store.revert_project(
+            project_id=project_id,
+            new_version=new_version,
+            image_path=new_path,
+            image_width=width,
+            image_height=height,
+            parent_version=target,
+            expected_version=project.source_version,
+        )
+    except ApiError:
+        new_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        new_path.unlink(missing_ok=True)
+        raise ApiError(422, "E_EDIT_FAILED", "复原失败，当前版本不受影响", str(exc)) from exc
+
+    if reverted is None:
+        new_path.unlink(missing_ok=True)
+        raise ApiError(409, "E_VERSION_STALE", "项目版本已变化，请刷新后重试")
+
+    return {
+        "projectId": reverted.id,
+        "sourceVersion": reverted.source_version,
+        "parentVersion": reverted.parent_version,
+        "revertedFrom": target,
+        "imageUrl": f"/api/projects/{reverted.id}/image",
+        "width": reverted.image_width,
+        "height": reverted.image_height,
+    }

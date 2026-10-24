@@ -12,10 +12,11 @@ dependencies = [
     "opencv-python==4.11.0.86",
     "Pillow>=10,<12",
     "python-multipart==0.0.20",
+    "httpx==0.28.1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx==0.28.1"]
+dev = ["pytest"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

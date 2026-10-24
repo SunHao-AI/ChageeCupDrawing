@@ -22,10 +22,12 @@ from app.config import (
     Settings,
 )
 from app.device.geometry import make_dpi_aware
+from app.device.mirror import MirrorService
 from app.device.service import DeviceService
 from app.executor.service import ExecutorService
 from app.services.editing import EditService
 from app.services.planning import PlanningService
+from app.services.settings_store import AiSettingsStore
 from app.store.store import Store
 
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
@@ -61,8 +63,12 @@ def create_app(
     app.state.store = store
     app.state.planner = planning
     app.state.device = devices
+    app.state.mirror = MirrorService(settings.data_dir, devices)
     app.state.executor = drawing
-    app.state.editor = EditService()
+    app.state.ai_settings = AiSettingsStore(settings.data_dir)
+    # Key 由浏览器持有；启动时清掉旧版本落在磁盘上的明文。
+    app.state.ai_settings.purge_stored_key()
+    app.state.editor = EditService(settings=app.state.ai_settings)
     install_error_handlers(app)
 
     @app.middleware("http")
@@ -79,6 +85,10 @@ def create_app(
                     httponly=True,
                     samesite="strict",
                     path="/",
+                    # 经反向代理时以 X-Forwarded-Proto 判断，避免 HTTPS 下漏发 Secure。
+                    secure=request.headers.get(
+                        "x-forwarded-proto", request.url.scheme
+                    ) == "https",
                 )
             return response
 

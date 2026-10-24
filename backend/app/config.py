@@ -33,3 +33,6 @@ class Settings:
     static_dir: Path | None = None
     # 为空时启动生成；测试可注入固定值以断言鉴权行为。
     session_token: str | None = None
+    # 默认只监听回环。CUPDRAW_BIND=0.0.0.0 开启局域网模式，供手机/平板控制。
+    bind_host: str = field(default_factory=lambda: os.environ.get("CUPDRAW_BIND", "127.0.0.1"))
+    port: int = field(default_factory=lambda: int(os.environ.get("CUPDRAW_PORT", "8765")))

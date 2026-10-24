@@ -8,13 +8,18 @@ import StudioView from '@/views/StudioView.vue'
 import CalibrateView from '@/views/CalibrateView.vue'
 import RunView from '@/views/RunView.vue'
 import PresetsView from '@/views/PresetsView.vue'
+import SettingsView from '@/views/SettingsView.vue'
+import { useAiStore } from '@/stores/ai'
 
 const VIEWS: { key: ViewKey; label: string }[] = [
   { key: 'studio', label: '工作台' },
   { key: 'calibrate', label: '校准' },
   { key: 'run', label: '绘制' },
   { key: 'presets', label: '预设' },
+  { key: 'settings', label: '设置' },
 ]
+
+const aiStore = useAiStore()
 
 const projectStore = useProjectStore()
 const current = shallowRef<ViewKey>('studio')
@@ -24,7 +29,14 @@ const backend = shallowRef<{ ok: boolean; version: string }>({ ok: false, versio
 const fileProtocol = window.location.protocol === 'file:'
 
 const currentComponent = computed(
-  () => ({ studio: StudioView, calibrate: CalibrateView, run: RunView, presets: PresetsView })[current.value],
+  () =>
+    ({
+      studio: StudioView,
+      calibrate: CalibrateView,
+      run: RunView,
+      presets: PresetsView,
+      settings: SettingsView,
+    })[current.value],
 )
 
 function onGoto(view: ViewKey) {
@@ -48,6 +60,7 @@ async function ping() {
 
 onMounted(() => {
   ping()
+  aiStore.load()
   projectStore.refreshWindows()
   window.addEventListener('dragover', blockFileNavigation)
   window.addEventListener('drop', blockFileNavigation)
@@ -200,5 +213,45 @@ onUnmounted(() => {
 
 .file-hint .num {
   color: var(--gold);
+}
+
+/* 窄屏：顶栏换行——品牌/徽标一行，页签整行横向滑动；项目信息让位 */
+@media (max-width: 1023px) {
+  .topbar {
+    flex-wrap: wrap;
+    align-content: center;
+    row-gap: 2px;
+    height: auto;
+    min-height: 52px;
+    padding: 6px 12px;
+  }
+
+  .brand {
+    flex: none;
+  }
+
+  .brand-name {
+    display: none;
+  }
+
+  .project-chip {
+    display: none;
+  }
+
+  .tabs {
+    order: 3;
+    flex: 1 0 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .tab {
+    flex: none;
+    white-space: nowrap;
+  }
+
+  .content {
+    padding: 12px 12px 24px;
+  }
 }
 </style>

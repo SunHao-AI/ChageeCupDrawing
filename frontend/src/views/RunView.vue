@@ -18,11 +18,25 @@ const projectStore = useProjectStore()
 
 const countdownMs = shallowRef<number>(TASK_CONTROLS.countdownMs.default)
 const allowDrift = shallowRef<number>(TASK_CONTROLS.allowDrift.default)
+// 窄屏下参数侧栏折叠为抽屉；桌面端 CSS 保证侧栏常开，此状态无效果。
+const paramsOpen = shallowRef(false)
 
 const planReady = computed(() => planStore.summary !== null && !planStore.pending)
 const running = computed(() => taskStore.isActive)
 const progress = computed(() => taskStore.progress)
 const snapshot = computed(() => taskStore.snapshot)
+
+/** 守护/急停触发的暂停：语义是「等用户切回目标后手动续画」，区别于普通停止。 */
+const GUARD_STOP_HINTS: Record<string, string> = {
+  focus_lost: '目标窗口失去焦点或已最小化，已立即抬笔。请切回小程序窗口，再从断点续画。',
+  mouse_takeover: '检测到鼠标被你接管，已立即抬笔。回到小程序窗口后从断点续画即可。',
+  esc: '已按 ESC 急停，笔已抬起。可从断点续画。',
+}
+const guardStopHint = computed(() =>
+  snapshot.value?.status === 'STOPPED' && snapshot.value.stopReason
+    ? GUARD_STOP_HINTS[snapshot.value.stopReason] ?? null
+    : null,
+)
 
 const statusLabel = computed(() => {
   switch (snapshot.value?.status) {
@@ -35,7 +49,7 @@ const statusLabel = computed(() => {
     case 'DONE':
       return '绘制完成'
     case 'STOPPED':
-      return '已停止，可续画'
+      return guardStopHint.value ? '已暂停，可续画' : '已停止，可续画'
     case 'FAILED':
       return `失败：${snapshot.value?.errorCode ?? ''}`
     default:
@@ -77,14 +91,33 @@ async function onResume() {
   await taskStore.resume(countdownMs.value, allowDrift.value)
 }
 
-onMounted(() => taskStore.ensureStream())
+/** 窄屏抽屉交互：参数调整完（滑杆松手/开关切换触发 change）自动收起。 */
+function onParamChanged() {
+  if (window.innerWidth < 1024) paramsOpen.value = false
+}
 
-onUnmounted(() => taskStore.detach())
+// 手机浏览器会冻结后台标签的 SSE；回到前台时主动拉一次快照、重接事件流。
+function onVisibility() {
+  if (document.visibilityState === 'visible') taskStore.ensureStream()
+}
+
+onMounted(() => {
+  taskStore.ensureStream()
+  document.addEventListener('visibilitychange', onVisibility)
+})
+
+onUnmounted(() => {
+  document.removeEventListener('visibilitychange', onVisibility)
+  taskStore.detach()
+})
 </script>
 
 <template>
-  <div class="run">
-    <aside class="card side">
+  <div class="split run" style="--split-side: 340px">
+    <button class="btn btn-sm params-toggle" @click="paramsOpen = !paramsOpen">
+      {{ paramsOpen ? '收起执行参数' : '展开执行参数' }}
+    </button>
+    <aside class="card side" :class="{ open: paramsOpen }">
       <h3 class="card-title">执行参数</h3>
       <ParamField
         v-for="meta in EXEC_FIELDS"
@@ -93,7 +126,14 @@ onUnmounted(() => taskStore.detach())
         :model-value="(paramsStore.exec as any)[meta.key]"
         :disabled="running"
         @update:model-value="paramsStore.setExec({ [meta.key]: $event } as any)"
+        @change="onParamChanged"
       />
+      <div
+        v-if="paramsStore.exec.autoWidth && !projectStore.calibration?.slider"
+        class="banner banner-warn auto-width-tip"
+      >
+        自动变粗需要先在「校准」页框选笔粗细滑杆轨道（建议同时标记撤销按钮与「∨」折叠按钮，分别用于标定后自动清空画布、绘制时自动折叠工具面板）。
+      </div>
 
       <div class="divider"></div>
       <h3 class="card-title">任务控制</h3>
@@ -126,16 +166,16 @@ onUnmounted(() => taskStore.detach())
         badge="!"
         title="倒计时中：立刻切换到目标窗口"
       >
-        把画板窗口点到前台并保持画布可见，倒计时结束校验通过后会自动落笔。
+        把画板窗口点到前台并保持画布可见。倒计时末段若目标不在前台会暂停等待，切回后自动继续。
       </GuideCard>
       <GuideCard
         v-else-if="showStartGuide"
         badge="4"
-        title="点击「开始绘制」，然后切窗口"
+        title="点击「开始绘制」，自动切到目标窗口"
         action="开始绘制"
         @action="onStart"
       >
-        ① 点开始 → ② 倒计时内切到目标窗口 → ③ 自动校验后自动落笔；按 ESC 可随时急停。
+        ① 点开始 → ② 自动把小程序带到前台并倒计时（若被系统拦下再手动切一下）→ ③ 自动校验后自动落笔；按 ESC 可随时急停。
       </GuideCard>
 
       <div class="progress-block">
@@ -151,6 +191,16 @@ onUnmounted(() => taskStore.detach())
 
       <ErrorBanner v-if="taskStore.error" kind="error">{{ taskStore.error }}</ErrorBanner>
       <ErrorBanner v-for="(warn, i) in taskStore.warnings" :key="i" kind="warn">{{ warn.message }}</ErrorBanner>
+      <GuideCard
+        v-if="guardStopHint"
+        tone="urgent"
+        badge="!"
+        title="绘制已暂停"
+        action="从断点续画"
+        @action="onResume"
+      >
+        {{ guardStopHint }}
+      </GuideCard>
       <div v-if="advice" class="advice">
         <span>{{ advice.text }}</span>
         <button v-if="advice.goto" class="btn btn-sm" @click="emit('goto', advice.goto)">{{ advice.action }}</button>
@@ -178,11 +228,41 @@ onUnmounted(() => taskStore.detach())
 </template>
 
 <style scoped>
-.run {
-  display: grid;
-  grid-template-columns: 340px minmax(0, 1fr);
-  gap: 16px;
-  align-items: start;
+/* 分栏骨架复用全局 .split（<1024px 自动单列），此处只管抽屉与手机细节 */
+.params-toggle {
+  display: none;
+}
+
+/* 平板竖屏：参数栏折叠为顶部抽屉 */
+@media (max-width: 1023px) {
+  .params-toggle {
+    display: flex;
+    justify-self: start;
+  }
+
+  .side {
+    display: none;
+  }
+
+  .side.open {
+    display: block;
+  }
+}
+
+/* 手机：进度大字号压缩、操作条全宽易点 */
+@media (max-width: 639px) {
+  .pct {
+    font-size: 40px;
+  }
+
+  .controls {
+    flex-wrap: wrap;
+  }
+
+  .controls .btn {
+    flex: 1 1 auto;
+    min-height: 44px;
+  }
 }
 
 .side {
@@ -194,6 +274,13 @@ onUnmounted(() => taskStore.detach())
   font-size: 11px;
   color: var(--text-faint);
   margin-top: 3px;
+}
+
+/* 触摸设备：小字号提一档 */
+@media (pointer: coarse), (max-width: 1376px) {
+  .hint {
+    font-size: 12px;
+  }
 }
 
 .divider {
@@ -213,6 +300,8 @@ onUnmounted(() => taskStore.detach())
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .stage-head .card-title {
@@ -275,6 +364,7 @@ onUnmounted(() => taskStore.detach())
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
   padding: 9px 12px;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);

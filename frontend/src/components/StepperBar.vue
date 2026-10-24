@@ -117,4 +117,25 @@ const currentIndex = computed(() => steps.value.findIndex((step) => !step.done))
   color: #1a1408;
   font-weight: 700;
 }
+
+/* 窄屏：步骤条横向滑动而不是把文字挤成竖排 */
+@media (max-width: 1023px) {
+  .stepper {
+    overflow-x: auto;
+    scrollbar-width: none;
+    padding: 7px 12px;
+  }
+
+  .step {
+    flex: none;
+    white-space: nowrap;
+  }
+}
+
+/* 平板/触摸端：序号圆点数字提一档 */
+@media (pointer: coarse), (max-width: 1376px) {
+  .dot {
+    font-size: 12px;
+  }
+}
 </style>

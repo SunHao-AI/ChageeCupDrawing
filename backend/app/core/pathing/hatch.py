@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
 
@@ -135,8 +137,14 @@ def tone_contour_paths(
     simplify_px: float,
     min_pixels: int = 8,
     background: np.ndarray | None = None,
+    min_stroke_px: int = 0,
 ) -> Paths:
-    """提取多级等值线并串成连续笔迹（输入为 tone_field / tone_area 的输出）。"""
+    """提取多级等值线并串成连续笔迹（输入为 tone_field / tone_area 的输出）。
+
+    ``min_stroke_px`` 按笔迹长度过滤碎线：等值线在相邻密集区之间串成的短横档
+    （梯子横木状伪影）是碎线的主要来源，长度过滤比面积过滤更贴近「这条线画
+    出来好不好看」。0 表示不过滤（兼容 V6 金标准路径）。
+    """
     boundary = tone_boundary(tone)
     if background is not None:
         # 吃掉背景与内容接缝上的边框线：预平滑把明暗过渡带展宽约 ±5 px，
@@ -154,9 +162,16 @@ def tone_contour_paths(
         return []
 
     paths: Paths = []
+    min_len = max(0.0, float(min_stroke_px))
     for raw in greedy_skeleton_paths(keep):
         if len(raw) < 2:
             continue
+        if min_len > 0:
+            length = sum(
+                math.hypot(x2 - x1, y2 - y1) for (x1, y1), (x2, y2) in zip(raw, raw[1:])
+            )
+            if length < min_len:
+                continue
         smoothed = simplify_polyline(raw, max(0.12, float(simplify_px) * 1.2), False)
         if len(smoothed) >= 2:
             paths.append(chaikin_smooth(smoothed, 2))

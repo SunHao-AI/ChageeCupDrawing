@@ -128,7 +128,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="studio">
+  <div class="split studio" style="--split-side: 340px">
     <input ref="fileInput" type="file" accept="image/png,image/jpeg" hidden @change="onFile" />
 
     <aside class="card panel scroll">
@@ -223,6 +223,7 @@ onMounted(() => {
           v-if="editStore.available"
           :summary="planStore.summary"
           :pending="planStore.pending"
+          @settings="emit('goto', 'settings')"
         />
         <div class="run-bar">
           <span class="run-hint num">
@@ -243,15 +244,29 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.studio {
-  display: grid;
-  grid-template-columns: 340px minmax(0, 1fr);
-  gap: 16px;
-  align-items: start;
-}
-
 .panel {
   max-height: calc(100vh - 108px);
+}
+
+/* 单列堆叠后侧栏不再内部滚动，随页面自然流动 */
+@media (max-width: 1023px) {
+  .panel {
+    max-height: none;
+  }
+}
+
+/* 触摸设备：小字号统一提一档，保证平板可读 */
+@media (pointer: coarse), (max-width: 1376px) {
+  .source-meta,
+  .group-name {
+    font-size: 12px;
+  }
+
+  .source-empty,
+  .saved-ok,
+  .run-hint {
+    font-size: 13px;
+  }
 }
 
 .panel-head {
@@ -353,6 +368,8 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .run-hint {

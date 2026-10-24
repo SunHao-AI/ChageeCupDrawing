@@ -76,7 +76,7 @@ onMounted(() => presetStore.load())
 </script>
 
 <template>
-  <div class="presets">
+  <div class="split presets" style="--split-side: 320px">
     <input ref="importInput" type="file" accept="application/json" hidden @change="onImport" />
 
     <aside class="card side scroll">
@@ -131,15 +131,14 @@ onMounted(() => presetStore.load())
 </template>
 
 <style scoped>
-.presets {
-  display: grid;
-  grid-template-columns: 320px minmax(0, 1fr);
-  gap: 16px;
-  align-items: start;
-}
-
 .side {
   max-height: calc(100vh - 108px);
+}
+
+@media (max-width: 1023px) {
+  .side {
+    max-height: none;
+  }
 }
 
 .side-head {
@@ -193,6 +192,8 @@ onMounted(() => presetStore.load())
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-bottom: 14px;
 }
 
@@ -217,6 +218,14 @@ onMounted(() => presetStore.load())
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+}
+
+/* 窄屏：参数对比表横向滚动，不压缩单元格 */
+@media (max-width: 639px) {
+  .diff {
+    display: block;
+    overflow-x: auto;
+  }
 }
 
 .diff th {

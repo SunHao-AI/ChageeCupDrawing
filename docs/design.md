@@ -424,7 +424,11 @@ V6 把这套逻辑写在 `build_drawing_plan` 内部并直接返回 dataclass，
 | `E_EDIT_INK_OUT_OF_RANGE` | 422 | 应用编辑草稿后墨量占比超出安全范围（<1% 或 >40%） |
 | `E_VERSION_STALE` | 409 | 编辑请求/应用基于过期的源图版本 |
 | `E_EDIT_APPLIED` | 409 | 编辑草稿已被应用，不可重复生效 |
-| `E_CONSENT_REQUIRED` | 403 | 未授权云端编辑即指定云端 provider（预留，随云端 provider 接入） |
+| `E_CONSENT_REQUIRED` | 403 | 未授权图片上传即使用云端 provider（见 ai-edit-provider-design §4.3） |
+| `E_PROVIDER_NOT_CONFIGURED` | 422 | 生成通道 provider 已注册但未配置 API Key / 服务地址 |
+| `E_PROVIDER_AUTH` | 401 | API Key 无效、欠费或无权限访问所选模型 |
+| `E_PROVIDER_TIMEOUT` | 504 | 生成模型响应超时（单次 180 s 上限） |
+| `E_PROVIDER_UNAVAILABLE` | 502 | 生成模型服务不可达、报错或未返回图像 |
 
 错误响应统一为 `{ errorCode, message, detail? }`，`message` 为可直接展示给用户的中文短句。
 

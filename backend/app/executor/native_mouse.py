@@ -61,6 +61,8 @@ class NativeMouse:
         self.user32 = ctypes.WinDLL("user32", use_last_error=True)
         self.user32.SendInput.argtypes = (ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int)
         self.user32.SendInput.restype = ctypes.c_uint
+        self._button_active = False
+        self._last_up_mono = 0.0
 
     # ---------- 基础 ----------
 
@@ -103,10 +105,20 @@ class NativeMouse:
         self._send_mouse(flags, x, y)
 
     def down(self) -> None:
+        self._button_active = True
         self._send_mouse(self.MOUSEEVENTF_LEFTDOWN)
 
     def up(self) -> None:
+        # 先置状态再发事件：守护线程读到按下位时豁免已生效。
+        self._button_active = False
+        self._last_up_mono = time.monotonic()
         self._send_mouse(self.MOUSEEVENTF_LEFTUP)
+
+    def button_active(self) -> bool:
+        return self._button_active
+
+    def last_button_mono(self) -> float:
+        return self._last_up_mono
 
     def click(self, x: float, y: float, hold: float = 0.020) -> None:
         self.move_to(x, y)
