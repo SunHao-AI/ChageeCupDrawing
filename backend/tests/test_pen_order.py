@@ -1,40 +1,32 @@
-"""tier_groups 单测：局部线密度分档 + 「信号退化时原样返回」保证既有顺序逐位不变。"""
+"""逐段目标行程与容差分桶单测：密度百分位 + 桶下缘点位 + 桶间宽→窄。"""
 
 from __future__ import annotations
 
-from app.executor.pen_order import tier_groups
+from app.executor.pen_order import target_fractions, width_buckets
 
 
-def _paths() -> list[list[tuple[float, float]]]:
-    # 密集区：8 条横线挤在 16px 高度内（线密度高=暗部）；稀疏区：两条远离彼此。
-    dense = [[(10 + i, 10 + j * 2) for i in range(40)] for j in range(8)]
-    sparse = [[(200 + i, 200) for i in range(40)], [(200, 300 + i) for i in range(40)]]
-    return dense + sparse
+def test_target_fractions_monotonic_by_density():
+    dense = [[(x, 10) for x in range(0, 20)]] + [
+        [(x, y) for x in range(0, 20)] for y in range(8, 30)  # 22 条平行线：高密度簇
+    ]
+    sparse = [[(0, 200), (50, 200)]]  # 远离簇的孤线：低密度
+    fr = target_fractions(dense + sparse)
+    assert fr[-1] < 0.1  # 孤线 → 行程最低（最细）
+    assert max(fr[:-1]) > 0.9  # 簇心笔画 → 接近满行程
+    assert len(fr) == len(dense) + len(sparse)
 
 
-def test_tiers_split_dense_vs_sparse() -> None:
-    paths = _paths()
-    groups = tier_groups(paths, 2)
-    assert groups, "应有分组"
-    assert groups[0][0] == 1  # 粗档先绘制
-    # 稀疏区的两条线密度最低，绝不该进粗档。
-    fine = groups[-1][1]
-    assert paths[-2] in fine and paths[-1] in fine
-    total = sum(len(group) for _, group in groups)
-    assert total == len(paths)
+def test_width_buckets_ordering_and_coverage():
+    paths = [[(i, 5), (i + 1, 6)] for i in range(0, 100, 10)]
+    buckets = width_buckets(paths, 0.05)
+    assert [b[0] for b in buckets] == sorted([b[0] for b in buckets], reverse=True)
+    assert sum(len(b[2]) for b in buckets) == len(paths)
+    for bucket_id, edge, _ in buckets:
+        assert abs(edge - bucket_id * 0.05) < 1e-9  # 点位取桶下缘
 
 
-def test_all_paths_covered_and_tiers_descend() -> None:
-    paths = _paths()
-    groups = tier_groups(paths, 3)
-    total = sum(len(group) for _, group in groups)
-    assert total == len(paths)
-    tiers = [tier for tier, _ in groups]
-    assert tiers == sorted(tiers, reverse=True)  # 粗档先绘制
-
-
-def test_degenerate_signal_keeps_original_order() -> None:
-    # 单条路径无区分度 → 单档原样返回。
-    single = [[(i, i) for i in range(50)]]
-    groups = tier_groups(single, 4)
-    assert groups == [(0, single)]
+def test_width_buckets_tol_bounds():
+    # tol=0.05 → 桶号 ≤ 19；空桶跳过
+    paths = [[(0, y), (30, y)] for y in (10, 200, 400)]
+    buckets = width_buckets(paths, 0.05)
+    assert all(0 <= b[0] <= 19 for b in buckets)

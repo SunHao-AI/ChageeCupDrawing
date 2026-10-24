@@ -23,7 +23,7 @@ from app.executor.guard import GuardProbe, Win32GuardProbe, evaluate_signals
 from app.executor.native_mouse import NativeMouse, path_length
 from app.executor.panel_control import PanelController
 from app.executor.pen_calibration import CalibrationError, PenCalibrator
-from app.executor.pen_order import tier_groups
+from app.executor.pen_order import width_buckets
 from app.store.models import PlanRecord, TaskRecord, utc_now
 from app.store.store import Store
 
@@ -624,12 +624,16 @@ class ExecutorService:
         paths: list[list[tuple[float, float]]],
         params: ExecParams,
     ) -> list[tuple[int, list[tuple[float, float]]]]:
-        """有宽度表时按局部笔迹密度分档重排（先粗后细），否则平铺为单档。"""
+        """有宽度表时按局部笔迹密度分桶重排（先粗后细），否则平铺为单桶。"""
         tiers = len(params.width_table) if params.width_table else 0
         if tiers < 2:
             return [(0, p) for p in paths]
-        groups = tier_groups(paths, tiers)
-        return [(tier, path) for tier, group in groups for path in group]
+        # 此处为过渡适配，Task 6 改为容差语义：现有参数只有档数，先换算为
+        # tol = 1/档数（档数≈桶数、整图换宽次数不变），再取新分桶结构的第 3 项
+        # 平铺成原有「(档号, 笔迹)」形状喂给下游换宽逻辑。
+        tol = 1.0 / max(1, tiers)
+        groups = width_buckets(paths, tol)
+        return [(bucket, path) for bucket, _edge, group in groups for path in group]
 
     def _start_guard(
         self, mouse: object, target: DrawingTarget, params: ExecParams, handle: _RunHandle
