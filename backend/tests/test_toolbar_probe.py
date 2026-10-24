@@ -150,6 +150,7 @@ class SuppressingBoard(ToolbarBoard):
 
     擦除量刻意落在「部分丢失」区间（基线 40%~90% 之间），以触发撤销探测的
     补描分支；擦除区域取自当前实际着墨列，确保与测试线真正重叠。
+    事件日志用于把断言强绑定到「擦除后、下一次候选点击前发生了一次画笔补描」。
     """
 
     SUPPRESS = (42, 512)
@@ -158,7 +159,12 @@ class SuppressingBoard(ToolbarBoard):
     def __init__(self) -> None:
         super().__init__()
         self.suppress_hits = 0
-        self.post_suppress_ink: list[int] = []
+        self.events: list[tuple] = []
+
+    def band_ink_px(self) -> int:
+        x0, y0, w, h = self.BAND_RECT
+        region = self.canvas_pixels[y0 : y0 + h, x0 : x0 + w]
+        return int((region < 160).sum())
 
     def _erase_half_band(self) -> None:
         x0, y0, w, h = self.BAND_RECT
@@ -170,19 +176,21 @@ class SuppressingBoard(ToolbarBoard):
         region[:, cut + 1 :] = 255
 
     def handle_click(self, x: float, y: float) -> None:
+        x0, y0, w, h = self.BAND_RECT
+        if not (x0 <= x <= x0 + w and y0 <= y <= y0 + h):
+            # 只记录工具条区域的按下；刻度带内的按下属于描线。
+            self.events.append(("click", float(x), float(y)))
         if abs(x - self.SUPPRESS[0]) <= 2 and abs(y - self.SUPPRESS[1]) <= 2:
             self.suppress_hits += 1
             self.tool = "eraser"
             self._erase_half_band()
+            self.events.append(("erase", self.band_ink_px()))
             return
         super().handle_click(x, y)
 
     def apply_stroke(self, x0: float, y0: float, x1: float, y1: float) -> None:
         super().apply_stroke(x0, y0, x1, y1)
-        if self.suppress_hits:
-            x0b, y0b, wb, hb = self.BAND_RECT
-            region = self.canvas_pixels[y0b : y0b + hb, x0b : x0b + wb]
-            self.post_suppress_ink.append(int((region < 160).sum()))
+        self.events.append(("stroke", self.tool, self.band_ink_px()))
 
 
 class EmptyBoard(ToolbarBoard):
@@ -445,16 +453,19 @@ def test_probe_cleanup_keeps_user_strokes():
 
 def test_probe_cleanup_restores_band_baseline():
     board = ToolbarBoard()
-    # 探测前刻度带里已有一笔用户墨迹（基线墨），撤销按钮人工给定。
+    # 探测前刻度带里已有一笔用户墨迹：同时写入像素与撤销历史，模拟真实的一笔。
+    prev = board.canvas_pixels[88:93, 54:100].copy()
     board.canvas_pixels[88:93, 54:100] = 0
+    baseline_stroke = (88, 93, 54, 100, prev)
+    board.strokes.append([baseline_stroke])
     baseline_ink = board.band_ink()
     assert baseline_ink > 0
 
     result = _run(board, open_bitmap=_manual(undo=(130, 515)))
     assert result.brush is not None
-    # 清理只撤探测自己新增的笔迹，带内墨量回到探测前基线。
+    # 清理只撤探测自己新增的笔迹：用户基线笔仍在历史里，带内墨量回到基线。
+    assert board.strokes == [[baseline_stroke]]
     assert abs(board.band_ink() - baseline_ink) < 1e-9
-    assert board.strokes == []
 
 
 def test_probe_keeps_manual_lum_and_only_nulls_computed():
@@ -491,11 +502,32 @@ def test_probe_ends_with_brush_when_lums_manual():
 def test_probe_restores_drawing_tool_before_supplement():
     board = SuppressingBoard()
     result = _run(board)
-    # 干扰点确实擦掉了测试线的一部分（基线 40%~90%），补描分支才会被触发。
+    # 干扰点确实擦掉了测试线的一部分（落在基线 40%~90% 的部分丢失区间）。
     assert board.suppress_hits >= 1
-    # 补描发生前工具仍是橡皮，补描后必须重新落墨：带内墨量回升。
-    assert board.post_suppress_ink
-    assert max(board.post_suppress_ink) > 0
+
+    # 折叠阶段可能先盲点到干扰点（此时刻度带还空），取真正擦掉墨的那一次。
+    erase_idx = next(
+        i for i, e in enumerate(board.events) if e[0] == "erase" and e[1] > 0
+    )
+    erased_ink = board.events[erase_idx][1]
+    full_ink = max(e[2] for e in board.events[:erase_idx] if e[0] == "stroke")
+    assert erased_ink < full_ink * 0.9
+
+    # 擦除后的下一次候选点击（y=512 行的 (70,512)）之前，必须出现一次画笔补描
+    # 把墨量拉回基线附近。
+    anchor_idx = next(
+        i
+        for i in range(erase_idx + 1, len(board.events))
+        if board.events[i][0] == "click"
+        and board.events[i][1] == 70.0
+        and board.events[i][2] == 512.0
+    )
+    window = board.events[erase_idx + 1 : anchor_idx]
+    assert any(
+        e[0] == "stroke" and e[1] == "brush" and e[2] >= full_ink * 0.9
+        for e in window
+    ), "补描分支缺失：擦除后到下一候选点击前没有画笔落笔把墨量补回基线"
+
     # 补描后继续扫描，撤销按钮仍能被正确判定，且最终笔迹清理干净。
     assert result.undo is not None
     assert _inside(ToolbarBoard.UNDO, result.undo)

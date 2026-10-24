@@ -96,7 +96,6 @@ class ToolbarProber:
         # 探测自己画出且真正改变像素的笔数（与撤销历史一一对应），以及已消耗的撤销次数。
         self._probe_strokes = 0
         self._probe_undos = 0
-        self._draw_seq = 0
 
     # ---------- 对外主流程 ----------
 
@@ -132,7 +131,6 @@ class ToolbarProber:
         self._band_baseline_px = self._band_ink_pixels(first_image)
         self._probe_strokes = 0
         self._probe_undos = 0
-        self._draw_seq = 0
 
         if fold is None:
             skip = self._skip_points(slider=slider, undo=undo, eraser=eraser, brush=brush)
