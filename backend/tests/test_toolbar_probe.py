@@ -9,6 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from app.executor.ink_measure import ink_occupied_fraction
 from app.executor.toolbar_probe import ProbeError, ToolBitmap, ToolbarProber
 
 CANVAS = (40, 60, 300, 360)
@@ -36,6 +37,7 @@ class ToolbarBoard:
         self.stroke_width = 3.0
         self.strokes: list[list[tuple[int, int, int, int, np.ndarray]]] = []
         self.pending: list[tuple[int, int, int, int, np.ndarray]] = []
+        self.pending_touched = False
         self.clicks: list[tuple[float, float]] = []
         self.undos = 0
 
@@ -100,6 +102,8 @@ class ToolbarBoard:
         prev = region.copy()
         region[:] = 0 if self.tool == "brush" else 255
         self.pending.append((ys0, ys1, xs0, xs1, prev))
+        if not np.array_equal(prev, region):
+            self.pending_touched = True
 
     def undo(self) -> None:
         self.undos += 1
@@ -107,6 +111,72 @@ class ToolbarBoard:
             return
         for ys0, ys1, xs0, xs1, prev in reversed(self.strokes.pop()):
             self.canvas_pixels[ys0:ys1, xs0:xs1] = prev
+
+    def band_ink(self) -> float:
+        return float((self.canvas_pixels[70:110, 46:246] < 160).mean())
+
+
+class FoldInterferenceBoard(ToolbarBoard):
+    """(42,512) 放一个只能把面板永久关掉的干扰控件；真实折叠钮仍在 FOLD 矩形。"""
+
+    INTERFERENCE = (42, 512)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.interference_hits = 0
+
+    def handle_click(self, x: float, y: float) -> None:
+        if (
+            abs(x - self.INTERFERENCE[0]) <= 2
+            and abs(y - self.INTERFERENCE[1]) <= 2
+            and self.interference_hits < 2
+        ):
+            self.interference_hits += 1
+            self.panel_open = False
+            return
+        super().handle_click(x, y)
+
+
+class NoUndoBoard(ToolbarBoard):
+    """撤销格被完全屏蔽：探测既找不到撤销，也无法清理测试笔迹。"""
+
+    def handle_click(self, x: float, y: float) -> None:
+        if self._hit(self._tool_rect(self.UNDO), x, y):
+            return
+        super().handle_click(x, y)
+
+
+class SuppressingBoard(ToolbarBoard):
+    """(42,512) 点击会擦掉刻度带右半并切到橡皮，用于验证撤销探测的补描恢复。"""
+
+    SUPPRESS = (42, 512)
+
+    def handle_click(self, x: float, y: float) -> None:
+        if abs(x - self.SUPPRESS[0]) <= 2 and abs(y - self.SUPPRESS[1]) <= 2:
+            self.tool = "eraser"
+            self.canvas_pixels[70:110, 146:246] = 255
+            return
+        super().handle_click(x, y)
+
+
+class EmptyBoard(ToolbarBoard):
+    """完全没有工具条：无滑杆、无折叠钮。"""
+
+    def image(self) -> np.ndarray:
+        return np.full((700, 600), 255, dtype=np.uint8)
+
+    def handle_click(self, x: float, y: float) -> None:
+        return
+
+
+class NoSliderBoard(ToolbarBoard):
+    """有折叠钮与工具格，但任何状态下都不画滑杆。"""
+
+    def image(self) -> np.ndarray:
+        img = super().image()
+        x, y, w, h = self.SLIDER
+        img[y : y + h, x : x + w] = 255
+        return img
 
 
 class ToolbarMouse:
@@ -127,16 +197,18 @@ class ToolbarMouse:
     def down(self):
         self.board.handle_click(*self.pos)
         self.board.pending = []
+        self.board.pending_touched = False
         self.press_pos = self.pos
         self.down_flag = True
 
     def up(self):
-        if self.board.pending:
+        if self.board.pending and self.board.pending_touched:
             self.board.strokes.append(self.board.pending)
             self.board.pending = []
-        else:
+        elif not self.board.pending:
             # 无位移的按下-抬起才算一次「点击」；带位移的按下属于描线。
             self.board.clicks.append(self.press_pos)
+        self.board.pending = []
         self.down_flag = False
 
 
@@ -154,7 +226,7 @@ class ToolbarProbe:
         return True
 
 
-def _prober(board: ToolbarBoard) -> tuple[ToolbarProber, object]:
+def _prober(board: ToolbarBoard) -> tuple[ToolbarProber, ToolbarMouse]:
     probe = ToolbarProbe(board)
     mouse = ToolbarMouse(board)
     prober = ToolbarProber(
@@ -179,6 +251,15 @@ def _run(
         on_progress=(progress.append if progress is not None else (lambda _m: None)),
         should_stop=should_stop,
     )
+
+
+def _manual(**overrides) -> ToolBitmap:
+    fields = dict(
+        brush=None, eraser=None, slider=None, undo=None, fold=None,
+        brush_selected_lum=None, brush_idle_lum=None,
+    )
+    fields.update(overrides)
+    return ToolBitmap(**fields)
 
 
 def _inside(rect, point) -> bool:
@@ -246,7 +327,7 @@ def test_probe_respects_manual_items():
     assert result == manual
     assert board.clicks == []  # 全部给定则不点任何候选
 
-    # 仅人工给定滑杆：折叠钮仍应探测。
+    # 仅人工给定滑杆：折叠钮仍应探测，且人工控件邻域候选不应被点。
     board2 = ToolbarBoard()
     partial = ToolBitmap(
         brush=(30, 515), eraser=(80, 515),
@@ -259,13 +340,164 @@ def test_probe_respects_manual_items():
     assert result2.fold is not None
     assert _inside(ToolbarBoard.FOLD, result2.fold)
     assert board2.clicks
+    # 人工画笔/橡皮/撤销/滑杆全部进入折叠阶段跳过集合。
+    assert (14.0, 512.0) not in board2.clicks
+    assert (42.0, 512.0) not in board2.clicks
+    assert (70.0, 512.0) not in board2.clicks
+    assert (126.0, 512.0) not in board2.clicks
 
 
 def test_probe_clicks_only_outside_canvas():
     board = ToolbarBoard()
     _run(board)
     assert board.clicks
-    assert all(y >= CANVAS_BOTTOM for _, y in board.clicks)
+    assert all(not _inside(CANVAS, point) for point in board.clicks)
+    assert all(point[1] > CANVAS_BOTTOM for point in board.clicks)
+
+
+def test_probe_skips_known_control_neighborhood():
+    board = ToolbarBoard()
+    prober, _ = _prober(board)
+    prober._canvas = CANVAS
+    prober._candidates = prober._make_candidates((700, 600))
+    skip = prober._skip_points(
+        brush=(14, 512),
+        eraser=(70, 512),
+        undo=(126, 512),
+        fold=(322, 512),
+        slider={"x": 100, "y": 530, "w": 200, "h": 12},
+    )
+    # 宽按钮内相邻候选（相距一个网格步长）必须一起跳过。
+    assert (42, 512) in skip
+    assert (14, 484) in skip
+    assert (98, 512) in skip
+    assert (350, 512) in skip
+    # 滑杆矩形内的候选也跳过。
+    assert (126, 540) in skip
+    assert (182, 512) not in skip
+
+
+def test_probe_continues_after_irreversible_fold_candidate():
+    board = FoldInterferenceBoard()
+    result = _run(board)
+    assert result.fold is not None
+    assert _inside(ToolbarBoard.FOLD, result.fold)
+    # 干扰点只做一次翻转 + 一次恢复尝试即放弃（之后不再触发干扰）。
+    assert board.interference_hits == 2
+
+
+def test_probe_cleans_band_and_stroke_history():
+    board = ToolbarBoard()
+    result = _run(board)
+    assert result.brush is not None
+    assert result.undo is not None
+    assert board.strokes == []
+    assert board.band_ink() == 0.0
+    assert board.tool == "brush"
+
+
+def test_probe_keeps_manual_lum_and_only_nulls_computed():
+    # 人工 selected 与自动 idle 差不足：只把计算所得 idle 置 None，保留人工值。
+    board = ToolbarBoard()
+    result = _run(board, open_bitmap=_manual(brush_selected_lum=240.0))
+    assert result.brush_selected_lum == 240.0
+    assert result.brush_idle_lum is None
+    assert result.brush is not None
+
+    # 差足够时保留人工 selected 并使用计算 idle。
+    board2 = ToolbarBoard()
+    result2 = _run(board2, open_bitmap=_manual(brush_selected_lum=123.0))
+    assert result2.brush_selected_lum == 123.0
+    assert result2.brush_idle_lum is not None
+
+
+def test_probe_ends_with_brush_when_lums_manual():
+    board = ToolbarBoard()
+    board.tool = "eraser"  # 从橡皮态开始，工具探测会以橡皮扫描收尾。
+    result = _run(
+        board,
+        open_bitmap=_manual(
+            undo=(130, 515),
+            brush_selected_lum=180.0,
+            brush_idle_lum=250.0,
+        ),
+    )
+    assert result.brush is not None
+    assert result.eraser is not None
+    assert board.tool == "brush"
+
+
+def test_probe_restores_drawing_tool_before_supplement():
+    board = SuppressingBoard()
+    result = _run(board)
+    assert result.undo is not None
+    assert _inside(ToolbarBoard.UNDO, result.undo)
+
+
+def test_probe_rejects_manual_point_inside_canvas():
+    board = ToolbarBoard()
+    result = _run(
+        board,
+        open_bitmap=_manual(fold=(100, 100), brush=(50, 100)),
+    )
+    # 画布内的人工点被丢弃，改由探测得到真实控件。
+    assert result.fold is not None
+    assert _inside(ToolbarBoard.FOLD, result.fold)
+    assert result.brush is not None
+    assert _inside(ToolbarBoard.BRUSH, result.brush)
+    assert (100.0, 100.0) not in board.clicks
+    assert (50.0, 100.0) not in board.clicks
+    assert all(not _inside(CANVAS, point) for point in board.clicks)
+
+
+def test_probe_click_guard_rejects_canvas_points():
+    board = ToolbarBoard()
+    prober, _ = _prober(board)
+    prober._canvas = CANVAS
+    with pytest.raises(ProbeError) as exc:
+        prober._click(100.0, 100.0)
+    assert exc.value.code == "E_PROBE_CLICK_IN_CANVAS"
+    assert board.clicks == []
+
+
+def test_probe_rejects_malformed_manual_slider():
+    board = ToolbarBoard()
+    with pytest.raises(ProbeError) as exc:
+        _run(board, open_bitmap=_manual(slider={"x": 100}))
+    assert exc.value.code == "E_PROBE_BAD_MANUAL"
+    assert board.clicks == []
+
+
+def test_probe_raises_when_probe_ink_uncleanable():
+    board = NoUndoBoard()
+    with pytest.raises(ProbeError) as exc:
+        _run(
+            board,
+            open_bitmap=_manual(
+                fold=(312, 512),
+                slider={"x": 100, "y": 530, "w": 200, "h": 12},
+                brush=(30, 515),
+                eraser=(80, 515),
+                brush_selected_lum=180.0,
+                brush_idle_lum=250.0,
+            ),
+        )
+    # undo 未知且刻度带留有测试笔迹：必须上报，而不是留下无法清理的墨。
+    assert exc.value.code == "E_PROBE_UNCLEANED"
+
+
+def test_probe_raises_no_toolbar():
+    board = EmptyBoard()
+    with pytest.raises(ProbeError) as exc:
+        _run(board)
+    assert exc.value.code == "E_PROBE_NO_TOOLBAR"
+
+
+def test_probe_raises_no_slider():
+    board = NoSliderBoard()
+    with pytest.raises(ProbeError) as exc:
+        _run(board, open_bitmap=_manual(fold=(312, 512)))
+    assert exc.value.code == "E_PROBE_NO_SLIDER"
 
 
 def test_probe_stops_on_should_stop():
@@ -273,3 +505,17 @@ def test_probe_stops_on_should_stop():
     with pytest.raises(ProbeError) as exc:
         _run(board, should_stop=lambda: True)
     assert exc.value.code == "E_STOPPED"
+
+
+def test_probe_stops_mid_scan():
+    board = ToolbarBoard()
+    calls = {"n": 0}
+
+    def should_stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 3
+
+    with pytest.raises(ProbeError) as exc:
+        _run(board, should_stop=should_stop)
+    assert exc.value.code == "E_STOPPED"
+    assert board.clicks  # 已经开始了候选扫描
