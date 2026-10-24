@@ -201,7 +201,7 @@ sequenceDiagram
 
 配套规则：所有可点目标 ≥ 44×44 px；`RectEditor` 已用 pointer events，补 `touch-action: none` 即可支持手指拖框；滑块（`ParamField`）加大行距与把手尺寸。不引入移动端框架，断点 + 现有组件足够。`[Expert judgment]`
 
-**局域网访问。** 手机/平板访问意味着服务不能只绑回环。新增启动项 `CUPDRAW_BIND`（默认 `127.0.0.1`），显式设为 `0.0.0.0` 即局域网模式。安全边界随之收紧：`design.md` §4 的会话令牌在局域网模式下从「防本地进程」升级为强制项，令牌在启动时打印到控制台，前端首次访问引导输入并存入 `localStorage`；HTTPS 不在本期范围（家庭局域网 + 一次性令牌，风险可接受），`[Hypothesis]`（若跨不可信网络使用需上 TLS，留待确认）。
+**局域网访问。** 手机/平板访问意味着服务不能只绑回环。新增启动项 `CUPDRAW_BIND`（默认 `127.0.0.1`），显式设为 `0.0.0.0` 即局域网模式。**已定案（2026-10-24）**：实现沿用既有会话机制——首次 GET 下发 `cupdraw_session` Cookie，写请求需带 `X-Requested-With: cupdraw` 头。该双要件挡的是跨站表单提交/CSRF，**不挡同网段直接访问**：局域网内任意设备拿到 Cookie 后即可控制绘制。定位为「可信家庭/办公局域网内的单用户工具」，接受此边界；文档明示只在可信网络开启 `CUPDRAW_BIND`，不引入配对码/访问密码。HTTPS 不在本期范围（直连 `http://<局域网IP>:8765`），跨不可信网络使用需另行上 TLS 与访问控制。
 
 **弱网与后台恢复。** 手机浏览器会把后台标签冻结，SSE 断流后现有 `EventSource` 重连 + `Last-Event-ID` 补发已经覆盖；额外在 `visibilitychange` 回到前台时主动 `refresh()` 一次任务快照，把冻结期间错过的状态迁移一次性拉平（`task.ts` 的 `ensureStream` 已具雏形，补一个可见性监听即可）。
 
@@ -244,7 +244,7 @@ AdbTarget 不经投屏，用 MaaFramework `AdbController` 截图 + MaaTouch 触�
 | 对现有代码的侵入 | 近乎为零：窗口即目标，守护/画布/坐标全复用 | 需要新截图路径、新注入适配、新守护信号源 |
 | 笔迹精度 | 与 PC 绘制同级（逐点 move 映射为逐点 touch） | 逐点 touch 可行，但每个事件走 adb socket，时延高且抖动 `[Hypothesis]`（待实测） |
 | 端到端时延 | 投屏 35–70 ms 只影响肉眼回显，注入路径不经过投屏回环 `[Research-backed]`（scrcpy 文档时延标称） | 截图与注入各自叠加 adb 往返 |
-| 用户环境要求 | USB 调试 + 随包分发 scrcpy 可执行文件 | USB/WiFi 调试；MaaTouch 需设备端 minitouch，个别 ROM 兼容性待验 `[To be confirmed]` |
+| 用户环境要求 | USB 调试 + 用户自装 scrcpy（已定案：不随包分发，缺失时报 `E_SCRCPY_MISSING` 并给安装指引） | USB/WiFi 调试；MaaTouch 需设备端 minitouch，个别 ROM 兼容性待验 `[To be confirmed]` |
 | 守护完整性 | 完整（窗口级信号全可用） | 降级（只能靠画面差分，见 §4.5） |
 | 失败模式 | scrcpy 进程退出 = 目标丢失，可检测 | USB 断开、授权弹窗等更杂 |
 
@@ -305,9 +305,9 @@ AdbTarget 不经投屏，用 MaaFramework `AdbController` 截图 + MaaTouch 触�
 | G0 | `guard.py` 落地：ESC 迁入、四类信号 + 豁免窗口 + GA_ROOTOWNER 判定；`ExecParams` 扩字段；`stop_reason` 扩展；RunView 暂停卡片与文案 | 真机验证：绘制中 Alt+Tab、抢鼠标、最小化、锁屏四种操作均 ≤ 100 ms 抬笔；正常绘制全程零误停 |
 | G1 | 守护式倒计时（冻结/恢复 + `countdown_frozen` 警告） | 倒计时内切走再切回，任务不 FAILED、自动接续 |
 | A1 | 前端断点体系 + 抽屉式参数栏 + 底部操作条 + `RectEditor` 触摸 | 360 px / 768 px / 1280 px 三档走查通过 |
-| A2 | `CUPDRAW_BIND` 局域网模式 + 令牌引导页 | 手机在同一 Wi-Fi 完成查看/停止/续画 |
+| A2 | `CUPDRAW_BIND` 局域网模式（沿用既有会话机制，不另做令牌引导页，见 §4.2 定案） | 手机在同一 Wi-Fi 完成查看/停止/续画 |
 | B1 | `TargetProvider` 抽象：把现状封装为 `Win32Target`，执行器改为面向接口 | 现有全部测试通过，行为无回归 |
-| B2 | `MirrorTarget` + `/api/devices/mirror` + scrcpy 随包分发；校准/绘制流程接入 | 真机 + 微信/浏览器小程序投屏窗口完成一次完整绘制 |
+| B2 | `MirrorTarget` + `/api/devices*` + scrcpy 用户自装（探测 PATH/环境变量，已定案）；校准/绘制流程接入 | 真机 + 微信/浏览器小程序投屏窗口完成一次完整绘制 |
 | B3（待定） | `AdbTarget` 实测与决策 | 实测报告后单独立项 |
 
 G0 排在一切之前：它是防误触的安全底座，且不依赖任何设备扩展。
@@ -317,7 +317,7 @@ G0 排在一切之前：它是防误触的安全底座，且不依赖任何设�
 | 风险 | 缓解 |
 | --- | --- |
 | 微信内嵌窗口句柄结构变化导致前台误判 | 判定收敛在一个纯函数里并在 G0 真机回归；误判率不可接受时退化为「前台变化只暂停不报错、续画走倒计时自证」 |
-| scrcpy 版本行为差异（窗口标题、渲染路径） | 随包锁定单一版本；窗口识别按 scrcpy 固定窗口类名而非标题 |
+| scrcpy 版本行为差异（窗口标题、渲染路径） | 用户自装场景下版本不可控：窗口识别按 scrcpy 固定窗口类名而非标题；发布说明给出验证过的版本区间 |
 | PrintWindow 对个别 GPU 合成窗口截图黑屏 | 现有 `AutoCapture` 已具备 Maa/PrintWindow 双路径；黑屏时校准环节即暴露，不会带病落笔 |
-| 局域网模式令牌被旁观 | 令牌启动时随机生成、仅打印本机控制台；文档明示只在可信网络开启 |
+| 局域网模式被同网段设备直接控制 | 已定案接受该边界（§4.2）：会话双要件只防 CSRF，文档明示只在可信网络开启 `CUPDRAW_BIND`；若需求变化再补配对码 |
 | 光标接管阈值在非 100% 缩放下偏差 | 阈值按物理像素比较（`GetCursorPos` 本身是物理坐标），DPI 缩放不影响 |

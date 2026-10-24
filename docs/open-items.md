@@ -25,6 +25,7 @@
 - **描述**：9 例真实模型验收（加字 3 例、微调 3 例、删元素 3 例）尚未取得有效结果，当前进度 0/9。
 - **背景**：上次跑批 `run-20261023-134941` 全部失败，原因是 OpenAI 账户余额耗尽返回 `429 credit_balance_exhausted`，与提示词质量无关。判据为「每类 ≥2/3 通过视作达标，不达标只收敛提示词模板、不动架构」。
 - **要求**：提供可用 Key（OpenAI 充值后，或改用 Gemini / DashScope），重跑 9 例并产出对照报告。脚本已适配 BYOK（见 §1.2），拿到 Key 后直接 `$env:CUPDRAW_AI_KEY="…"; python .benchmarks/mc_acceptance.py --provider <id>` 即可。
+- **已排除的捷径（2026-10-24 实测）**：本机 Ollama（0.40.6）不可用于本验收——它只有 `/v1/images/generations`（纯文生图），`/v1/images/edits` 返回 404，无法做「按指令改原线稿」；且本机仅文本模型。免费本地验证请别再试 Ollama。
 - **完成判据**：`backend/data/mc_acceptance/run-<时间戳>/report.html` 生成，9 例均出图，三类通过率有结论。
 - **关联**：[mc_acceptance.py](file:///d:/Workplace/ChageeCupDrawing/backend/.benchmarks/mc_acceptance.py)、[ai-edit-provider-design.md](file:///d:/Workplace/ChageeCupDrawing/docs/ai-edit-provider-design.md)（§7 M-C）
 
@@ -62,12 +63,10 @@
 - **完成判据**：真机画板完成一次含守护中断与续画的完整绘制；逐点时延有实测数据（决定是否推进 B3 ADB 直连）。
 - **关联**：设计文档 §4.5–§4.6
 
-### 1A.3 scrcpy 随包分发的许可与体积未确认 ⚠中
+### 1A.3 scrcpy 分发方式 ✅已定案：用户自装（2026-10-24）
 
-- **描述**：若最终要随应用分发 scrcpy + adb 二进制，需确认许可合规与体积影响。
-- **背景**：scrcpy 为 Apache-2.0，其依赖（ffmpeg、SDL、adb）许可各异；完整 Windows 包解压约 40–90 MB。当前实现是「探测 PATH / 环境变量，缺失则报 `E_SCRCPY_MISSING` 并在前端给安装指引」，不随包分发。
-- **要求**：产品决策——维持「用户自装」（现状）还是随包分发。若随包，需附第三方许可清单并处理升级路径。
-- **完成判据**：决策记录进设计文档，现状或方案二选一落地。
+- **决策**：维持现状——探测 PATH / `CUPDRAW_SCRCPY` / `CUPDRAW_ADB`，缺失报 `E_SCRCPY_MISSING` 并在前端给安装指引；**不随包分发**（免去 Apache-2.0 与 ffmpeg/SDL/adb 混合许可清单、40–90 MB 体积与升级通道负担）。
+- **落地**：决策已写入设计文档 §4.4 对比表、里程碑 B2 与风险表（版本不可控 → 按固定窗口类名识别 + 发布说明标注验证过的版本区间）。
 
 ### 1A.4 真机 iPad 字号验证（两种 Safari 浏览模式）⚠中
 
@@ -76,11 +75,10 @@
 - **要求**：真机 Safari 打开局域网地址，检查：正文不小于 15 px、输入框聚焦不触发整页放大、无横向溢出；横竖屏各一遍。
 - **关联**：[main.css](file:///d:/Workplace/ChageeCupDrawing/frontend/src/assets/main.css) 触摸端两组 `@media`
 
-### 1A.5 局域网模式的访问控制偏弱 ⚠中
+### 1A.5 局域网模式的访问控制 ✅已定案：接受现状（2026-10-24）
 
-- **描述**：`CUPDRAW_BIND=0.0.0.0` 时同网段任意设备可直接控制绘制，缺少设计文档提过的「令牌引导」。
-- **背景**：设计文档 A2 曾写「`CUPDRAW_BIND` 局域网模式 + 令牌引导」，实现时沿用了既有会话机制（首次 GET 下发 `cupdraw_session` Cookie + 写请求需 `X-Requested-With: cupdraw`）。该双要件挡的是跨站表单提交，**不挡同网段直接访问**——手机浏览器拿到 Cookie 后即可停止/续画他人的任务。当前为局域网单用户工具，风险可接受，但与设计描述有出入。
-- **要求**：确认是接受现状（更新设计文档措辞），还是补一个启动时打印的一次性配对码/访问密码。
+- **决策**：不加配对码/访问密码。会话双要件（`cupdraw_session` Cookie + `X-Requested-With: cupdraw`）只防 CSRF、不防同网段直接访问，定位为可信局域网单用户工具，接受此边界。
+- **落地**：设计文档 §4.2「局域网访问」已改写为实现真相 + 定案声明，里程碑 A2 与风险表同步；文档明示只在可信网络开启 `CUPDRAW_BIND`。
 - **关联**：[serve.py](file:///d:/Workplace/ChageeCupDrawing/backend/serve.py)、[main.py](file:///d:/Workplace/ChageeCupDrawing/backend/app/main.py) 的 `session_gate`
 
 ---
