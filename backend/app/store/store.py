@@ -171,6 +171,8 @@ class Store:
         slider: dict | None = None,
         undo: dict | None = None,
         fold: dict | None = None,
+        tools_open: dict | None = None,
+        tools_collapsed: dict | None = None,
         device_kind: str = "pc",
         device_serial: str | None = None,
     ) -> CanvasProfile:
@@ -191,6 +193,8 @@ class Store:
             slider=slider,
             undo=undo,
             fold=fold,
+            tools_open=tools_open,
+            tools_collapsed=tools_collapsed,
             device_kind=device_kind,
             device_serial=device_serial,
         )
@@ -198,8 +202,9 @@ class Store:
             conn.execute(
                 "INSERT INTO canvas_profile (id, project_id, hwnd, window_title, capture_method,"
                 " rect_x, rect_y, rect_w, rect_h, dpi_scale, source, confidence,"
-                " slider_json, undo_json, fold_json, device_kind, device_serial, captured_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " slider_json, undo_json, fold_json, tools_open_json, tools_collapsed_json,"
+                " device_kind, device_serial, captured_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     profile.id,
                     profile.project_id,
@@ -216,6 +221,8 @@ class Store:
                     json.dumps(slider) if slider else None,
                     json.dumps(undo) if undo else None,
                     json.dumps(fold) if fold else None,
+                    json.dumps(tools_open) if tools_open else None,
+                    json.dumps(tools_collapsed) if tools_collapsed else None,
                     device_kind,
                     device_serial,
                     profile.captured_at,
@@ -593,6 +600,10 @@ def _canvas(row: sqlite3.Row) -> CanvasProfile:
     slider_json = row["slider_json"] if "slider_json" in keys else None
     undo_json = row["undo_json"] if "undo_json" in keys else None
     fold_json = row["fold_json"] if "fold_json" in keys else None
+    tools_open_json = row["tools_open_json"] if "tools_open_json" in keys else None
+    tools_collapsed_json = (
+        row["tools_collapsed_json"] if "tools_collapsed_json" in keys else None
+    )
     return CanvasProfile(
         id=row["id"],
         project_id=row["project_id"],
@@ -610,6 +621,8 @@ def _canvas(row: sqlite3.Row) -> CanvasProfile:
         slider=json.loads(slider_json) if slider_json else None,
         undo=json.loads(undo_json) if undo_json else None,
         fold=json.loads(fold_json) if fold_json else None,
+        tools_open=json.loads(tools_open_json) if tools_open_json else None,
+        tools_collapsed=json.loads(tools_collapsed_json) if tools_collapsed_json else None,
         device_kind=(row["device_kind"] if "device_kind" in keys and row["device_kind"] else "pc"),
         device_serial=row["device_serial"] if "device_serial" in keys else None,
     )

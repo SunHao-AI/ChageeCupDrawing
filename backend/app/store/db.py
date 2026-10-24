@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS canvas_profile (
     slider_json TEXT,
     undo_json TEXT,
     fold_json TEXT,
+    tools_open_json TEXT,
+    tools_collapsed_json TEXT,
     captured_at TEXT NOT NULL
 );
 
@@ -113,6 +115,9 @@ _COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("undo_json", "TEXT"),
         # 画板下方工具面板的折叠按钮中心点（换笔间隙收起面板用）。
         ("fold_json", "TEXT"),
+        # 面板展开/折叠两态工具位图（逐段笔宽：探测产物 JSON）。
+        ("tools_open_json", "TEXT"),
+        ("tools_collapsed_json", "TEXT"),
         # 多设备目标（B2）：pc / mirror / adb 与来源设备序列号。
         ("device_kind", "TEXT NOT NULL DEFAULT 'pc'"),
         ("device_serial", "TEXT"),
