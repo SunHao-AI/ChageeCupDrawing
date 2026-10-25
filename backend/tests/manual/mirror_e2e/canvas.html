@@ -70,8 +70,8 @@
         background: #c8c8c8;
       }
       /* 滑杆 = 透明的大命中区 + 顶部 6px 深色条。后端按深色条识别滑杆、按识别
-         到的坐标点击，而截图把窗口边框也拍进去了（点击会落到目标下方 ~36px），
-         所以命中区必须比深色条高出一截，否则滑块点击会落在轨道外。 */
+         到的坐标点击；深色条只有 6px 高，而相邻候选行在页面里相距约 24px，
+         所以命中区要比深色条高出一截，让两条相邻候选行都能落到滑块上。 */
       #slider {
         background: transparent;
       }
@@ -213,23 +213,28 @@
       // 画板与工具条几何：工具条顶边 = 画板下缘 +8，左对齐画板、宽度跟随画板，
       // 因此「控件中心占工具条宽度的比例」在截图里是同一个比例，与窗口缩放无关。
       //
-      // 垂直方向要留余量：截图是客户区的等比缩放（实测 720x889 图像 / 782x966
-      // 客户区 / 页面 626x743 CSS，DPI 1.25），探测候选行是「图像 y = 画布下缘 +8
-      // 起、步长 28」，换算到页面 CSS 后是 663/688/712/737 四条。按钮行放在
-      // CSS 651..683（撑满行 0），滑杆的透明命中区放在 690..742（吃掉行 2/3），
-      // 这样最近一行就能命中折叠钮，探测不必再往下扫（越远越慢、越容易误点）。
+      // 垂直方向只有一处换算：截图图像坐标 = 客户区物理像素（DPI 1.25）+ 窗口
+      // 顶边偏移，换回页面 CSS 即 (image - 偏移) / 1.25。实测页面视口 626x743
+      // CSS、画板下缘 632、工具栏顶 640；探测候选行在页面 CSS 约
+      // 640/663/688/712/737，相邻行距 24-25px（28 图像 px / 1.25 后取整）。
       //
-      // 已用静态换算核对（不点鼠标）：行 0 → 折叠/画笔/橡皮/撤销各有 1-2 个候选列，
-      // 行 2/3 → 滑杆命中区。控件尺寸 48x32 是为了让候选列即使跳过一格也仍有命中。
+      // 按钮中心带高 56 是为了同时覆盖两条相邻候选行（640 与 663），避免 ±24px
+      // 的换算/取整误差导致漏点：按钮中心仍在 667（原 651+32/2），上下各多留 12px。
+      // 滑杆透明命中区 684..726（top 44 / height 42）盖住候选行 688/712；工具栏
+      // 高 92（640..732）在 743 视口内完整可见，命中区下缘 726 也在工具栏内，
+      // 不会被 overflow:hidden 裁掉。
+      //
+      // 已用静态换算核对（不点鼠标）：行 640/663 → 折叠/画笔/橡皮/撤销（每格 48px
+      // 宽，约 1.7 个候选步长，候选列跳过一格仍能命中），行 688/712 → 滑杆命中区。
       const CELL_W = 48
-      const CELL_H = 32
-      const CELL_TOP = 11
+      const CELL_H = 56
+      const CELL_TOP = -1
       const layout = () => {
         const boardRect = board.getBoundingClientRect()
         toolbar.style.left = `${boardRect.left}px`
         toolbar.style.top = `${boardRect.bottom + 8}px`
         toolbar.style.width = `${boardRect.width}px`
-        toolbar.style.height = '110px'
+        toolbar.style.height = '92px'
 
         const place = (el, fraction) => {
           el.style.width = `${CELL_W}px`
@@ -242,12 +247,12 @@
         place(eraserBtn, 0.54)
         place(undoBtn, 0.78)
 
-        // 滑杆：透明命中区（160x52）里只放一条 6px 深色条。深色条供识别，
+        // 滑杆：透明命中区（160x42）里只放一条 6px 深色条。深色条供识别，
         // 命中区向下延伸，让候选行 2/3 也能点到滑块（后端按识别到的轨道坐标点）。
         slider.style.left = '12px'
-        slider.style.top = '50px'
+        slider.style.top = '44px'
         slider.style.width = '160px'
-        slider.style.height = '52px'
+        slider.style.height = '42px'
         track.style.left = '0px'
         track.style.top = '0px'
         track.style.width = '160px'
@@ -292,7 +297,7 @@
         state.strokes.push(stroke)
         state.count += 1
         state.recent.push(stroke.tool)
-        // 标定/探测的测试线只有 46px；用户路径（源图 6 条横线）远长于 120px。
+        // 标定/探测的测试线只有 46px；用户路径（源图 4 条横线）远长于 120px。
         if (pathLength(stroke.points) >= 120) state.drawPhase = true
         redraw()
         publish()

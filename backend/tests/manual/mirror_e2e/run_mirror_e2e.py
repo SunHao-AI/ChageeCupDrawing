@@ -258,8 +258,9 @@ def main() -> int:
         # 7. 注入真实落墨：画布笔画计数随绘制增长
         found = find_window(c)
         strokes_end = strokes_of(found[1]) if found else 0
-        check("注入落墨可见（笔画计数增长）", strokes_end > 0 and strokes_end >= strokes_mid,
-              f"mid={strokes_mid} end={strokes_end}")
+        check("注入落墨可见（笔画计数增长）",
+              strokes_end > 0 and strokes_end - strokes_mid >= 2,
+              f"mid={strokes_mid} end={strokes_end} 追加={strokes_end - strokes_mid}（期望 ≥2）")
 
         # 8. 逐段笔宽：绘制全程画笔、面板收起、换宽次数与面板展开次数有界
         kv = parse_title(found[1]) if found else {"recent": []}
@@ -277,13 +278,14 @@ def main() -> int:
         check("绘制结束面板收起", kv.get("panel") == 0, f"panel={kv.get('panel')}")
         switches = int(kv.get("drawPhaseSwitch", 0))
         switch_limit = math.ceil(1 / 0.05) + 1
-        check("换宽确实发生且有界", 1 <= switches <= switch_limit,
-              f"drawPhaseSwitch={switches} 上限={switch_limit}")
+        check("换宽确实发生且有界", 2 <= switches <= switch_limit,
+              f"drawPhaseSwitch={switches} 区间=[2,{switch_limit}]")
         width_table = (snap.get("exec") or {}).get("widthTable") or []
-        check("笔宽分为多档（源图密度非退化）", len(width_table) >= 2,
-              f"widthTable={width_table}（源图几何退化或分桶异常）")
-        check("面板展开次数有界", int(kv.get("foldClicks", 0)) <= 21,
-              f"foldClicks={kv.get('foldClicks')} 上限=21")
+        check("标定档位 ≥ 2（仅证明标定成功；桶数由离线验证覆盖）", len(width_table) >= 2,
+              f"widthTable={width_table}")
+        fold_clicks = int(kv.get("foldClicks", 0))
+        check("面板开合次数在合理区间", 2 <= fold_clicks <= 21,
+              f"foldClicks={fold_clicks} 区间=[2,21]")
 
         # 9. 注销后句柄失效判定
         c.request("DELETE", "/devices/mirror", headers={"X-Requested-With": "cupdraw"})
