@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
 
@@ -49,6 +51,7 @@ def _line_density_map(paths: list[Path], shape: tuple[int, int]) -> np.ndarray:
 
 def target_fractions(paths: list[Path]) -> list[float]:
     """每段笔画 → 目标滑杆行程 [0,1]（1=最粗）。密度百分位排名；信号退化时全 0。"""
+    paths = [p for p in paths if p]
     if not paths:
         return []
     ys = [round(y) for p in paths for _, y in p]
@@ -57,17 +60,30 @@ def target_fractions(paths: list[Path]) -> list[float]:
     densities = np.array([_path_density(p, box) for p in paths], dtype=np.float64)
     if float(densities.std()) < 1e-6:
         return [0.0] * len(paths)          # 信号退化：全用最细档
-    ranks = densities.argsort().argsort().astype(np.float64)
+    # 稳定排序让并列密度按原始顺序取相邻名次，结果逐位确定（续画重算需一致）；
+    # 不做平均名次——平均会让并列段共享同一行程，失去「每段一个连续目标」。
+    ranks = densities.argsort(kind="stable").argsort().astype(np.float64)
     return [float(r) / max(1, len(paths) - 1) for r in ranks]
 
 
 def width_buckets(paths: list[Path], tol: float) -> list[tuple[int, float, list[Path]]]:
-    """→ [(桶号, 桶下缘行程, 桶内笔迹)]，按桶号降序（宽→窄）。桶号=floor(f/tol)。"""
-    tol = max(0.02, min(0.20, float(tol)))
+    """→ [(桶号, 桶下缘行程, 桶内笔迹)]，按桶号降序（宽→窄）。桶号=floor(f/tol)。
+
+    tol 夹在 [0.02, 0.20]，NaN 回退默认 0.05。桶上限由 tol 推导：
+    cap = ceil(1/tol) - 1，保证桶下缘 bucket*tol ≤ 1（tol=0.05 → 19 档、
+    tol=0.02 → 49 档、tol=0.20 → 4 档）；整图换笔次数 ≈ cap+1，粒度越细越多。
+    """
+    paths = [p for p in paths if p]
+    tol = 0.05 if not math.isfinite(tol) else float(tol)
+    tol = max(0.02, min(0.20, tol))
+    # 减 1e-9 抵消 1/0.1=10.000000000000002 这类浮点上偏，避免多出一个空档。
+    cap = math.ceil(1.0 / tol - 1e-9) - 1
     fracs = target_fractions(paths)
     groups: dict[int, list[Path]] = {}
     for frac, path in zip(fracs, paths):
-        groups.setdefault(min(19, int(frac / tol)), []).append(path)
+        # int() 截断在 0.6/0.2=2.9999999999999996 这类下偏时会把恰落桶下缘的
+        # 行程掉进下一档；加 1e-9 修正到 floor(f/tol) 的真值。
+        groups.setdefault(min(cap, int(frac / tol + 1e-9)), []).append(path)
     out: list[tuple[int, float, list[Path]]] = []
     for bucket_id in sorted(groups, reverse=True):      # 宽→窄
         out.append((bucket_id, bucket_id * tol, nearest_order_paths(groups[bucket_id])))

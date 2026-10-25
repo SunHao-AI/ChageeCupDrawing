@@ -632,8 +632,13 @@ class ExecutorService:
         # tol = 1/档数（档数≈桶数、整图换宽次数不变），再取新分桶结构的第 3 项
         # 平铺成原有「(档号, 笔迹)」形状喂给下游换宽逻辑。
         tol = 1.0 / max(1, tiers)
-        groups = width_buckets(paths, tol)
-        return [(bucket, path) for bucket, _edge, group in groups for path in group]
+        flat: list[tuple[int, list[tuple[float, float]]]] = []
+        for bucket, _edge, group in width_buckets(paths, tol):
+            # 顶桶（frac=1.0）会算出档号 tiers，压回最后一档，消除一次同位置
+            # 滑杆点击与「第 tiers+1 档」错误文案。
+            bucket = min(bucket, tiers - 1)
+            flat.extend((bucket, path) for path in group)
+        return flat
 
     def _start_guard(
         self, mouse: object, target: DrawingTarget, params: ExecParams, handle: _RunHandle
