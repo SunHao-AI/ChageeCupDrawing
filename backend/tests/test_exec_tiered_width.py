@@ -17,7 +17,6 @@ import pytest
 from app.core.vision.canvas_detect import detect_canvas_rect
 from app.device.geometry import ClientArea
 from app.executor import panel_control, pen_order, service
-from app.executor.pen_order import width_buckets
 from app.executor.service import ExecParams, ExecutorService, TaskError, _RunHandle
 from app.executor.toolbar_probe import ProbeError, ToolBitmap
 
@@ -260,8 +259,10 @@ def _run(
     params: ExecParams,
     *,
     cursor: int = 0,
+    mouse: FakeMouse | None = None,
 ) -> FakeMouse:
-    mouse = FakeMouse(board)
+    if mouse is None:
+        mouse = FakeMouse(board)
     svc = _service(store, mouse)
     handle = _RunHandle()
     svc._arm_and_draw(
@@ -495,6 +496,36 @@ class _FakeProber:
         )
 
 
+class _FakeCalibrator:
+    """模拟标定：画 1 条测试线并返回 3 档宽度表。
+
+    假画板不会因标定落墨改变像素（真实 PenCalibrator 的测宽会失败），这里用
+    drag_polyline 记下「那一条测试线」，供用例断言标定确实发生在探测之后。
+    """
+
+    # 执行器会读取 PenCalibrator 的这两个类属性：探测刻度带几何与标定回退阈值。
+    TEST_MARGIN = 6
+    TEST_LINE_LEN = 46
+    MIN_SPREAD_RATIO = 0.18
+
+    def __init__(self, *, mouse, **_kwargs) -> None:
+        self._mouse = mouse
+
+    def run(
+        self,
+        *,
+        canvas,
+        **_kwargs,
+    ) -> SimpleNamespace:
+        self._mouse.drag_polyline(
+            [(canvas[0] + 6, canvas[1] + 10), (canvas[0] + 52, canvas[1] + 10)]
+        )
+        return SimpleNamespace(
+            table=SimpleNamespace(tiers=TABLE_3),
+            width_spread=0.5,
+        )
+
+
 def test_probed_bitmap_persisted_in_saved_rect_frame(monkeypatch) -> None:
     """B-3：探测坐标来自 new_rect 帧，写入 profile 前须减回旧 rect 帧。
 
@@ -504,12 +535,14 @@ def test_probed_bitmap_persisted_in_saved_rect_frame(monkeypatch) -> None:
     dx, dy = 2, 1
     monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
     monkeypatch.setattr(service, "ToolbarProber", _FakeProber)
+    monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
     calibration = _calibration()
     calibration.rect_x = RECT_X - dx
     calibration.rect_y = RECT_Y - dy
     store = FakeStore(calibration)
     board = FakeBoard(open_=True)
-    params = ExecParams(auto_width=True, width_table=TABLE_3, width_tolerance=0.05)
+    # 探测只在首绘标定前跑（width_table 为空），故这里也必须以未标定状态进入。
+    params = ExecParams(auto_width=True, width_table=None, width_tolerance=0.05)
 
     _run(store, board, _paths(3), params)
 
@@ -621,9 +654,12 @@ def test_legacy_profile_single_bitmap_fallback(monkeypatch) -> None:
             raise ProbeError("E_PROBE_NO_TOOLBAR", "工具条区域未探到任何控件")
 
     monkeypatch.setattr(service, "ToolbarProber", FailingProber)
+    monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
     store = FakeStore(_calibration())  # 旧校准：无 tools_open / tools_collapsed
     board = FakeBoard(open_=True)
-    params = ExecParams(auto_width=True, width_table=TABLE_3)
+    # 探测在标定前跑；失败后沿用旧单套坐标，标定与换宽仍可继续。
+    params = ExecParams(auto_width=True, width_table=None)
 
     mouse = _run(store, board, _paths(3), params)
 
@@ -632,10 +668,14 @@ def test_legacy_profile_single_bitmap_fallback(monkeypatch) -> None:
     assert any("旧校准：无法校验画笔态" in m for m in warnings)
     assert store.saved == []  # 探测失败不写库
     assert store.status == "DONE"
-    assert len(mouse.drags) == 3
+    # 3 条用户路径 + 假标定的 1 条测试线。
+    assert len(mouse.drags) == 3 + 1
     # 仍用旧单套坐标换宽（滑杆坐标未被探测结果替换）。
     clicks = _slider_clicks(mouse)
-    assert len(clicks) == len({b for b, _e, _p in width_buckets(_paths(3), 0.05)})
+    assert [round(x, 3) for x, _ in clicks] == [
+        TRACK["x"] + TRACK["w"] * 0.95,
+        TRACK["x"] + TRACK["w"] * 0.90,
+    ]
 
 
 def test_width_tiers_key_ignored() -> None:
@@ -650,3 +690,72 @@ def test_width_tiers_key_ignored() -> None:
 
     tuned = ExecParams.from_dict({"widthTolerance": 0.1, "widthTiers": 3})
     assert tuned.width_tolerance == 0.1
+
+
+def test_probe_bootstraps_calibration_without_manual_anchors(monkeypatch) -> None:
+    """全新用户：校准只有画布矩形，探测须先跑，标定才有滑杆坐标可用。"""
+    monkeypatch.setattr(service, "ToolbarProber", _FakeProber)
+    monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    calibration = _calibration(tools_open=None, slider=None, fold=None)
+    store = FakeStore(calibration)
+    params = ExecParams(auto_width=True, width_table=None, width_tolerance=0.05)
+
+    mouse = _run(store, FakeBoard(open_=True), _paths(3), params)
+
+    # 探测成功即持久化成一条新校准记录，滑杆坐标落在假画板的轨道内。
+    assert len(store.saved) == 1
+    assert store.saved[0]["source"] == "probe"
+    slider = store.saved[0]["tools_open"]["slider"]
+    assert TRACK["x"] <= slider["x"] <= TRACK["x"] + TRACK["w"]
+    assert store.status == "DONE"
+
+    # 3 条用户路径 + _FakeCalibrator 模拟的 1 条标定测试线（真实标定会画 5 条，
+    # 但假画板无法测宽，故用最小假标定只记一条）。
+    assert len(mouse.drags) == 3 + 1
+    assert _slider_clicks(mouse)  # 标定与换宽都会点滑杆
+    assert not any("未标定粗细滑杆" in m for m in store.warnings())
+
+
+def test_probe_runs_before_brush_guard_and_calibration(monkeypatch) -> None:
+    """用户裁决的顺序：探测 → 画笔校验 → 笔宽标定。"""
+    events: list[str] = []
+
+    class EventProber(_FakeProber):
+        def run(self, **kwargs) -> ToolBitmap:
+            events.append("probe")
+            return super().run(**kwargs)
+
+    class EventMouse(FakeMouse):
+        def click(self, x: float, y: float, **kwargs) -> None:
+            if (
+                TRACK["x"] <= x <= TRACK["x"] + TRACK["w"]
+                and TRACK["y"] <= y <= TRACK["y"] + TRACK["h"]
+            ):
+                events.append("slider-click")
+            elif any(
+                abs(x - px) <= 8 and abs(y - py) <= 8
+                for px, py in (BRUSH_OPEN, BRUSH_CLOSED)
+            ):
+                events.append("brush-click")
+            elif abs(x - FOLD["x"]) <= 20 and abs(y - FOLD["y"]) <= 20:
+                events.append("fold-click")
+            super().click(x, y, **kwargs)
+
+    monkeypatch.setattr(service, "ToolbarProber", EventProber)
+    monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
+    # 保证绘制期跨桶换宽，从而产生「标定之后」的滑杆点击。
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    calibration = _calibration(tools_open=None, slider=None, fold=None)
+    store = FakeStore(calibration)
+    params = ExecParams(auto_width=True, width_table=None, width_tolerance=0.05)
+    board = FakeBoard(open_=True, tool="eraser")
+
+    _run(store, board, _paths(3), params, mouse=EventMouse(board))
+
+    probe_at = events.index("probe")
+    brush_at = events.index("brush-click")
+    slider_at = events.index("slider-click")
+    # 探测在最前；画笔校验只在探测拿到双态位图后才会执行；标定最后（用的是
+    # 探测学出的滑杆坐标）。
+    assert probe_at < brush_at < slider_at

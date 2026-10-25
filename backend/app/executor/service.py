@@ -463,6 +463,38 @@ class ExecutorService:
             panel_open = panel.is_open(slider_open)
 
         rendering_calibration = params.auto_width and params.width_table is None and cursor == 0
+
+        # 探测在标定之前跑：标定依赖滑杆坐标，而旧校准（尤其全新用户只剩画布
+        # 矩形）可能没有任何人工锚点。探测成功即持久化成新校准记录；人工锚点
+        # 只作为探测输入（open_bitmap），不再作为探测开关。失败只警告、沿用旧
+        # 单套坐标，不阻断绘制。
+        if rendering_calibration and calibration.tools_open is None:
+            probed = self._probe_toolbar(
+                task_id, plan.project_id, calibration, target, mouse, client, image_size,
+                new_rect, dx, dy, fold_closed, slider_open, undo_open, handle,
+            )
+            if handle.stop_event.is_set():
+                self._finish_stopped(task_id, cursor, total, started, handle)
+                return
+            if probed is not None:
+                tools_open = self._tool_bitmap(asdict(probed), 0.0, 0.0)
+                slider_open = tools_open.slider if tools_open is not None else slider_open
+                undo_open = self._point_dict(tools_open.undo) if tools_open else undo_open
+                fold_open = (
+                    self._point_dict(tools_open.fold) if tools_open else None
+                ) or fold_open
+                fold_closed = (
+                    self._point_dict(tools_collapsed.fold) if tools_collapsed else None
+                ) or fold_open
+                legacy_mode = False
+                # 探测过程中会开合面板，状态未知，按实际截图重判。
+                panel_open = None
+                # 旧校准的 panel 可能已存在，但其滑杆/折叠坐标已被探测结果替换，
+                # 必须按新坐标重建。
+                panel = self._make_panel(
+                    params, target, mouse, image_size, client, slider_open, fold_open
+                )
+
         if rendering_calibration and not legacy_mode:
             # 标定会用测试笔在刻度带试画；若当前停在橡皮态，试画会先擦掉用户画作。
             # 有双态位图时把画笔态校验前移到标定之前（折叠态同样按跳过规则处理）。
@@ -472,8 +504,8 @@ class ExecutorService:
                 canvas=new_rect,
             )
 
-        # 自动变粗：首绘先标定笔宽表（刻度带测试线→清空画布），续画复用已回写
-        # 的宽度表，保证分桶笔序与首绘逐次一致。
+        # 自动变粗：首绘先用行为探测补齐控件坐标（上方），再标定笔宽表（刻度带
+        # 测试线→清空画布），续画复用已回写的宽度表，保证分桶笔序与首绘逐次一致。
         if rendering_calibration:
             if slider_open is None:
                 self._emit(task_id, "task.warning", {
@@ -495,39 +527,6 @@ class ExecutorService:
                     )
                     if params is None:  # 标定被停止，已落 STOPPED
                         return
-
-        # 探测接入：旧校准缺双态位图时行为探测一次，成功后把结果持久化成新的
-        # 校准记录（沿用其余字段）。失败只警告并沿用旧单套坐标，不阻断绘制。
-        if (
-            params.auto_width
-            and cursor == 0
-            and calibration.tools_open is None
-            and (slider_open is not None or fold_open is not None)
-        ):
-            probed = self._probe_toolbar(
-                task_id, plan.project_id, calibration, target, mouse, client, image_size,
-                new_rect, dx, dy, fold_closed, slider_open, undo_open, handle,
-            )
-            if handle.stop_event.is_set():
-                self._finish_stopped(task_id, cursor, total, started, handle)
-                return
-            if probed is not None:
-                tools_open = self._tool_bitmap(asdict(probed), 0.0, 0.0)
-                slider_open = tools_open.slider if tools_open is not None else slider_open
-                undo_open = self._point_dict(tools_open.undo) if tools_open else undo_open
-                fold_open = (
-                    self._point_dict(tools_open.fold) if tools_open else None
-                ) or fold_open
-                fold_closed = (
-                    self._point_dict(tools_collapsed.fold) if tools_collapsed else None
-                ) or fold_open
-                legacy_mode = False
-                # 探测过程中会开合面板，状态未知，按实际截图重判。
-                panel_open = None
-                if panel is None:
-                    panel = self._make_panel(
-                        params, target, mouse, image_size, client, slider_open, fold_open
-                    )
 
         # 宽度表存在即视为自动变粗生效（哪怕只有 1 档）：面板必须收起，否则
         # 会遮住画布下部。多档才涉及换笔与分桶。
