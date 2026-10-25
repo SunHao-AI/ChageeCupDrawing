@@ -17,10 +17,9 @@ import pytest
 from app.core.vision.canvas_detect import detect_canvas_rect
 from app.device.geometry import ClientArea
 from app.executor import panel_control, pen_order, service
-from app.executor.panel_control import PanelController
 from app.executor.pen_order import width_buckets
 from app.executor.service import ExecParams, ExecutorService, TaskError, _RunHandle
-from app.executor.toolbar_probe import ProbeError, ToolBitmap
+from app.executor.toolbar_probe import ProbeError
 
 SIZE = (900, 600)  # (h, w)
 CANVAS = (150, 200, 450, 650)  # l, t, r, b
