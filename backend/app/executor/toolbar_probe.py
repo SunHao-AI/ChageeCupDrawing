@@ -66,10 +66,12 @@ class ToolbarProber:
     BAND_LINE_LEN = 46
     LUM_DELTA_MIN = 30  # 选中态判定最小亮度差
     CANDIDATE_STEP = 28  # 工具条候选点网格步长
-    # 折叠钮扫描的候选点预算。候选按行优先、距画布由近到远，截断等价于「只扫
-    # 最靠近画布的几行」。超出预算的折叠钮不再自动探测（用户可在校准页人工补标），
-    # 避免无工具条应用在首绘承担全网格盲点的分钟级 worst case。
-    MAX_FOLD_CLICKS = 120
+    # 折叠钮扫描的候选行预算。候选按行优先、距画布由近到远，截断等价于「只扫
+    # 画布下方最近几行」，与截图宽度无关；按点数限死会让宽屏只覆盖不到两行。
+    # 4 行 ≈ 画布下缘 112px：工具条通常紧贴画布下方 70px 左右，3 行会漏掉折叠钮。
+    # 更远的折叠钮不再自动探测（用户可在校准页人工补标），避免无工具条应用在
+    # 首绘承担全网格盲点的分钟级 worst case。
+    MAX_FOLD_ROWS = 4
     # 撤销判据：刻度带内墨量降到基线该比例以下即认定撤销生效。
     UNDO_DROP_RATIO = 0.4
     INK_THRESHOLD = 160
@@ -95,6 +97,8 @@ class ToolbarProber:
         self._canvas: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._band: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._candidates: list[tuple[int, int]] = []
+        # 折叠扫描的候选点数上限，由 run() 按截图宽度与 MAX_FOLD_ROWS 计算。
+        self._fold_limit = 0
         # 探测前的刻度带墨像素数：清理只需回到这个深度，绝不越过它去撤用户笔画。
         self._band_baseline_px = 0
         # 探测自己画出且真正改变像素的笔数（与撤销历史一一对应），以及已消耗的撤销次数。
@@ -132,6 +136,8 @@ class ToolbarProber:
         check_stop()
         first_image = self._grab()
         self._candidates = self._make_candidates(first_image.shape)
+        cols = max(1, math.ceil(first_image.shape[1] / self.CANDIDATE_STEP))
+        self._fold_limit = min(len(self._candidates), self.MAX_FOLD_ROWS * cols)
         self._band_baseline_px = self._band_ink_pixels(first_image)
         self._probe_strokes = 0
         self._probe_undos = 0
@@ -217,7 +223,7 @@ class ToolbarProber:
                 return
             self._click(float(brush[0]), float(brush[1]))
             self._sleep(self._settle_s)
-        except ProbeError:
+        except Exception:  # 清理路径：任何恢复失败都不得掩盖原始异常
             pass
 
     # ---------- 人工兜底校验 ----------
@@ -373,12 +379,12 @@ class ToolbarProber:
         不可逆的候选（点了不恢复）只算干扰：标记后继续扫描，并以当前可见性
         作为新基线——折叠钮在两个方向上都会翻转可见性，后续仍能识别。
 
-        只扫候选序前 MAX_FOLD_CLICKS 个点（行优先、距画布由近到远）；折叠钮
-        若在更远处则不再自动探测，由用户在校准页人工补标。
+        只扫画布下方最近 MAX_FOLD_ROWS 行候选（行优先、由近到远）；更远的折叠钮
+        放弃自动探测，请用户在校准页人工补标。
         """
         before_visible = self._find_slider(self._grab()) is not None
         blocked: set[tuple[int, int]] = set()
-        for point in self._candidates[: self.MAX_FOLD_CLICKS]:
+        for point in self._candidates[: self._fold_limit]:
             if point in skip or point in blocked:
                 continue
             check_stop()

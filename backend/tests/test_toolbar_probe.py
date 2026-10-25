@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -214,7 +216,7 @@ class NoSliderBoard(ToolbarBoard):
 
 
 class FarFoldBoard(ToolbarBoard):
-    """折叠钮落在候选序 120 位之后（末行 y=680），预算内不应被扫到。"""
+    """折叠钮落在候选序第 10 行（预算外），预算内不应被扫到。"""
 
     FOLD = (560, 680, 40, 40)
 
@@ -608,17 +610,29 @@ def test_probe_raises_no_slider():
     assert exc.value.code == "E_PROBE_NO_SLIDER"
 
 
+def _fold_cols(width: int) -> int:
+    """与 ToolbarProber.run 相同的每行候选列数上界。"""
+    return max(1, math.ceil(width / ToolbarProber.CANDIDATE_STEP))
+
+
 def test_probe_fold_scan_respects_click_budget():
-    """折叠钮在预算外：只点前 MAX_FOLD_CLICKS 个候选，然后放弃探测。"""
+    """折叠钮在预算外：只点画布下方最近 MAX_FOLD_ROWS 行，然后放弃探测。"""
     board = FarFoldBoard()
     board.panel_open = False
+    height, width = board.canvas_pixels.shape
+    assert FarFoldBoard.FOLD[1] >= CANVAS_BOTTOM + 8 + ToolbarProber.MAX_FOLD_ROWS * ToolbarProber.CANDIDATE_STEP
 
     with pytest.raises(ProbeError) as exc:
         _run(board)
 
     assert exc.value.code == "E_PROBE_NO_TOOLBAR"
-    assert len(board.clicks) == ToolbarProber.MAX_FOLD_CLICKS
+    # 实际点数 = 前 MAX_FOLD_ROWS 行的候选点数上界（本板行数足够，不触发 min 截断）。
+    assert len(board.clicks) == ToolbarProber.MAX_FOLD_ROWS * _fold_cols(width)
     assert all(not _inside(FarFoldBoard.FOLD, point) for point in board.clicks)
+    # 预算按行而非按点：900/1920 宽下分别覆盖 4×33=132、4×69=276 个候选（上界），
+    # 不再像固定 120 点那样在宽屏只覆盖不到两行。
+    assert ToolbarProber.MAX_FOLD_ROWS * _fold_cols(900) == 132
+    assert ToolbarProber.MAX_FOLD_ROWS * _fold_cols(1920) == 276
 
 
 def test_probe_restores_brush_when_cleanup_raises(monkeypatch):
