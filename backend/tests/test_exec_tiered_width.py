@@ -157,6 +157,8 @@ class FakeStore:
         self.saved: list[dict] = []
         self.updates: list[dict] = []
         self.status = "ARMING"
+        # 续画用例可放入一条带 exec_params 的记录；其余用例保持 None。
+        self.task = None
 
     def latest_calibration(self, _project_id: str):
         return self.calibration
@@ -165,6 +167,9 @@ class FakeStore:
         self.updates.append(fields)
         if "status" in fields:
             self.status = fields["status"]
+        if self.task is not None:
+            for key, value in fields.items():
+                setattr(self.task, key, value)
 
     def append_event(self, _task_id: str, event_type: str, payload: dict) -> None:
         self.events.append((event_type, payload))
@@ -173,7 +178,13 @@ class FakeStore:
         self.saved.append(kwargs)
 
     def get_task(self, _task_id: str):
-        return SimpleNamespace(cursor_path=0)
+        return self.task if self.task is not None else SimpleNamespace(cursor_path=0)
+
+    def get_plan(self, _plan_id: str):
+        return SimpleNamespace(id="plan1", project_id="p1", paths_path="unused")
+
+    def reopen_task(self, _task_id: str) -> None:
+        return None
 
     def warnings(self) -> list[str]:
         return [
@@ -278,6 +289,62 @@ def _slider_clicks(mouse: FakeMouse) -> list[tuple[float, float]]:
         if TRACK["x"] <= x <= TRACK["x"] + TRACK["w"]
         and TRACK["y"] <= y <= TRACK["y"] + TRACK["h"]
     ]
+
+
+# 跨态画布用例：折叠态画布盖住滑杆（y=520），展开后画布缩短、滑杆露出。
+SLIDER_LOW = {"x": 200, "y": 520, "w": 200, "h": 10}
+CANVAS_FOLDED = (0, 0, 400, 560)
+CANVAS_EXPANDED = (0, 0, 400, 430)
+
+
+class _TrackBoard(FakeBoard):
+    """额外在 y=520 画滑杆轨道，用于模拟折叠态画布盖住滑杆的真实布局。"""
+
+    def image(self) -> np.ndarray:
+        grid = super().image()
+        if self.open:
+            cy = SLIDER_LOW["y"] + SLIDER_LOW["h"] // 2
+            grid[cy - 2 : cy + 3, SLIDER_LOW["x"] : SLIDER_LOW["x"] + SLIDER_LOW["w"]] = 0
+        return grid
+
+
+def test_slider_click_uses_current_frame_canvas(monkeypatch) -> None:
+    """N-1：折叠态画布 ⊃ 展开态画布时，换宽仍须点中滑杆并推进档位。
+
+    守卫若沿用展开前（折叠态）的 new_rect，滑杆坐标会被判成落在画布内而拒点，
+    active_bucket 不前进，每条笔迹都会重复展开/校验/折叠。
+    """
+    board = _TrackBoard(open_=False)
+
+    def detect(_image):
+        return CANVAS_EXPANDED if board.open else CANVAS_FOLDED
+
+    monkeypatch.setattr(service, "detect_canvas_rect", detect)
+    monkeypatch.setattr(panel_control, "detect_canvas_rect", detect)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    calibration = _calibration(tools_open=_tools(slider=SLIDER_LOW))
+    # 校准矩形与折叠态画布一致，避免漂移拦截（本用例只关心守卫矩形）。
+    calibration.rect_x, calibration.rect_y = 0, 0
+    calibration.rect_w, calibration.rect_h = 400, 560
+    store = FakeStore(calibration)
+    params = ExecParams(auto_width=True, width_table=TABLE_3, width_tolerance=0.05)
+
+    mouse = _run(store, board, _paths(3), params)
+
+    clicks = [
+        (x, y)
+        for x, y in mouse.clicks
+        if SLIDER_LOW["y"] <= y <= SLIDER_LOW["y"] + SLIDER_LOW["h"]
+    ]
+    assert len(clicks) == 2  # 两次跨桶各一次，档位已推进
+    assert [round(x, 3) for x, _ in clicks] == [
+        SLIDER_LOW["x"] + SLIDER_LOW["w"] * 0.95,
+        SLIDER_LOW["x"] + SLIDER_LOW["w"] * 0.90,
+    ]
+    assert all(y == SLIDER_LOW["y"] + SLIDER_LOW["h"] / 2.0 for _, y in clicks)
+    assert any("已切换第 20 档笔宽" in m for m in store.warnings())
+    assert any("已切换第 19 档笔宽" in m for m in store.warnings())
+    assert not any("滑杆坐标落在画布内" in m for m in store.warnings())
 
 
 TABLE_3 = ((0.0, 2.0), (0.5, 4.0), (1.0, 8.0))
@@ -465,6 +532,45 @@ def test_probed_bitmap_persisted_in_saved_rect_frame(monkeypatch) -> None:
     assert clicks[0][1] == pytest.approx(TRACK["y"] + TRACK["h"] / 2.0)
 
 
+def test_legacy_tier_resume_migrates_once(monkeypatch) -> None:
+    """N-3：旧 widthTiers 记录续画时重置一次并迁移参数，第二次不再重复 warning。"""
+    store = FakeStore(_calibration(tools_open=_tools()))
+    board = FakeBoard(open_=True)
+    mouse = FakeMouse(board)
+    svc = _service(store, mouse)
+    store.task = SimpleNamespace(
+        id="t1",
+        plan_id="plan1",
+        status="STOPPED",
+        cursor_path=2,
+        exec_params={
+            "autoWidth": True,
+            "widthTiers": 5,
+            "widthTable": [[0.0, 2.0], [0.5, 4.0], [1.0, 8.0]],
+        },
+    )
+    monkeypatch.setattr(svc, "_load_paths", lambda _plan: _paths(3))
+    monkeypatch.setattr(svc, "_target", lambda _plan: FakeTarget(board))
+    monkeypatch.setattr(svc, "_claim", lambda _target: (_RunHandle(), mouse))
+    monkeypatch.setattr(svc, "_spawn", lambda *args, **kwargs: None)
+
+    def legacy_warnings() -> list[str]:
+        return [m for m in store.warnings() if "旧版按档位顺序" in m]
+
+    svc.resume(task_id="t1", countdown_ms=0, allow_drift=0.02)
+
+    assert len(legacy_warnings()) == 1
+    assert store.task.cursor_path == 0
+    assert "widthTiers" not in store.task.exec_params
+    assert store.task.exec_params["widthTolerance"] == pytest.approx(0.05)
+    assert store.task.exec_params["widthTable"] == [[0.0, 2.0], [0.5, 4.0], [1.0, 8.0]]
+
+    store.task.status = "STOPPED"
+    svc.resume(task_id="t1", countdown_ms=0, allow_drift=0.02)
+
+    assert len(legacy_warnings()) == 1  # 迁移后不再重复重置
+
+
 def test_resume_recomputes_identical_sequence(monkeypatch) -> None:
     monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
     store = FakeStore(_calibration(tools_open=_tools()))
@@ -472,8 +578,8 @@ def test_resume_recomputes_identical_sequence(monkeypatch) -> None:
     params = ExecParams(auto_width=True, width_table=TABLE_3, width_tolerance=0.05)
     paths = _paths(3)
 
-    flat = svc._build_draw_sequence("t1", paths, params)
-    assert flat == svc._build_draw_sequence("t1", paths, params)  # 续画重算逐位一致
+    flat = svc._build_draw_sequence(paths, params)
+    assert flat == svc._build_draw_sequence(paths, params)  # 续画重算逐位一致
     buckets = [bucket for bucket, _edge, _path in flat]
     assert buckets == sorted(buckets, reverse=True)
     assert all(
@@ -503,7 +609,7 @@ def test_resume_recomputes_identical_sequence(monkeypatch) -> None:
         for _b, _e, path in flat[:cursor]
     }
     assert before.isdisjoint(drawn)  # 断点之前的笔迹不再绘制
-    assert flat[cursor] == svc._build_draw_sequence("t1", paths, params)[cursor]
+    assert flat[cursor] == svc._build_draw_sequence(paths, params)[cursor]
 
 
 def test_legacy_profile_single_bitmap_fallback(monkeypatch) -> None:

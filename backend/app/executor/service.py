@@ -228,11 +228,15 @@ class ExecutorService:
         if cursor > 0 and self._legacy_tier_order(record.exec_params):
             # 升级前（widthTiers 档位序）创建的断点：笔序与当前容差分桶不同，
             # 从旧游标续画会漏画/错宽；本次从第 1 笔重画，避免静默错序。
+            # 同时把 exec_params 迁移成当前格式（as_dict 不再输出 widthTiers），
+            # 否则下次续画会重复触发这段重置与 warning。
             self._emit(task_id, "task.warning", {
                 "message": "该任务由旧版按档位顺序创建，断点笔序与当前算法不同；"
                            "已从第 1 笔重新开始（请确认画布已清空）"
             })
-            self._store.update_task(task_id, cursor_path=0)
+            self._store.update_task(
+                task_id, cursor_path=0, exec_params=params.as_dict()
+            )
             cursor = 0
             record = self._store.get_task(task_id) or record
         self._spawn(
@@ -550,7 +554,12 @@ class ExecutorService:
                 canvas=new_rect,
             )
 
-        flat = self._build_draw_sequence(task_id, paths, params)
+        flat = self._build_draw_sequence(paths, params)
+        bucket_count = len({bucket for bucket, _edge, _path in flat})
+        if bucket_count > 1:
+            self._emit(task_id, "task.warning", {
+                "message": f"按容差 {params.width_tolerance:.2f} 分 {bucket_count} 档笔宽绘制"
+            })
 
         handle.guard_active.set()
         self._transition(task_id, "DRAWING")
@@ -586,16 +595,21 @@ class ExecutorService:
                         })
                 try:
                     if switched:
+                        # 面板展开后画布可能被工具条撑大（折叠态盖住滑杆区域），
+                        # 必须按当前帧重新取画布做守卫，否则滑杆/画笔坐标会被
+                        # 折叠态的旧矩形判成「落在画布内」而全部拒点。
+                        guard_canvas = self._current_canvas_rect(target) or new_rect
                         # 展开态工具格可见：换笔前再确认一次画笔态，非画笔则先切回。
                         self._ensure_brush(
                             task_id, tools_open, mouse, target, image_size, client,
-                            canvas=new_rect,
+                            canvas=guard_canvas,
                         )
                         # 点位取桶下缘（target_frac 即 bucket*tol），保证实际不粗于计划。
                         sx = slider_open["x"] + slider_open["w"] * target_frac
                         sy = slider_open["y"] + slider_open["h"] / 2.0
                         if self._click_image_point(
-                            mouse, target, (sx, sy), image_size, client, canvas=new_rect,
+                            mouse, target, (sx, sy), image_size, client,
+                            canvas=guard_canvas,
                         ):
                             time.sleep(0.25)
                             self._emit(task_id, "task.warning", {
@@ -763,28 +777,23 @@ class ExecutorService:
 
     def _build_draw_sequence(
         self,
-        task_id: str,
         paths: list[list[tuple[float, float]]],
         params: ExecParams,
     ) -> list[tuple[int, float, list[tuple[float, float]]]]:
         """无宽度表或仅 1 档时平铺为单桶；否则按容差 + 局部密度分桶（先粗后细）。
 
         返回 [(桶号, 桶下缘行程, 笔迹)]，桶号越大越粗。续画会基于同一份
-        width_table 与容差重算，结果必须逐位一致（有锁定测试）。
+        width_table 与容差重算，结果必须逐位一致（有锁定测试）。纯函数，
+        不在此发消息，分档提示由调用点在拿到结果后发出。
         """
         if params.width_table is None or len(params.width_table) < 2:
             return [(0, 0.0, p) for p in paths]
         buckets = width_buckets(paths, params.width_tolerance)
-        flat = [
+        return [
             (bucket, edge, path)
             for bucket, edge, group in buckets
             for path in group
         ]
-        # 先构列表再 emit：构建函数的副作用让「同一份输入必得同一结果」更难验证。
-        self._emit(task_id, "task.warning", {
-            "message": f"按容差 {params.width_tolerance:.2f} 分 {len(buckets)} 档笔宽绘制"
-        })
-        return flat
 
     @staticmethod
     def _legacy_tier_order(raw: dict) -> bool:
@@ -1014,12 +1023,32 @@ class ExecutorService:
                 })
                 return
         try:
+            if unfolded:
+                guard_canvas = self._current_canvas_rect(target) or canvas
+            else:
+                guard_canvas = canvas
             self._ensure_brush(
-                task_id, tools_open, mouse, target, image_size, client, canvas=canvas,
+                task_id, tools_open, mouse, target, image_size, client,
+                canvas=guard_canvas,
             )
         finally:
             if unfolded:
                 panel.fold(slider, fold_open)  # type: ignore[union-attr]
+
+    def _current_canvas_rect(self, target: DrawingTarget) -> Rect | None:
+        """按当前截图重取画布矩形。
+
+        面板开合会改变画布区域（折叠时更大、可能盖住工具条），跨态点击的
+        守卫必须用「点击那一刻」的画布，而不是展开前那张图推出来的矩形。
+        """
+        image = target.capture_image()
+        if image is None:
+            return None
+        found = detect_canvas_rect(image)
+        if found is None:
+            return None
+        left, top, right, bottom = found
+        return Rect(left, top, right - left, bottom - top)
 
     def _probe_toolbar(
         self,
