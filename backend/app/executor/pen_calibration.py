@@ -54,6 +54,8 @@ class CalibrationResult:
     strokes_drawn: int
     cleared: bool
     width_spread: float
+    # 标定开始前、与最终刻度带同一区域的既有墨量占比（已夹到 [0,1]）。
+    baseline_occupied: float = 0.0
 
 class PenCalibrator:
     """在真机画布上扫描滑杆档位并实测笔宽。
@@ -98,20 +100,25 @@ class PenCalibrator:
         canvas: tuple[int, int, int, int],
         on_progress: Callable[[str], None],
         should_stop: Callable[[], bool],
-        baseline_occupied: float = 0.0,
     ) -> CalibrationResult:
-        """执行标定；``baseline_occupied`` 为标定开始前刻度带内既有墨量占比。
+        """执行标定；清空判定以标定器自己量出的刻度带为准。
 
-        清空判定以该占比为基线：用户画布本就带墨时，只要墨量回落到基线附近
-        即视为测试线已撤净，不会把既有墨迹当成清空失败。
+        基线在同一张图上取样：start 前先抓一张，扫描结束后拿到真实 band，再用
+        这张图按同一 band 计算既有墨量占比。band 只有扫描后才知道，先前的
+        常量推导会与标定器实际布局不一致（行距随笔宽增长），基线偏大时撤销
+        失败也会被判「已清空」，测试线会留在用户画布上。
         """
         track = self._validate_track(slider_track)
         tier_count = max(2, min(int(tiers), self.MAX_PROBE_STEPS))
 
+        # 必须保留标定开始前的像素快照：band 要到扫描结束后才有，若直接持有
+        # 截图对象（有的实现返回内部缓冲），后续笔画会改掉这份「基线」。
+        before = self._grab().copy()
         rows, band = self._scan_widths(
             track=track, probe_steps=tier_count, canvas=canvas,
             on_progress=on_progress, should_stop=should_stop,
         )
+        baseline_occupied = max(0.0, min(1.0, ink_occupied_fraction(before, band)))
         table, spread = self._build_table(rows, tier_count)
 
         # 无论调宽是否有效都要清空刻度带测试线，画布干净才算标定完成。
@@ -132,8 +139,15 @@ class PenCalibrator:
                 strokes_drawn=len(rows),
                 cleared=True,
                 width_spread=spread,
+                baseline_occupied=baseline_occupied,
             )
-        return CalibrationResult(table=table, strokes_drawn=len(rows), cleared=True, width_spread=spread)
+        return CalibrationResult(
+            table=table,
+            strokes_drawn=len(rows),
+            cleared=True,
+            width_spread=spread,
+            baseline_occupied=baseline_occupied,
+        )
 
     # ---------- 档位扫描 ----------
 

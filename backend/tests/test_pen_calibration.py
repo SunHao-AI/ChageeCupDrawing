@@ -167,10 +167,11 @@ def test_clear_accepts_preexisting_ink() -> None:
     result = calib.run(
         slider_track=TRACK, undo_point=UNDO, tiers=5, canvas=CANVAS,
         on_progress=lambda _m: None, should_stop=lambda: False,
-        baseline_occupied=0.01,
     )
     assert result.cleared
     assert result.strokes_drawn == 5
+    # 基线由标定器用最终 band 在首张图上实测，而不是外部常量推导。
+    assert 0.0 < result.baseline_occupied < 0.1
     # 既有墨迹不属于测试线，撤销后必须还在（不能为凑清空多撤别人的笔）。
     assert board.grid[68, 46:92].max() == 0
 

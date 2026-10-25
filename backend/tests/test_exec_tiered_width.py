@@ -19,7 +19,7 @@ from app.device.geometry import ClientArea
 from app.executor import panel_control, pen_order, service
 from app.executor.pen_order import width_buckets
 from app.executor.service import ExecParams, ExecutorService, TaskError, _RunHandle
-from app.executor.toolbar_probe import ProbeError
+from app.executor.toolbar_probe import ProbeError, ToolBitmap
 
 SIZE = (900, 600)  # (h, w)
 CANVAS = (150, 200, 450, 650)  # l, t, r, b
@@ -284,7 +284,7 @@ TABLE_3 = ((0.0, 2.0), (0.5, 4.0), (1.0, 8.0))
 
 
 def test_buckets_switch_only_when_crossing(monkeypatch) -> None:
-    # 目标行程 0.95/0.93 落在同一桶（19），0.90 落到桶 18：只换一次宽。
+    # 0.95 → 桶 19（第 20 档）；0.93 与 0.90 同落桶 18（第 19 档）：只换一次宽。
     monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
     store = FakeStore(_calibration(tools_open=_tools(brush=None)))
     board = FakeBoard(open_=True)
@@ -306,20 +306,22 @@ def test_buckets_switch_only_when_crossing(monkeypatch) -> None:
 
 
 def test_brush_state_enforced_before_first_stroke() -> None:
-    store = FakeStore(_calibration(tools_open=_tools(slider=None, fold=None)))
+    # 位图需带折叠钮/滑杆，面板状态才可判定；否则按 B-1 规则应跳过校验。
+    store = FakeStore(_calibration(tools_open=_tools()))
     board = FakeBoard(open_=True, tool="eraser")
     params = ExecParams(auto_width=True, width_table=((0.0, 3.0),))
 
     mouse = _run(store, board, _paths(1), params)
 
-    # 第一次点击必须是把画笔切回来的画笔格点击，且发生在任何拖拽之前。
-    assert mouse.clicks[0] == BRUSH_OPEN
+    # 必须发生过画笔格点击（把画笔切回来），且发生在任何拖拽之前。
+    assert BRUSH_OPEN in mouse.clicks
     assert board.tool == "brush"
     assert len(mouse.drags) == 1
     assert any("已自动切回画笔" in m for m in store.warnings())
 
-    # 无法纠正：仍点画笔复检后依旧非画笔 → E_NOT_BRUSH，且一笔都不落。
-    stuck_store = FakeStore(_calibration(tools_open=_tools(slider=None, fold=None)))
+    # 无法纠正：仍点画笔复检后依旧非画笔 → E_NOT_BRUSH，且一笔都不落；
+    # 抛错前面板须已收起（最后一击是折叠钮）。
+    stuck_store = FakeStore(_calibration(tools_open=_tools()))
     stuck_board = FakeBoard(open_=True, tool="eraser", brush_toggle_enabled=False)
     stuck_mouse = FakeMouse(stuck_board)
     svc = _service(stuck_store, stuck_mouse)
@@ -340,7 +342,36 @@ def test_brush_state_enforced_before_first_stroke() -> None:
         )
     assert excinfo.value.code == "E_NOT_BRUSH"
     assert stuck_mouse.drags == []
-    assert stuck_mouse.clicks == [BRUSH_OPEN]
+    assert BRUSH_OPEN in stuck_mouse.clicks
+    assert stuck_mouse.clicks[-1] == (FOLD["x"], FOLD["y"])
+
+
+def test_unknown_panel_state_skips_brush_guard() -> None:
+    """B-1：面板态未知（无折叠按钮）时不得用展开态坐标盲点，只警告并跳过。"""
+    store = FakeStore(_calibration(tools_open=_tools(fold=None), fold=None))
+    board = FakeBoard(open_=True, tool="eraser")
+    params = ExecParams(auto_width=True, width_table=((0.0, 3.0),))
+
+    mouse = _run(store, board, _paths(1), params)
+
+    assert BRUSH_OPEN not in mouse.clicks
+    assert board.tool == "eraser"
+    assert len(mouse.drags) == 1
+    assert any("折叠态无画笔位图，本次跳过画笔校验" in m for m in store.warnings())
+
+
+def test_unfold_failure_skips_brush_guard() -> None:
+    """B-1：折叠态无折叠位图且展开失败时，不点击任何画笔格。"""
+    store = FakeStore(_calibration(tools_open=_tools()))
+    board = FakeBoard(open_=False, tool="eraser", toggle_enabled=False)
+    params = ExecParams(auto_width=True, width_table=((0.0, 3.0),))
+
+    mouse = _run(store, board, _paths(1), params)
+
+    assert BRUSH_OPEN not in mouse.clicks
+    assert board.tool == "eraser"
+    assert len(mouse.drags) == 1
+    assert any("折叠态无画笔位图，本次跳过画笔校验" in m for m in store.warnings())
 
 
 def test_never_clicks_eraser_during_draw(monkeypatch) -> None:
@@ -379,27 +410,100 @@ def test_uses_collapsed_bitmap_when_panel_folded() -> None:
     assert len(mouse.drags) == 2
 
 
-def test_resume_recomputes_identical_sequence() -> None:
+class _FakeProber:
+    """探测成功并返回本次截图帧（new_rect 坐标系）下的工具位图。"""
+
+    def __init__(self, **_kwargs) -> None:
+        pass
+
+    def run(self, **_kwargs) -> ToolBitmap:
+        return ToolBitmap(
+            brush=BRUSH_OPEN,
+            eraser=ERASER_OPEN,
+            slider=dict(TRACK),
+            undo=(UNDO["x"], UNDO["y"]),
+            fold=(FOLD["x"], FOLD["y"]),
+            brush_selected_lum=SELECTED_LUM,
+            brush_idle_lum=IDLE_LUM,
+        )
+
+
+def test_probed_bitmap_persisted_in_saved_rect_frame(monkeypatch) -> None:
+    """B-3：探测坐标来自 new_rect 帧，写入 profile 前须减回旧 rect 帧。
+
+    构造一个 2/1px 的画布漂移：若持久化未反平移，下次读取会再平移一次，
+    滑杆点击位置就会偏移同样距离。
+    """
+    dx, dy = 2, 1
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    monkeypatch.setattr(service, "ToolbarProber", _FakeProber)
+    calibration = _calibration()
+    calibration.rect_x = RECT_X - dx
+    calibration.rect_y = RECT_Y - dy
+    store = FakeStore(calibration)
+    board = FakeBoard(open_=True)
+    params = ExecParams(auto_width=True, width_table=TABLE_3, width_tolerance=0.05)
+
+    _run(store, board, _paths(3), params)
+
+    saved = store.saved[-1]
+    assert saved["source"] == "probe"
+    assert saved["rect_x"] == RECT_X - dx
+    assert saved["rect_y"] == RECT_Y - dy
+    tools = saved["tools_open"]
+    assert tools["slider"]["x"] == pytest.approx(TRACK["x"] - dx)
+    assert tools["slider"]["y"] == pytest.approx(TRACK["y"] - dy)
+    assert tools["brush"] == pytest.approx((BRUSH_OPEN[0] - dx, BRUSH_OPEN[1] - dy))
+    assert tools["fold"] == pytest.approx((FOLD["x"] - dx, FOLD["y"] - dy))
+
+    # 用刚写入的 profile 再跑一次：换宽点击不应被再平移一次。
+    store2 = FakeStore(SimpleNamespace(**saved))
+    mouse2 = _run(store2, FakeBoard(open_=True), _paths(3), params)
+    clicks = _slider_clicks(mouse2)
+    assert clicks
+    assert clicks[0][0] == pytest.approx(TRACK["x"] + TRACK["w"] * 0.95)
+    assert clicks[0][1] == pytest.approx(TRACK["y"] + TRACK["h"] / 2.0)
+
+
+def test_resume_recomputes_identical_sequence(monkeypatch) -> None:
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
     store = FakeStore(_calibration(tools_open=_tools()))
     svc = _service(store, FakeMouse(FakeBoard()))
     params = ExecParams(auto_width=True, width_table=TABLE_3, width_tolerance=0.05)
-    paths = _paths(5)
+    paths = _paths(3)
 
-    first = svc._build_draw_sequence("t1", paths, params)
-    second = svc._build_draw_sequence("t1", paths, params)
-
-    assert first == second  # 续画重算逐位一致
-    for cursor in (1, 3):
-        assert first[cursor:] == second[cursor:]
-    buckets = [bucket for bucket, _edge, _path in first]
+    flat = svc._build_draw_sequence("t1", paths, params)
+    assert flat == svc._build_draw_sequence("t1", paths, params)  # 续画重算逐位一致
+    buckets = [bucket for bucket, _edge, _path in flat]
     assert buckets == sorted(buckets, reverse=True)
     assert all(
         abs(edge - bucket * params.width_tolerance) < 1e-9
-        for bucket, edge, _path in first
+        for bucket, edge, _path in flat
     )
-    # 真实分桶下每条笔迹只出现一次，续画不会重复/丢失。
-    assert len(first) == len(paths)
-    assert sorted(map(id, [p for _b, _e, p in first])) == sorted(map(id, paths))
+
+    # 真实断点：第二个桶的首个索引。断点前已画过，不能再画；断点后首击须换到
+    # 该桶下缘滑杆位置。
+    cursor = next(
+        index for index, (bucket, _e, _p) in enumerate(flat) if bucket != flat[0][0]
+    )
+    assert cursor > 0
+    board = FakeBoard(open_=True)
+    mouse = _run(store, board, paths, params, cursor=cursor)
+    clicks = _slider_clicks(mouse)
+    assert len(clicks) == 1
+    assert clicks[0][0] == pytest.approx(TRACK["x"] + TRACK["w"] * flat[cursor][1])
+    assert len(mouse.drags) == len(flat) - cursor
+    drawn = [tuple(drag[0]) for drag in mouse.drags]
+    assert drawn == [
+        (path[0][0] + RECT_X, path[0][1] + RECT_Y)
+        for _b, _e, path in flat[cursor:]
+    ]
+    before = {
+        (path[0][0] + RECT_X, path[0][1] + RECT_Y)
+        for _b, _e, path in flat[:cursor]
+    }
+    assert before.isdisjoint(drawn)  # 断点之前的笔迹不再绘制
+    assert flat[cursor] == svc._build_draw_sequence("t1", paths, params)[cursor]
 
 
 def test_legacy_profile_single_bitmap_fallback(monkeypatch) -> None:
