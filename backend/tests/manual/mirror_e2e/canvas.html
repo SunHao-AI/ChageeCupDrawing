@@ -4,14 +4,18 @@
     <meta charset="utf-8" />
     <title>CupDraw E2E Target</title>
     <style>
-      /* 背景中性灰，画板纯白。画板用 vh + aspect-ratio 定尺寸（高=70vh，
+      /* 背景中性浅灰，画板纯白。画板用 vh + aspect-ratio 定尺寸（高=70vh，
          宽高比 2:3）：相对视口与 DPI 无关，白区恒占截图高 ~70%、宽 ~56%
-         （窗口 640x780 下），稳居 canvas_detect 的 42–92% / 34–82% 安全区。 */
+         （窗口 640x780 下），稳居 canvas_detect 的 42–92% / 34–82% 安全区。
+
+         背景刻意保持「亮灰（灰度 >160）」而不是深灰：工具栏探测把画布下方
+         任何 ≥60px 长的深色水平条当作滑杆轨道，深色背景会把画布与工具栏之间
+         的空白带误认成滑杆。画板纯白（≥250）仍能被 canvas_detect 稳定识别。 */
       html,
       body {
         margin: 0;
         height: 100%;
-        background: #888;
+        background: #d0d0d0;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -28,55 +32,324 @@
         height: 100%;
         display: block;
       }
+      /* 合成工具条：绝对定位，只占画板下方的留白，不参与 flex 布局，
+         因此画板的位置与尺寸与无工具栏时完全一致。 */
+      #toolbar {
+        position: absolute;
+        background: #e9e9e9;
+        box-sizing: border-box;
+        overflow: hidden;
+      }
+      #toolbar button,
+      #slider,
+      #track {
+        position: absolute;
+        box-sizing: border-box;
+        padding: 0;
+        margin: 0;
+        border: 0;
+        font: 16px/1 sans-serif;
+      }
+      #fold {
+        background: #555;
+        color: #fff;
+        border-radius: 4px;
+      }
+      #brush,
+      #eraser,
+      #undo {
+        border-radius: 4px;
+      }
+      /* 选中态用更亮的底色：后端画笔指纹按「选中格亮度 >= (选中+未选中)/2」
+         判定，选中格必须比未选中格亮（差 ≥30），否则绘制期会被误判成橡皮态。 */
+      #brush,
+      #eraser {
+        background: #444;
+      }
+      #undo {
+        background: #c8c8c8;
+      }
+      /* 滑杆 = 透明的大命中区 + 顶部 6px 深色条。后端按深色条识别滑杆、按识别
+         到的坐标点击，而截图把窗口边框也拍进去了（点击会落到目标下方 ~36px），
+         所以命中区必须比深色条高出一截，否则滑块点击会落在轨道外。 */
+      #slider {
+        background: transparent;
+      }
+      #track {
+        background: #333;
+        border-radius: 3px;
+        overflow: visible;
+      }
+      #knob {
+        position: absolute;
+        background: #222;
+        border-radius: 50%;
+      }
+      /* 折叠只隐藏面板内容；工具栏占位与画板位置不变。 */
+      #toolbar.collapsed .panel-item {
+        display: none;
+      }
     </style>
   </head>
   <body>
     <div id="board"><canvas id="c"></canvas></div>
+    <div id="toolbar">
+      <button id="fold" title="折叠">∨</button>
+      <button id="brush" class="panel-item" title="画笔"></button>
+      <button id="eraser" class="panel-item" title="橡皮"></button>
+      <button id="undo" class="panel-item" title="撤销"></button>
+      <div id="slider" class="panel-item"><div id="track"><div id="knob"></div></div></div>
+    </div>
     <script>
-      // 模拟小程序画板：指针事件画线，笔画数写进 document.title，
-      // 供外部验证脚本通过窗口标题读取（Chrome --app 窗口标题=页面标题）。
+      // 模拟小程序画板 + 工具条：指针事件落墨，工具/面板/换宽计数写进
+      // document.title，供外部验证脚本通过窗口标题读取（Chrome --app 标题=页面标题）。
+      //
+      // 工具条必须能被后端的「行为探测」学会：探测在截图里以「画布下缘 +8 起、
+      // 步长 28px」的网格点击，且截图包含窗口边框（图像 y 比页面 CSS y 多一个
+      // 固定偏移），所以控件位置按「探测网格 + 边框偏移」一起对齐，见 layout()。
       const board = document.getElementById('board')
       const canvas = document.getElementById('c')
       const ctx = canvas.getContext('2d')
+      const toolbar = document.getElementById('toolbar')
+      const foldBtn = document.getElementById('fold')
+      const brushBtn = document.getElementById('brush')
+      const eraserBtn = document.getElementById('eraser')
+      const undoBtn = document.getElementById('undo')
+      const slider = document.getElementById('slider')
+      const track = document.getElementById('track')
+      const knob = document.getElementById('knob')
+
+      const state = {
+        tool: 'eraser', // 开局橡皮态：验证首绘前会被纠正为画笔
+        panelOpen: true,
+        strokes: [], // 画笔笔迹 {tool:'brush', points, width}；橡皮 {tool:'eraser', ...}
+        recent: [], // 最近 8 笔的工具名（含探测/标定的测试笔）
+        count: 0,
+        sliderClicks: 0,
+        foldClicks: 0,
+        drawPhaseSwitch: 0,
+        drawPhase: false, // 首笔长度 ≥120px 后进入用户绘制期
+        frac: 0.4, // 滑杆位置 0..1
+      }
+
+      const brushWidth = () => 2 + 10 * state.frac
+      const eraserWidth = () => 16
+
+      // 画布坐标 = CSS px（canvas 尺寸与 CSS 尺寸一致）。
+      const pos = (e) => {
+        const r = canvas.getBoundingClientRect()
+        return [
+          ((e.clientX - r.left) * canvas.width) / r.width,
+          ((e.clientY - r.top) * canvas.height) / r.height,
+        ]
+      }
+
+      const redraw = (current) => {
+        ctx.save()
+        ctx.globalCompositeOperation = 'source-over'
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        for (const stroke of state.strokes) paint(stroke)
+        if (current) paint(current)
+        ctx.restore()
+      }
+
+      const paint = (stroke) => {
+        if (!stroke.points.length) return
+        ctx.globalCompositeOperation = stroke.tool === 'eraser' ? 'destination-out' : 'source-over'
+        ctx.strokeStyle = '#111'
+        ctx.fillStyle = '#111'
+        ctx.lineCap = 'round'
+        ctx.lineJoin = 'round'
+        ctx.lineWidth = stroke.width
+        if (stroke.points.length === 1) {
+          const [x, y] = stroke.points[0]
+          ctx.beginPath()
+          ctx.arc(x, y, Math.max(0.5, stroke.width / 2), 0, Math.PI * 2)
+          ctx.fill()
+          return
+        }
+        ctx.beginPath()
+        ctx.moveTo(stroke.points[0][0], stroke.points[0][1])
+        for (const [x, y] of stroke.points.slice(1)) ctx.lineTo(x, y)
+        ctx.stroke()
+      }
+
+      const pathLength = (points) => {
+        let total = 0
+        for (let i = 1; i < points.length; i += 1) {
+          total += Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1])
+        }
+        return total
+      }
+
+      const publish = () => {
+        document.title =
+          `CupDraw E2E Target [${state.count}]` +
+          ` tool=${state.tool}` +
+          ` panel=${state.panelOpen ? 1 : 0}` +
+          ` sliderClicks=${state.sliderClicks}` +
+          ` foldClicks=${state.foldClicks}` +
+          ` drawPhaseSwitch=${state.drawPhaseSwitch}` +
+          ` recent=${state.recent.slice(-8).join(',')}`
+      }
+
+      const syncToolStyles = () => {
+        brushBtn.style.background = state.tool === 'brush' ? '#ddd' : '#444'
+        eraserBtn.style.background = state.tool === 'eraser' ? '#ddd' : '#444'
+      }
+
+      const syncPanel = () => {
+        toolbar.classList.toggle('collapsed', !state.panelOpen)
+      }
+
+      const syncKnob = () => {
+        const trackRect = track.getBoundingClientRect()
+        const knobRect = knob.getBoundingClientRect()
+        const usable = Math.max(0, trackRect.width - knobRect.width)
+        knob.style.left = `${state.frac * usable}px`
+        knob.style.top = `${(trackRect.height - knobRect.height) / 2}px`
+      }
+
+      // 画板与工具条几何：工具条顶边 = 画板下缘 +8，左对齐画板、宽度跟随画板，
+      // 因此「控件中心占工具条宽度的比例」在截图里是同一个比例，与窗口缩放无关。
+      //
+      // 垂直方向要留余量：截图是客户区的等比缩放（实测 720x889 图像 / 782x966
+      // 客户区 / 页面 626x743 CSS，DPI 1.25），探测候选行是「图像 y = 画布下缘 +8
+      // 起、步长 28」，换算到页面 CSS 后是 663/688/712/737 四条。按钮行放在
+      // CSS 651..683（撑满行 0），滑杆的透明命中区放在 690..742（吃掉行 2/3），
+      // 这样最近一行就能命中折叠钮，探测不必再往下扫（越远越慢、越容易误点）。
+      //
+      // 已用静态换算核对（不点鼠标）：行 0 → 折叠/画笔/橡皮/撤销各有 1-2 个候选列，
+      // 行 2/3 → 滑杆命中区。控件尺寸 48x32 是为了让候选列即使跳过一格也仍有命中。
+      const CELL_W = 48
+      const CELL_H = 32
+      const CELL_TOP = 11
+      const layout = () => {
+        const boardRect = board.getBoundingClientRect()
+        toolbar.style.left = `${boardRect.left}px`
+        toolbar.style.top = `${boardRect.bottom + 8}px`
+        toolbar.style.width = `${boardRect.width}px`
+        toolbar.style.height = '110px'
+
+        const place = (el, fraction) => {
+          el.style.width = `${CELL_W}px`
+          el.style.height = `${CELL_H}px`
+          el.style.left = `${boardRect.width * fraction - CELL_W / 2}px`
+          el.style.top = `${CELL_TOP}px`
+        }
+        place(foldBtn, 0.06)
+        place(brushBtn, 0.3)
+        place(eraserBtn, 0.54)
+        place(undoBtn, 0.78)
+
+        // 滑杆：透明命中区（160x52）里只放一条 6px 深色条。深色条供识别，
+        // 命中区向下延伸，让候选行 2/3 也能点到滑块（后端按识别到的轨道坐标点）。
+        slider.style.left = '12px'
+        slider.style.top = '50px'
+        slider.style.width = '160px'
+        slider.style.height = '52px'
+        track.style.left = '0px'
+        track.style.top = '0px'
+        track.style.width = '160px'
+        track.style.height = '6px'
+        knob.style.width = '14px'
+        knob.style.height = '14px'
+        syncKnob()
+      }
+
       const fit = () => {
         canvas.width = board.clientWidth
         canvas.height = board.clientHeight
-        ctx.lineWidth = 3
-        ctx.lineCap = 'round'
-        ctx.strokeStyle = '#111'
+        redraw()
       }
-      fit()
-      addEventListener('resize', fit)
-      let strokes = 0
-      let drawing = false
-      const pos = (e) => {
-        const r = canvas.getBoundingClientRect()
-        return [((e.clientX - r.left) * canvas.width) / r.width, ((e.clientY - r.top) * canvas.height) / r.height]
-      }
+
+      // ---------- 画布笔迹 ----------
+      let current = null
+
       canvas.addEventListener('pointerdown', (e) => {
         e.preventDefault()
         canvas.setPointerCapture(e.pointerId)
-        drawing = true
-        const [x, y] = pos(e)
-        ctx.beginPath()
-        ctx.moveTo(x, y)
+        current = {
+          tool: state.tool,
+          width: state.tool === 'eraser' ? eraserWidth() : brushWidth(),
+          points: [pos(e)],
+        }
+        redraw(current)
       })
+
       canvas.addEventListener('pointermove', (e) => {
-        if (!drawing) return
+        if (!current) return
         e.preventDefault()
-        const [x, y] = pos(e)
-        ctx.lineTo(x, y)
-        ctx.stroke()
+        current.points.push(pos(e))
+        redraw(current)
       })
-      const end = (e) => {
-        if (!drawing) return
+
+      const endStroke = (e) => {
+        if (!current) return
         e.preventDefault()
-        drawing = false
-        strokes += 1
-        document.title = `CupDraw E2E Target [${strokes}]`
+        const stroke = current
+        current = null
+        state.strokes.push(stroke)
+        state.count += 1
+        state.recent.push(stroke.tool)
+        // 标定/探测的测试线只有 46px；用户路径（源图 6 条横线）远长于 120px。
+        if (pathLength(stroke.points) >= 120) state.drawPhase = true
+        redraw()
+        publish()
       }
-      canvas.addEventListener('pointerup', end)
-      canvas.addEventListener('pointercancel', end)
+      canvas.addEventListener('pointerup', endStroke)
+      canvas.addEventListener('pointercancel', endStroke)
+
+      // ---------- 工具条 ----------
+      foldBtn.addEventListener('click', () => {
+        state.foldClicks += 1
+        state.panelOpen = !state.panelOpen
+        syncPanel()
+        publish()
+      })
+
+      brushBtn.addEventListener('click', () => {
+        state.tool = 'brush'
+        syncToolStyles()
+        publish()
+      })
+
+      eraserBtn.addEventListener('click', () => {
+        state.tool = 'eraser'
+        syncToolStyles()
+        publish()
+      })
+
+      undoBtn.addEventListener('click', () => {
+        // 撤销 = 弹出最后一笔并整体重绘（橡皮笔迹被撤时墨迹恢复，与真实画板一致）。
+        state.strokes.pop()
+        redraw()
+        publish()
+      })
+
+      // 点击命中区（含深色条下方那段透明区）都算一次滑块点击。
+      slider.addEventListener('pointerdown', (e) => {
+        e.preventDefault()
+        const trackRect = track.getBoundingClientRect()
+        const knobRect = knob.getBoundingClientRect()
+        const usable = Math.max(1, trackRect.width - knobRect.width)
+        const frac = (e.clientX - trackRect.left - knobRect.width / 2) / usable
+        state.frac = Math.min(1, Math.max(0, frac))
+        state.sliderClicks += 1
+        if (state.drawPhase) state.drawPhaseSwitch += 1
+        syncKnob()
+        publish()
+      })
+
+      layout()
+      fit()
+      addEventListener('resize', () => {
+        layout()
+        fit()
+      })
+      syncToolStyles()
+      syncPanel()
+      publish()
     </script>
   </body>
 </html>

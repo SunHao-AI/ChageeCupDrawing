@@ -15,6 +15,7 @@ from __future__ import annotations
 import ctypes
 import http.server
 import json
+import math
 import os
 import re
 import socket
@@ -64,10 +65,14 @@ def wait_for(fn, timeout_s: float, what: str, interval_s: float = 0.1):
 # ---------- 夹具 ----------
 
 def make_source_png(path: Path) -> None:
-    """6 条水平短线：pathCount 少而可控，适合中途停止做断点续画验证。"""
+    """4 条水平短线：pathCount 少而可控，适合中途停止做断点续画验证。
+
+    线数直接影响笔宽分桶数：每档换宽都要「展开→点滑杆→折叠」两次折叠点击，
+    6 条等长线会分到 6 档（夹具上限 21 次），4 条留出余量。
+    """
     img = Image.new("RGB", (420, 620), "white")
     draw = ImageDraw.Draw(img)
-    for i in range(6):
+    for i in range(4):
         y = 120 + i * 70
         draw.line([(70, y), (350, y)], fill="black", width=3)
     img.save(path)
@@ -133,6 +138,29 @@ def strokes_of(window_title: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def parse_title(window_title: str) -> dict:
+    """解析夹具标题：`CupDraw E2E Target [n] tool=.. panel=.. sliderClicks=.. ...`。
+
+    标题里 `[n]` 仍是落笔总数（strokes_of 依赖该前缀格式），其后是空格分隔的
+    键值对；`recent` 为逗号分隔的最近 8 笔工具名。
+    """
+    data: dict = {"strokes": strokes_of(window_title), "recent": []}
+    m = re.search(re.escape(TITLE_PREFIX) + r"\s*\[(\d+)\]\s*(.*)$", window_title)
+    if not m:
+        return data
+    for part in m.group(2).split():
+        key, _, value = part.partition("=")
+        if key:
+            data[key] = value
+    data["recent"] = [x for x in str(data.get("recent", "")).split(",") if x]
+    for key in ("panel", "sliderClicks", "foldClicks", "drawPhaseSwitch"):
+        try:
+            data[key] = int(data.get(key, 0))
+        except (TypeError, ValueError):
+            data[key] = 0
+    return data
+
+
 def find_window(c: httpx.Client) -> tuple[int, str] | None:
     for w in c.get("/devices").json()["pcWindows"]:
         if w["title"].startswith(TITLE_PREFIX):
@@ -194,9 +222,10 @@ def main() -> int:
         task = post(c, f"/plans/{plan_id}/tasks",
                     json={"exec": exec_params, "countdownMs": 1200, "allowDrift": 0.1}).json()
         task_id = task["taskId"]
+        print("… 探测中（首绘前自动识别工具条，每个候选点都要截图比对，需要 1-2 分钟）")
         wait_for(
             lambda: (s if (s := task_status(c, task_id))["cursorPath"] >= 2 else None),
-            60, "已画过 2 笔（真中途断点）", interval_s=0.05,
+            180, "已画过 2 笔（真中途断点）", interval_s=0.05,
         )
         t_min = time.monotonic()
         user32.ShowWindow(ctypes.c_void_p(hwnd), SW_MINIMIZE)  # 模拟用户最小化投屏窗口
@@ -218,7 +247,7 @@ def main() -> int:
         post(c, f"/tasks/{task_id}/resume", json={"countdownMs": 1200, "allowDrift": 0.1})
         snap = wait_for(
             lambda: (s if (s := task_status(c, task_id))["status"] in ("DONE", "FAILED", "STOPPED") else None),
-            120, "续画到终态", interval_s=0.1,
+            300, "续画到终态", interval_s=0.1,
         )
         check("断点续画完成", snap["status"] == "DONE" and snap["cursorPath"] == snap["totalPaths"],
               f"status={snap['status']} cursor={snap['cursorPath']}/{snap['totalPaths']} 断点={mid_cursor}")
@@ -229,7 +258,26 @@ def main() -> int:
         check("注入落墨可见（笔画计数增长）", strokes_end > 0 and strokes_end >= strokes_mid,
               f"mid={strokes_mid} end={strokes_end}")
 
-        # 8. 注销后句柄失效判定
+        # 8. 逐段笔宽：绘制全程画笔、面板收起、换宽次数与面板展开次数有界
+        kv = parse_title(found[1]) if found else {"recent": []}
+        total_paths = int(snap["totalPaths"])
+        recent = kv.get("recent", [])
+        draw_tail = recent[-total_paths:] if total_paths else []
+        print(f"… 夹具计数：{found[1] if found else '<窗口已关闭>'}")
+        check("绘制期全程画笔（最近各笔均为 brush）",
+              len(draw_tail) == total_paths and all(t == "brush" for t in draw_tail),
+              f"totalPaths={total_paths} recent={recent}")
+        check("终态工具为画笔（橡皮开局已被纠正）", kv.get("tool") == "brush",
+              f"tool={kv.get('tool')}")
+        check("绘制结束面板收起", kv.get("panel") == 0, f"panel={kv.get('panel')}")
+        switches = int(kv.get("drawPhaseSwitch", 0))
+        switch_limit = math.ceil(1 / 0.05) + 1
+        check("换宽确实发生且有界", 1 <= switches <= switch_limit,
+              f"drawPhaseSwitch={switches} 上限={switch_limit}")
+        check("面板展开次数有界", int(kv.get("foldClicks", 0)) <= 21,
+              f"foldClicks={kv.get('foldClicks')} 上限=21")
+
+        # 9. 注销后句柄失效判定
         c.request("DELETE", "/devices/mirror", headers={"X-Requested-With": "cupdraw"})
         status = c.get("/devices").json()["mirror"]
         check("注销镜像目标", status.get("running") is False)

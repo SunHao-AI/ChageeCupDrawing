@@ -13,6 +13,7 @@
 | HTTPS 反代 | 已按要求停止并删除 `deploy/`（2026-10-24），开发直连 `http://127.0.0.1:8765` |
 | 前端构建 | `frontend/dist` 已构建（含 BYOK 改造、响应式断点体系、iPad 字号修复） |
 | 无手机全链路 | `tests/manual/mirror_e2e/run_mirror_e2e.py` ALL PASS（注册→校准→规划→绘制→守护 62ms 停笔→断点续画 2/6→DONE） |
+| 逐段笔宽 | 实现完成（探测+双态位图+容差合批），待真机走查 |
 | 开机自启 | 已按用户要求移除（开发机不做运维配置） |
 | 代码提交 | 本轮全部改动已提交（2026-10-24，未推送远端），见 §3 |
 
@@ -80,6 +81,19 @@
 - **决策**：不加配对码/访问密码。会话双要件（`cupdraw_session` Cookie + `X-Requested-With: cupdraw`）只防 CSRF、不防同网段直接访问，定位为可信局域网单用户工具，接受此边界。
 - **落地**：设计文档 §4.2「局域网访问」已改写为实现真相 + 定案声明，里程碑 A2 与风险表同步；文档明示只在可信网络开启 `CUPDRAW_BIND`。
 - **关联**：[serve.py](file:///d:/Workplace/ChageeCupDrawing/backend/serve.py)、[main.py](file:///d:/Workplace/ChageeCupDrawing/backend/app/main.py) 的 `session_gate`
+
+### 1A.6 真机控件探测与逐段换宽走查 ❗高
+
+- **描述**：在真实小程序画板上验收「首绘前行为探测 + 按容差分桶换宽」。无手机 E2E 夹具已按探测要求合成工具条（折叠/画笔/橡皮/撤销/滑杆，见 [canvas.html](file:///d:/Workplace/ChageeCupDrawing/backend/tests/manual/mirror_e2e/canvas.html)），但真实小程序的控件外观、响应延迟与折叠行为只有真机能确认。
+- **背景**：探测按行为判据工作（折叠看滑杆轨道消失/出现、撤销看刻度带墨量掉到 40% 以下、橡皮/画笔看重描后线是否消失），任一控件外观或行为与假设不符都会退化为「探测失败 → 回退单细笔」或误点。夹具初始即橡皮态，用于验证「首绘前自动切回画笔」这条路径。
+- **要求**：
+  1. **探测命中率**：真机首绘一次，确认折叠、滑杆、撤销、橡皮、画笔五个控件全部被自动识别（日志出现 5 条「已识别 …」且无 `E_PROBE_NO_TOOLBAR`/`E_PROBE_NO_SLIDER`）。
+  2. **换宽精度**：绘制完成后在刻度带逐档抽测线宽，与 `pen_calibration` 记录的 `width_table` 目标值比较，偏差不超过 ±15%（截图量化误差内）。
+  3. **橡皮态纠正**：手动把工具停在橡皮，不重新校准直接开画——应出现警告「检测到非画笔工具，已自动切回画笔」且全程不擦除；若画笔格坐标落在画布内，应报 `E_NOT_BRUSH` 并停止。
+  4. **面板开合与画布矩形**：展开/收起工具面板时画布白区矩形不变（`canvas_detect` 结果一致），否则绘制映射会漂移。
+  5. **探测耗时**：记录首绘从 `ARMING` 到第一笔的实际耗时（候选点逐点截图，期望 ≤ 3 分钟；若明显超时需评估缩小扫描行数）。
+- **完成判据**：上述 5 项均有实测记录；探测失败时能按警告回退单细笔且不误点画布。
+- **关联**：[toolbar_probe.py](file:///d:/Workplace/ChageeCupDrawing/backend/app/executor/toolbar_probe.py)、[service.py](file:///d:/Workplace/ChageeCupDrawing/backend/app/executor/service.py) 的 `_arm_and_draw`、[pen_calibration.py](file:///d:/Workplace/ChageeCupDrawing/backend/app/executor/pen_calibration.py)
 
 ---
 
