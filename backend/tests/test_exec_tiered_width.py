@@ -17,6 +17,7 @@ import pytest
 from app.core.vision.canvas_detect import detect_canvas_rect
 from app.device.geometry import ClientArea
 from app.executor import panel_control, pen_order, service
+from app.executor.pen_order import width_buckets
 from app.executor.service import ExecParams, ExecutorService, TaskError, _RunHandle
 from app.executor.toolbar_probe import ProbeError, ToolBitmap
 
@@ -503,10 +504,12 @@ class _FakeCalibrator:
     drag_polyline 记下「那一条测试线」，供用例断言标定确实发生在探测之后。
     """
 
-    # 执行器会读取 PenCalibrator 的这两个类属性：探测刻度带几何与标定回退阈值。
+    # 仅为让 service 的刻度带计算不依赖真实标定器（它读取这三个类属性）。
     TEST_MARGIN = 6
     TEST_LINE_LEN = 46
     MIN_SPREAD_RATIO = 0.18
+
+    last_slider: dict | None = None
 
     def __init__(self, *, mouse, **_kwargs) -> None:
         self._mouse = mouse
@@ -514,9 +517,11 @@ class _FakeCalibrator:
     def run(
         self,
         *,
+        slider_track: dict,
         canvas,
         **_kwargs,
     ) -> SimpleNamespace:
+        type(self).last_slider = dict(slider_track)
         self._mouse.drag_polyline(
             [(canvas[0] + 6, canvas[1] + 10), (canvas[0] + 52, canvas[1] + 10)]
         )
@@ -535,14 +540,12 @@ def test_probed_bitmap_persisted_in_saved_rect_frame(monkeypatch) -> None:
     dx, dy = 2, 1
     monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
     monkeypatch.setattr(service, "ToolbarProber", _FakeProber)
-    monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
     calibration = _calibration()
     calibration.rect_x = RECT_X - dx
     calibration.rect_y = RECT_Y - dy
     store = FakeStore(calibration)
     board = FakeBoard(open_=True)
-    # 探测只在首绘标定前跑（width_table 为空），故这里也必须以未标定状态进入。
-    params = ExecParams(auto_width=True, width_table=None, width_tolerance=0.05)
+    params = ExecParams(auto_width=True, width_table=TABLE_3, width_tolerance=0.05)
 
     _run(store, board, _paths(3), params)
 
@@ -654,12 +657,10 @@ def test_legacy_profile_single_bitmap_fallback(monkeypatch) -> None:
             raise ProbeError("E_PROBE_NO_TOOLBAR", "工具条区域未探到任何控件")
 
     monkeypatch.setattr(service, "ToolbarProber", FailingProber)
-    monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
     monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
     store = FakeStore(_calibration())  # 旧校准：无 tools_open / tools_collapsed
     board = FakeBoard(open_=True)
-    # 探测在标定前跑；失败后沿用旧单套坐标，标定与换宽仍可继续。
-    params = ExecParams(auto_width=True, width_table=None)
+    params = ExecParams(auto_width=True, width_table=TABLE_3)
 
     mouse = _run(store, board, _paths(3), params)
 
@@ -668,14 +669,10 @@ def test_legacy_profile_single_bitmap_fallback(monkeypatch) -> None:
     assert any("旧校准：无法校验画笔态" in m for m in warnings)
     assert store.saved == []  # 探测失败不写库
     assert store.status == "DONE"
-    # 3 条用户路径 + 假标定的 1 条测试线。
-    assert len(mouse.drags) == 3 + 1
+    assert len(mouse.drags) == 3
     # 仍用旧单套坐标换宽（滑杆坐标未被探测结果替换）。
     clicks = _slider_clicks(mouse)
-    assert [round(x, 3) for x, _ in clicks] == [
-        TRACK["x"] + TRACK["w"] * 0.95,
-        TRACK["x"] + TRACK["w"] * 0.90,
-    ]
+    assert len(clicks) == len({b for b, _e, _p in width_buckets(_paths(3), 0.05)})
 
 
 def test_width_tiers_key_ignored() -> None:
@@ -697,6 +694,7 @@ def test_probe_bootstraps_calibration_without_manual_anchors(monkeypatch) -> Non
     monkeypatch.setattr(service, "ToolbarProber", _FakeProber)
     monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
     monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    _FakeCalibrator.last_slider = None
     calibration = _calibration(tools_open=None, slider=None, fold=None)
     store = FakeStore(calibration)
     params = ExecParams(auto_width=True, width_table=None, width_tolerance=0.05)
@@ -709,6 +707,9 @@ def test_probe_bootstraps_calibration_without_manual_anchors(monkeypatch) -> Non
     slider = store.saved[0]["tools_open"]["slider"]
     assert TRACK["x"] <= slider["x"] <= TRACK["x"] + TRACK["w"]
     assert store.status == "DONE"
+
+    # 标定器拿到的滑杆矩形就是探测结果（TRACK），而非旧校准的空坐标。
+    assert _FakeCalibrator.last_slider == TRACK
 
     # 3 条用户路径 + _FakeCalibrator 模拟的 1 条标定测试线（真实标定会画 5 条，
     # 但假画板无法测宽，故用最小假标定只记一条）。

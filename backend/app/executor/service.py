@@ -465,10 +465,11 @@ class ExecutorService:
         rendering_calibration = params.auto_width and params.width_table is None and cursor == 0
 
         # 探测在标定之前跑：标定依赖滑杆坐标，而旧校准（尤其全新用户只剩画布
-        # 矩形）可能没有任何人工锚点。探测成功即持久化成新校准记录；人工锚点
-        # 只作为探测输入（open_bitmap），不再作为探测开关。失败只警告、沿用旧
-        # 单套坐标，不阻断绘制。
-        if rendering_calibration and calibration.tools_open is None:
+        # 矩形）可能没有任何人工锚点。只要首画且尚无双态位图就探测，不要求尚无
+        # 宽度表（续画可能已有表但从未探到控件坐标）。探测成功即持久化成新校准
+        # 记录；人工锚点只作为探测输入（open_bitmap），不再作为探测开关。失败
+        # 只警告、沿用旧单套坐标，不阻断绘制。
+        if params.auto_width and cursor == 0 and calibration.tools_open is None:
             probed = self._probe_toolbar(
                 task_id, plan.project_id, calibration, target, mouse, client, image_size,
                 new_rect, dx, dy, fold_closed, slider_open, undo_open, handle,
