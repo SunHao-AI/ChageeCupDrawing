@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -45,8 +46,9 @@ BAND_ROW_STEP_PX = 14  # 与 PenCalibrator 的最小行距一致
 
 # 工具条行为探测的空白前提：探测会在画布下方候选区逐点盲点，若画布已有墨迹
 # （用户画作或上次未清理的笔迹），可能点中「清空/颜色」等无法恢复的控件。
-# 因此墨迹占比超过该阈值即跳过自动探测，改由用户在校准页人工标注。
-PROBE_BLANK_MAX = 0.01
+# 判定用墨像素绝对下限而非比例：探测自己残留的 46×3 测试线约 138 px，在大画布
+# 上占比不足 0.1%，用比例阈值会被误判成空白，恰是本门禁要防的情形。
+PROBE_BLANK_MIN_PIXELS = 64  # 任何可辨认的残留笔迹都远多于该像素数
 
 
 class TaskError(Exception):
@@ -660,6 +662,13 @@ class ExecutorService:
                     if panel_active and slider_open is not None:
                         if panel.fold(slider_open, fold_open):  # type: ignore[union-attr]
                             panel_open = False
+                        else:
+                            # 折叠失败：面板仍展开，画布可能被撑小，收起态基准
+                            # 已不可信。已有异常在传播时只告警，不掩盖原错误。
+                            self._guard_mapping_drift(
+                                task_id, target, mapping_rect,
+                                primary_exc=sys.exc_info()[0] is not None,
+                            )
                     handle.settled_cursor = None
             screen_path = [
                 image_point_to_screen(
@@ -1108,11 +1117,44 @@ class ExecutorService:
             for a, b, side in checks
         )
 
+    def _guard_mapping_drift(
+        self,
+        task_id: str,
+        target: DrawingTarget,
+        mapping_rect: Rect,
+        *,
+        primary_exc: bool,
+    ) -> None:
+        """换宽后折叠失败时，确认画布仍与收起态映射基准一致。
+
+        面板没收起说明画布可能仍被工具条撑小（或已重新变大），继续按收起态
+        ``mapping_rect`` 映射会静默错位。此刻若已有异常在传播，只能告警而不能
+        抛出新异常掩盖原始错误。
+        """
+        rect = self._current_canvas_rect(target)
+        if rect is None:
+            self._emit(task_id, "task.warning", {
+                "message": "无法确认当前画布矩形，按收起态基准继续绘制"
+            })
+            return
+        if not self._canvas_size_drifted(rect, mapping_rect):
+            return
+        message = (
+            "工具面板未能收起且画布矩形已变化（收起基准 x,y,w,h="
+            f"{mapping_rect.x},{mapping_rect.y},{mapping_rect.w},{mapping_rect.h} / 当前 "
+            f"{rect.x},{rect.y},{rect.w},{rect.h}），"
+            "已停止以免笔迹错位；请重新校准"
+        )
+        if primary_exc:
+            self._emit(task_id, "task.warning", {"message": message})
+            return
+        raise TaskError(409, "E_CANVAS_DRIFT", message)
+
     def _canvas_is_blank(self, target: DrawingTarget, canvas: Rect) -> bool:
         """探测前空白门禁：画布已有墨迹时不得在下方候选区盲点。
 
-        截图失败按空白处理并继续（无法判定时不因门禁额外阻断）；墨迹占比超过
-        ``PROBE_BLANK_MAX`` 即视为非空白，可能已有用户画作或未清理的笔迹。
+        截图失败按空白处理并继续（无法判定时不因门禁额外阻断）；墨像素少于
+        ``PROBE_BLANK_MIN_PIXELS`` 才视为空白，可能已有用户画作或未清理的笔迹。
         """
         image = target.capture_image()
         if image is None:
@@ -1120,7 +1162,8 @@ class ExecutorService:
         fraction = ink_occupied_fraction(
             image, (canvas.x, canvas.y, canvas.w, canvas.h)
         )
-        return fraction <= PROBE_BLANK_MAX
+        pixels = fraction * max(1.0, canvas.w * canvas.h)
+        return pixels < PROBE_BLANK_MIN_PIXELS
 
     def _probe_toolbar(
         self,

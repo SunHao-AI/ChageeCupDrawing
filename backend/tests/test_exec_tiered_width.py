@@ -382,6 +382,40 @@ def test_fold_changes_canvas_rect_stops_before_drawing(monkeypatch) -> None:
     assert board.open is False  # 面板已收起，等用户重新校准
 
 
+def test_fold_failure_after_width_switch_rechecks_mapping(monkeypatch) -> None:
+    """C1 残留：换宽后折叠失败且画布已变化，必须停止而非按收起基准继续。"""
+    board = _TrackBoard(open_=False)
+
+    def detect(_image):
+        return CANVAS_EXPANDED if board.open else CANVAS_FOLDED
+
+    monkeypatch.setattr(service, "detect_canvas_rect", detect)
+    monkeypatch.setattr(panel_control, "detect_canvas_rect", detect)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    real_fold = panel_control.PanelController.fold
+    folds = {"n": 0}
+
+    def fold_then_fail(self, slider_rect, fold_point):
+        folds["n"] += 1
+        if folds["n"] == 1:  # 开局面板已收起：首次 fold 是无需点击的空操作
+            return real_fold(self, slider_rect, fold_point)
+        return False  # 换宽后收起失败：面板实际仍展开
+
+    monkeypatch.setattr(panel_control.PanelController, "fold", fold_then_fail)
+    calibration = _calibration(tools_open=_tools(slider=SLIDER_LOW))
+    calibration.rect_x, calibration.rect_y = 0, 0
+    calibration.rect_w, calibration.rect_h = 400, 560
+    store = FakeStore(calibration)
+    params = ExecParams(auto_width=True, width_table=TABLE_3, width_tolerance=0.05)
+
+    with pytest.raises(TaskError) as excinfo:
+        _run(store, board, _paths(2), params)
+
+    assert excinfo.value.code == "E_CANVAS_DRIFT"
+    assert "工具面板未能收起且画布矩形已变化" in excinfo.value.message
+    assert board.open is True  # 折叠确实没生效，画布与收起基准已不一致
+
+
 def test_calibration_stop_reports_cursor_and_total(monkeypatch) -> None:
     """I5：标定被停止时进度须带真实的 cursor/total，而不是 0/0。"""
 
@@ -875,3 +909,23 @@ def test_probe_skipped_when_canvas_not_blank(monkeypatch) -> None:
     assert any("未标定粗细滑杆" in m for m in store.warnings())
     assert len(mouse.drags) == 1
     assert store.status == "DONE"
+
+
+def test_canvas_blank_gate_uses_pixels_not_fraction() -> None:
+    """C2 残留：46×3 的探测残留测试线（≈138 px）不得被判成空白。"""
+
+    class _ImageTarget(FakeTarget):
+        def __init__(self, image: np.ndarray) -> None:
+            self._image = image
+
+        def capture_image(self) -> np.ndarray:
+            return self._image
+
+    svc = _service(FakeStore(_calibration()), FakeMouse(FakeBoard(open_=True)))
+    rect = service.Rect(*CANVAS[:2], CANVAS[2] - CANVAS[0], CANVAS[3] - CANVAS[1])
+    blank = np.full(SIZE, 255, dtype=np.uint8)
+    assert svc._canvas_is_blank(_ImageTarget(blank), rect) is True
+
+    residue = blank.copy()
+    residue[250:253, 250:296] = 0  # 46×3 = 138 px，正是探测测试线的量级
+    assert svc._canvas_is_blank(_ImageTarget(residue), rect) is False
