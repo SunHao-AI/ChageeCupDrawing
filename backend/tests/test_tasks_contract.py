@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 import threading
 import time
 from pathlib import Path
@@ -534,32 +535,59 @@ def test_task_endpoints_not_found(tmp_path: Path, device: FakeDevice, mouse_fact
         client.__exit__(None, None, None)
 
 
+_FRONTEND_EXEC_DEFAULTS = (
+    Path(__file__).resolve().parents[2] / "frontend" / "src" / "params" / "registry.ts"
+)
+
+
+def _frontend_exec_default_keys() -> set[str]:
+    """从前端 defaultExecParams() 提取键集合，防止前后端字段名静默漂移。"""
+    assert _FRONTEND_EXEC_DEFAULTS.is_file(), f"未找到前端默认参数文件：{_FRONTEND_EXEC_DEFAULTS}"
+    source = _FRONTEND_EXEC_DEFAULTS.read_text(encoding="utf-8")
+    body = re.search(
+        r"export function defaultExecParams\(\): ExecParams \{\s*return \{(.*?)\n  \}",
+        source,
+        re.S,
+    )
+    assert body is not None, "未能定位 registry.ts 的 defaultExecParams() 函数体"
+    keys = set(re.findall(r"^[ \t]{2,8}(\w+):", body.group(1), re.M))
+    # 正则失配时键集合为空会让「集合相等」假通过，这里显式拦截。
+    assert len(keys) >= 12, f"defaultExecParams() 解析出的键异常：{sorted(keys)}"
+    return keys
+
+
 def test_create_task_accepts_frontend_exec_payload(
     tmp_path: Path, device: FakeDevice, mouse_factory
 ) -> None:
     """前端 defaultExecParams() 的全部字段（camelCase）必须被后端接受并持久化。"""
+    frontend_keys = _frontend_exec_default_keys()
+    assert "widthTiers" not in frontend_keys
+
+    exec_payload = {
+        "eventStepPx": 1.0,
+        "pointDelayMs": 1.5,
+        "strokeDelayMs": 6.0,
+        "clickHoldMs": 20,
+        "noCoalesce": True,
+        "shortStrokeProtect": True,
+        "shortStrokeThresholdPx": 1.2,
+        "focusGuard": True,
+        "cursorTakeoverPx": 6,
+        "guardPollMs": 50,
+        "autoWidth": True,
+        "widthTolerance": 0.05,
+    }
+    assert set(exec_payload) == frontend_keys, (
+        f"测试 payload 与前端 defaultExecParams() 键不一致："
+        f"payload={sorted(exec_payload)} frontend={sorted(frontend_keys)}"
+    )
+
     client = _make_client(tmp_path, device, mouse_factory)
     try:
         plan_id = _ready_project(client)
         created = client.post(
             f"/api/plans/{plan_id}/tasks",
-            json={
-                "exec": {
-                    "eventStepPx": 1.0,
-                    "pointDelayMs": 1.5,
-                    "strokeDelayMs": 6.0,
-                    "clickHoldMs": 20,
-                    "noCoalesce": True,
-                    "shortStrokeProtect": True,
-                    "shortStrokeThresholdPx": 1.2,
-                    "focusGuard": True,
-                    "cursorTakeoverPx": 6,
-                    "guardPollMs": 50,
-                    "autoWidth": True,
-                    "widthTolerance": 0.05,
-                },
-                "countdownMs": 0,
-            },
+            json={"exec": exec_payload, "countdownMs": 0},
             headers=WRITE_HEADERS,
         )
         assert created.status_code == 201, created.text
@@ -570,9 +598,13 @@ def test_create_task_accepts_frontend_exec_payload(
         assert exec_params["widthTolerance"] == 0.05
         assert exec_params["autoWidth"] is True
         assert "widthTiers" not in exec_params
+        # widthTable 由执行器回写，其余键必须与前端 payload 完全一致。
+        assert {k: v for k, v in exec_params.items() if k != "widthTable"} == exec_payload
+        width_table = exec_params.get("widthTable")
+        assert width_table is None or isinstance(width_table, list)
 
         final = _wait_terminal(client, task_id)
-        assert final["status"] != "FAILED", final
+        assert final["status"] == "DONE", final
     finally:
         client.__exit__(None, None, None)
 
@@ -592,6 +624,6 @@ def test_create_task_rejects_legacy_width_tiers(
         assert rejected.status_code == 400, rejected.text
         body = rejected.json()
         assert body["errorCode"] == "E_INVALID_ARGUMENT"
-        assert "widthTiers" in body["detail"][0]["path"]
+        assert any("widthTiers" in item["path"] for item in body["detail"])
     finally:
         client.__exit__(None, None, None)

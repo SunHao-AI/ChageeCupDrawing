@@ -132,7 +132,7 @@ onUnmounted(() => {
         v-if="paramsStore.exec.autoWidth && !projectStore.calibration?.slider"
         class="banner banner-warn auto-width-tip"
       >
-        自动变粗需要先在「校准」页框选笔粗细滑杆轨道（建议同时标记撤销按钮与「∨」折叠按钮，分别用于标定后自动清空画布、绘制时自动折叠工具面板）。程序会先自动识别工具栏控件，个别识别失败时再请到校准页补标。
+        程序会先自动探测工具栏控件；个别控件识别失败时，再到「校准」页手动补标粗细滑杆轨道（建议同时标记撤销按钮与「∨」折叠按钮，分别用于标定后自动清空画布、绘制时自动折叠工具面板）。
       </div>
 
       <div class="divider"></div>
