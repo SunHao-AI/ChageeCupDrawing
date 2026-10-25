@@ -213,6 +213,12 @@ class NoSliderBoard(ToolbarBoard):
         return img
 
 
+class FarFoldBoard(ToolbarBoard):
+    """折叠钮落在候选序 120 位之后（末行 y=680），预算内不应被扫到。"""
+
+    FOLD = (560, 680, 40, 40)
+
+
 class ToolbarMouse:
     def __init__(self, board: ToolbarBoard) -> None:
         self.board = board
@@ -600,6 +606,50 @@ def test_probe_raises_no_slider():
     with pytest.raises(ProbeError) as exc:
         _run(board, open_bitmap=_manual(fold=(312, 512)))
     assert exc.value.code == "E_PROBE_NO_SLIDER"
+
+
+def test_probe_fold_scan_respects_click_budget():
+    """折叠钮在预算外：只点前 MAX_FOLD_CLICKS 个候选，然后放弃探测。"""
+    board = FarFoldBoard()
+    board.panel_open = False
+
+    with pytest.raises(ProbeError) as exc:
+        _run(board)
+
+    assert exc.value.code == "E_PROBE_NO_TOOLBAR"
+    assert len(board.clicks) == ToolbarProber.MAX_FOLD_CLICKS
+    assert all(not _inside(FarFoldBoard.FOLD, point) for point in board.clicks)
+
+
+def test_probe_restores_brush_when_cleanup_raises(monkeypatch):
+    """清理抛错时仍要切回画笔，避免异常退出后停在橡皮态擦掉用户画作。"""
+    board = ToolbarBoard()
+    board.tool = "eraser"
+    prober, _ = _prober(board)
+
+    def boom(*_args, **_kwargs):
+        raise ProbeError("E_PROBE_INK_UNCLEANABLE", "模拟清理失败")
+
+    monkeypatch.setattr(prober, "_clear_probe_ink", boom)
+    manual = _manual(
+        fold=(312, 512),
+        slider={"x": 100, "y": 530, "w": 200, "h": 12},
+        undo=(130, 515),
+        brush_selected_lum=180.0,
+        brush_idle_lum=250.0,
+    )
+
+    with pytest.raises(ProbeError) as exc:
+        prober.run(
+            canvas=CANVAS,
+            band=BAND,
+            open_bitmap=manual,
+            on_progress=lambda _m: None,
+            should_stop=lambda: False,
+        )
+
+    assert exc.value.code == "E_PROBE_INK_UNCLEANABLE"
+    assert board.tool == "brush"
 
 
 def test_probe_stops_on_should_stop():

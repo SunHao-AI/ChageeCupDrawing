@@ -497,6 +497,9 @@ class _FakeProber:
         )
 
 
+_CALIBRATOR_INSTANCES: list = []
+
+
 class _FakeCalibrator:
     """模拟标定：画 1 条测试线并返回 3 档宽度表。
 
@@ -509,19 +512,19 @@ class _FakeCalibrator:
     TEST_LINE_LEN = 46
     MIN_SPREAD_RATIO = 0.18
 
-    last_slider: dict | None = None
-
     def __init__(self, *, mouse, **_kwargs) -> None:
         self._mouse = mouse
+        self.slider_track: dict | None = None
+        _CALIBRATOR_INSTANCES.append(self)
 
     def run(
         self,
         *,
         slider_track: dict,
-        canvas,
+        canvas: tuple[int, int, int, int],
         **_kwargs,
     ) -> SimpleNamespace:
-        type(self).last_slider = dict(slider_track)
+        self.slider_track = dict(slider_track)
         self._mouse.drag_polyline(
             [(canvas[0] + 6, canvas[1] + 10), (canvas[0] + 52, canvas[1] + 10)]
         )
@@ -694,7 +697,7 @@ def test_probe_bootstraps_calibration_without_manual_anchors(monkeypatch) -> Non
     monkeypatch.setattr(service, "ToolbarProber", _FakeProber)
     monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
     monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
-    _FakeCalibrator.last_slider = None
+    _CALIBRATOR_INSTANCES.clear()
     calibration = _calibration(tools_open=None, slider=None, fold=None)
     store = FakeStore(calibration)
     params = ExecParams(auto_width=True, width_table=None, width_tolerance=0.05)
@@ -709,7 +712,8 @@ def test_probe_bootstraps_calibration_without_manual_anchors(monkeypatch) -> Non
     assert store.status == "DONE"
 
     # 标定器拿到的滑杆矩形就是探测结果（TRACK），而非旧校准的空坐标。
-    assert _FakeCalibrator.last_slider == TRACK
+    assert _CALIBRATOR_INSTANCES
+    assert _CALIBRATOR_INSTANCES[-1].slider_track == TRACK
 
     # 3 条用户路径 + _FakeCalibrator 模拟的 1 条标定测试线（真实标定会画 5 条，
     # 但假画板无法测宽，故用最小假标定只记一条）。
@@ -743,8 +747,13 @@ def test_probe_runs_before_brush_guard_and_calibration(monkeypatch) -> None:
                 events.append("fold-click")
             super().click(x, y, **kwargs)
 
+    class EventCalibrator(_FakeCalibrator):
+        def run(self, **kwargs) -> SimpleNamespace:
+            events.append("calibrate")
+            return super().run(**kwargs)
+
     monkeypatch.setattr(service, "ToolbarProber", EventProber)
-    monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
+    monkeypatch.setattr(service, "PenCalibrator", EventCalibrator)
     # 保证绘制期跨桶换宽，从而产生「标定之后」的滑杆点击。
     monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
     calibration = _calibration(tools_open=None, slider=None, fold=None)
@@ -754,9 +763,8 @@ def test_probe_runs_before_brush_guard_and_calibration(monkeypatch) -> None:
 
     _run(store, board, _paths(3), params, mouse=EventMouse(board))
 
-    probe_at = events.index("probe")
-    brush_at = events.index("brush-click")
-    slider_at = events.index("slider-click")
-    # 探测在最前；画笔校验只在探测拿到双态位图后才会执行；标定最后（用的是
-    # 探测学出的滑杆坐标）。
-    assert probe_at < brush_at < slider_at
+    # 探测 → 画笔校验 → 标定 → 绘制期换宽。滑杆点击来自标定之后的换宽路径
+    # （假标定内部不点滑杆），因此可把 calibrate 与 slider-click 分开锁定。
+    assert events.index("probe") < events.index("brush-click")
+    assert events.index("brush-click") < events.index("calibrate")
+    assert events.index("calibrate") < events.index("slider-click")

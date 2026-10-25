@@ -66,6 +66,10 @@ class ToolbarProber:
     BAND_LINE_LEN = 46
     LUM_DELTA_MIN = 30  # 选中态判定最小亮度差
     CANDIDATE_STEP = 28  # 工具条候选点网格步长
+    # 折叠钮扫描的候选点预算。候选按行优先、距画布由近到远，截断等价于「只扫
+    # 最靠近画布的几行」。超出预算的折叠钮不再自动探测（用户可在校准页人工补标），
+    # 避免无工具条应用在首绘承担全网格盲点的分钟级 worst case。
+    MAX_FOLD_CLICKS = 120
     # 撤销判据：刻度带内墨量降到基线该比例以下即认定撤销生效。
     UNDO_DROP_RATIO = 0.4
     INK_THRESHOLD = 160
@@ -183,23 +187,38 @@ class ToolbarProber:
             )
 
         # 清理探测笔迹：残留墨会落进 pen_calibration 的首个测宽窗口。
-        self._require_panel_open(fold, check_stop, assume_open=slider_manual)
-        self._clear_probe_ink(undo, check_stop)
-        if tools_probed and brush is not None:
-            # 探测中可能停在橡皮态；返回前显式切回画笔。
-            check_stop()
+        try:
+            self._require_panel_open(fold, check_stop, assume_open=slider_manual)
+            self._clear_probe_ink(undo, check_stop)
+            if tools_probed and brush is not None:
+                check_stop()
+            return ToolBitmap(
+                brush=brush,
+                eraser=eraser,
+                slider=dict(slider) if slider is not None else None,
+                undo=undo,
+                fold=fold,
+                brush_selected_lum=selected_lum,
+                brush_idle_lum=idle_lum,
+            )
+        finally:
+            # 探测中可能停在橡皮态；即便清理/展开抛错也要尽力切回画笔，否则上层
+            # 探测失败时仍跳过画笔校验，后续绘制会擦掉用户画作。
+            if tools_probed and brush is not None:
+                self._restore_brush(brush, fold)
+
+    def _restore_brush(
+        self, brush: tuple[float, float], fold: tuple[float, float] | None
+    ) -> None:
+        """异常路径恢复画笔；失败不得掩盖正在传播的原始异常。"""
+        try:
+            # 用 no-op check_stop：恢复是收尾动作，停止信号不应在此再抛。
+            if not self._ensure_panel_open(fold, lambda: None):
+                return
             self._click(float(brush[0]), float(brush[1]))
             self._sleep(self._settle_s)
-
-        return ToolBitmap(
-            brush=brush,
-            eraser=eraser,
-            slider=dict(slider) if slider is not None else None,
-            undo=undo,
-            fold=fold,
-            brush_selected_lum=selected_lum,
-            brush_idle_lum=idle_lum,
-        )
+        except ProbeError:
+            pass
 
     # ---------- 人工兜底校验 ----------
 
@@ -353,10 +372,13 @@ class ToolbarProber:
 
         不可逆的候选（点了不恢复）只算干扰：标记后继续扫描，并以当前可见性
         作为新基线——折叠钮在两个方向上都会翻转可见性，后续仍能识别。
+
+        只扫候选序前 MAX_FOLD_CLICKS 个点（行优先、距画布由近到远）；折叠钮
+        若在更远处则不再自动探测，由用户在校准页人工补标。
         """
         before_visible = self._find_slider(self._grab()) is not None
         blocked: set[tuple[int, int]] = set()
-        for point in self._candidates:
+        for point in self._candidates[: self.MAX_FOLD_CLICKS]:
             if point in skip or point in blocked:
                 continue
             check_stop()
