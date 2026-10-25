@@ -65,15 +65,18 @@ def wait_for(fn, timeout_s: float, what: str, interval_s: float = 0.1):
 # ---------- 夹具 ----------
 
 def make_source_png(path: Path) -> None:
-    """4 条水平短线：pathCount 少而可控，适合中途停止做断点续画验证。
+    """「一对紧邻线 + 两条孤立线」：4 条路径，但局部线密度必须有区分度。
 
-    线数直接影响笔宽分桶数：每档换宽都要「展开→点滑杆→折叠」两次折叠点击，
-    6 条等长线会分到 6 档（夹具上限 21 次），4 条留出余量。
+    笔宽分桶按 21px 窗口内的局部线密度做百分位排名；若各线等长等距（密度完全
+    相同），密度标准差为 0，规划会把所有段都算成 0 行程——只剩 1 个笔宽桶，
+    「换宽确实发生」断言必然失败。所以前两条线相距 14px（彼此落在对方的密度
+    窗口内 → 密度高），后两条各自孤立（密度低）。
+    线数仍为 4：每档换宽都要「展开→点滑杆→折叠」两次折叠点击，档数过多会
+    顶到夹具的 21 次上限。
     """
     img = Image.new("RGB", (420, 620), "white")
     draw = ImageDraw.Draw(img)
-    for i in range(4):
-        y = 120 + i * 70
+    for y in (100, 114, 250, 330):
         draw.line([(70, y), (350, y)], fill="black", width=3)
     img.save(path)
 
@@ -262,11 +265,13 @@ def main() -> int:
         kv = parse_title(found[1]) if found else {"recent": []}
         total_paths = int(snap["totalPaths"])
         recent = kv.get("recent", [])
-        draw_tail = recent[-total_paths:] if total_paths else []
+        # 夹具标题只保留最近 8 笔工具名；路径数超过 8 时只能核对最近 8 笔。
+        tail_n = min(total_paths, 8)
+        draw_tail = recent[-tail_n:] if tail_n else []
         print(f"… 夹具计数：{found[1] if found else '<窗口已关闭>'}")
         check("绘制期全程画笔（最近各笔均为 brush）",
-              len(draw_tail) == total_paths and all(t == "brush" for t in draw_tail),
-              f"totalPaths={total_paths} recent={recent}")
+              len(draw_tail) == tail_n and all(t == "brush" for t in draw_tail),
+              f"totalPaths={total_paths} 核对最近 {tail_n} 笔 recent={recent}")
         check("终态工具为画笔（橡皮开局已被纠正）", kv.get("tool") == "brush",
               f"tool={kv.get('tool')}")
         check("绘制结束面板收起", kv.get("panel") == 0, f"panel={kv.get('panel')}")
@@ -274,6 +279,9 @@ def main() -> int:
         switch_limit = math.ceil(1 / 0.05) + 1
         check("换宽确实发生且有界", 1 <= switches <= switch_limit,
               f"drawPhaseSwitch={switches} 上限={switch_limit}")
+        width_table = (snap.get("exec") or {}).get("widthTable") or []
+        check("笔宽分为多档（源图密度非退化）", len(width_table) >= 2,
+              f"widthTable={width_table}（源图几何退化或分桶异常）")
         check("面板展开次数有界", int(kv.get("foldClicks", 0)) <= 21,
               f"foldClicks={kv.get('foldClicks')} 上限=21")
 
