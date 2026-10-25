@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -20,10 +20,12 @@ from app.device.geometry import Rect, image_point_to_screen
 from app.device.service import DeviceService
 from app.device.target import DrawingTarget, resolve_target
 from app.executor.guard import GuardProbe, Win32GuardProbe, evaluate_signals
+from app.executor.ink_measure import ink_occupied_fraction
 from app.executor.native_mouse import NativeMouse, path_length
 from app.executor.panel_control import PanelController
 from app.executor.pen_calibration import CalibrationError, PenCalibrator
 from app.executor.pen_order import width_buckets
+from app.executor.toolbar_probe import ProbeError, ToolBitmap, ToolbarProber
 from app.store.models import PlanRecord, TaskRecord, utc_now
 from app.store.store import Store
 
@@ -32,6 +34,14 @@ TERMINAL_STATUSES = ("DONE", "FAILED", "STOPPED")
 # 倒计时最后这段时间要求目标在前台，不满足则冻结倒计时等待用户切回。
 ARM_FINAL_WINDOW_S = 1.0
 ARM_STABLE_S = 0.5
+
+# 标定扫描档数：只用于判断滑杆是否真的能调宽（宽度 spread），
+# 不再对应绘制档数/桶数（桶数由 width_tolerance 推导）。
+CALIBRATION_PROBE_TIERS = 5
+
+# 刻度带工作区：画布顶部条带，标定/探测的测试线都画在这里。基线取样与探测
+# 观测必须与标定器用同一块工作区，否则底墨会被算进线宽或误判清空。
+BAND_MAX_H_PX = 160
 
 
 class TaskError(Exception):
@@ -56,9 +66,10 @@ class ExecParams:
     focus_guard: bool = True
     cursor_takeover_px: float = 6.0
     guard_poll_ms: float = 50.0
-    # 自动变粗：绘制前扫描小程序粗细滑杆标定笔宽表，按明暗分档换笔绘制。
-    auto_width: bool = False
-    width_tiers: int = 5
+    # 自动变粗：绘制前探测工具栏、标定笔宽，并按目标行程逐段分配笔宽。
+    auto_width: bool = True
+    # 换宽容差：目标行程差超过该值才换一次笔（0.02~0.20，默认 0.05 ≈ 最多 20 档）。
+    width_tolerance: float = 0.05
     # 标定产出并回写 exec_params 的宽度表 [(滑杆位置0..1, 实测宽度px)]；续画复用。
     width_table: tuple[tuple[float, float], ...] | None = None
 
@@ -75,8 +86,9 @@ class ExecParams:
             focus_guard=bool(data.get("focusGuard", True)),
             cursor_takeover_px=float(data.get("cursorTakeoverPx", 6.0)),
             guard_poll_ms=float(data.get("guardPollMs", 50.0)),
-            auto_width=bool(data.get("autoWidth", False)),
-            width_tiers=int(data.get("widthTiers", 5)),
+            auto_width=bool(data.get("autoWidth", True)),
+            # 旧字段 widthTiers 已被容差语义取代，刻意忽略以兼容历史请求体。
+            width_tolerance=float(data.get("widthTolerance", 0.05)),
             width_table=(
                 tuple((float(a), float(b)) for a, b in data["widthTable"])
                 if data.get("widthTable")
@@ -97,7 +109,7 @@ class ExecParams:
             "cursorTakeoverPx": self.cursor_takeover_px,
             "guardPollMs": self.guard_poll_ms,
             "autoWidth": self.auto_width,
-            "widthTiers": self.width_tiers,
+            "widthTolerance": self.width_tolerance,
             "widthTable": [list(t) for t in self.width_table] if self.width_table else None,
         }
 
@@ -382,6 +394,7 @@ class ExecutorService:
             raise TaskError(422, "E_CAPTURE_FAILED", "落笔前截图失败") from exc
 
         image_h, image_w = capture.image.shape[:2]
+        image_size = (image_w, image_h)
         detected = detect_canvas_rect(capture.image)
         if detected is None:
             raise TaskError(409, "E_CANVAS_DRIFT", "落笔前未识别到画布，未落笔")
@@ -400,53 +413,118 @@ class ExecutorService:
 
         client = target.client_area()
 
-        # 自动变粗：首绘先扫描滑杆标定笔宽表（刻度带测试线→清空画布），
-        # 续画复用已回写的宽度表，保证分档笔序与首绘逐次一致。
-        slider_now: dict | None = None
-        undo_now: dict | None = None
-        fold_now: dict | None = None
-        if calibration.slider is not None:
-            dx, dy = new_rect.x - saved_rect.x, new_rect.y - saved_rect.y
-            slider_now = {**calibration.slider, "x": calibration.slider["x"] + dx,
-                          "y": calibration.slider["y"] + dy}
-            if calibration.undo is not None:
-                undo_now = {**calibration.undo, "x": calibration.undo["x"] + dx,
-                            "y": calibration.undo["y"] + dy}
-            if calibration.fold is not None:
-                fold_now = {**calibration.fold, "x": calibration.fold["x"] + dx,
-                            "y": calibration.fold["y"] + dy}
-        # 面板开合控制器：折叠按钮已标定时才启用（绘制期间保持折叠，画布完整可见）。
-        panel: PanelController | None = None
-        if params.auto_width and slider_now is not None and fold_now is not None:
-            panel = PanelController(
-                probe=target,
-                mouse=mouse,
-                to_screen=lambda x, y: image_point_to_screen(x, y, image_w, image_h, client),
-            )
+        # 控件坐标来源是校准坐标系：按画布矩形整体平移（同一截图坐标系）。
+        dx, dy = new_rect.x - saved_rect.x, new_rect.y - saved_rect.y
+        slider_legacy = self._shift_rect(calibration.slider, dx, dy)
+        undo_legacy = self._shift_point(calibration.undo, dx, dy)
+        fold_legacy = self._shift_point(calibration.fold, dx, dy)
+
+        # 双态工具位图：展开态/折叠态各一套坐标，绝不跨态使用；两者皆无即旧
+        # 校准（单套坐标、无法校验画笔态）。
+        tools_open = self._tool_bitmap(calibration.tools_open, dx, dy)
+        tools_collapsed = self._tool_bitmap(calibration.tools_collapsed, dx, dy)
+        legacy_mode = tools_open is None and tools_collapsed is None
+        slider_open = tools_open.slider if tools_open is not None else slider_legacy
+        undo_open = self._point_dict(tools_open.undo if tools_open else None) or undo_legacy
+        fold_open = self._point_dict(tools_open.fold if tools_open else None) or fold_legacy
+        fold_closed = self._point_dict(tools_collapsed.fold if tools_collapsed else None) or fold_open
+
+        panel = self._make_panel(params, target, mouse, image_size, client, slider_open, fold_open)
+        # 面板当前态：None 表示未知（旧校准无折叠按钮，坐标直接可用）。
+        panel_open: bool | None = None
+        if panel is not None and slider_open is not None:
+            panel_open = panel.is_open(slider_open)
+
+        # 自动变粗：首绘先标定笔宽表（刻度带测试线→清空画布），续画复用已回写
+        # 的宽度表，保证分桶笔序与首绘逐次一致。
         if params.auto_width and params.width_table is None and cursor == 0:
-            if panel is not None and panel.is_open(slider_now) is False:
-                panel.unfold(slider_now, fold_now)
-            params = self._run_pen_calibration(
-                task_id, params, mouse, target, client, (image_w, image_h),
-                new_rect, slider_now, undo_now, handle,
+            if slider_open is None:
+                self._emit(task_id, "task.warning", {
+                    "message": "未标定粗细滑杆，已回退单细笔绘制（可在校准页补标）"
+                })
+            else:
+                if panel is not None and panel_open is not True:
+                    if panel.unfold(slider_open, fold_closed):
+                        panel_open = True
+                    else:
+                        # 展开失败时滑杆可能被画布覆盖，点下去就是墨点：跳过标定。
+                        self._emit(task_id, "task.warning", {
+                            "message": "工具面板无法展开，跳过笔宽标定（本次单细笔绘制）"
+                        })
+                if panel is None or panel_open is True:
+                    # 基线必须在标定开始前、用与标定器相同的刻度带工作区取样并夹到
+                    # [0,1]：标定器测宽时会把既有底墨一起算进线宽，基线偏大或偏小
+                    # 都会让「测试线是否撤净」的判定失真（Task 5 取样纪律）。
+                    baseline = self._band_baseline(target, new_rect)
+                    params = self._run_pen_calibration(
+                        task_id, params, mouse, target, client, image_size,
+                        new_rect, slider_open, undo_open, baseline, handle,
+                    )
+                    if params is None:  # 标定被停止，已落 STOPPED
+                        return
+
+        # 探测接入：旧校准缺双态位图时行为探测一次，成功后把结果持久化成新的
+        # 校准记录（沿用其余字段）。失败只警告并沿用旧单套坐标，不阻断绘制。
+        if (
+            params.auto_width
+            and cursor == 0
+            and calibration.tools_open is None
+            and (slider_open is not None or fold_open is not None)
+        ):
+            probed = self._probe_toolbar(
+                task_id, plan.project_id, calibration, target, mouse, client, image_size,
+                new_rect, fold_closed, slider_open, undo_open, handle,
             )
-            if params is None:  # 标定被停止，已落 STOPPED
+            if handle.stop_event.is_set():
+                self._finish_stopped(task_id, cursor, total, started, handle)
                 return
+            if probed is not None:
+                tools_open = self._tool_bitmap(asdict(probed), 0.0, 0.0)
+                slider_open = tools_open.slider if tools_open is not None else slider_open
+                undo_open = self._point_dict(tools_open.undo) if tools_open else undo_open
+                fold_open = (
+                    self._point_dict(tools_open.fold) if tools_open else None
+                ) or fold_open
+                fold_closed = (
+                    self._point_dict(tools_collapsed.fold) if tools_collapsed else None
+                ) or fold_open
+                legacy_mode = False
+                # 探测过程中会开合面板，状态未知，按实际截图重判。
+                panel_open = None
+                if panel is None:
+                    panel = self._make_panel(
+                        params, target, mouse, image_size, client, slider_open, fold_open
+                    )
+
+        multi_width = params.width_table is not None and len(params.width_table) >= 2
 
         # 开画前收起工具面板（滑杆不再需要常开）。面板位于画布下方的工具条，
         # 收起只腾出可视区域、不改变画布矩形，落笔映射沿用 new_rect。
-        panel_active = panel is not None and params.width_table is not None
+        panel_active = panel is not None and multi_width
         if panel_active:
-            panel.fold(slider_now, fold_now)
+            if slider_open is not None and panel.fold(slider_open, fold_open):
+                panel_open = False
+            handle.settled_cursor = None
 
-        flat = self._flatten_tiered_paths(task_id, paths, params)
+        # 首笔前强制画笔校验：绝不在橡皮态下笔。旧校准无法判定，降级放行并提示。
+        if legacy_mode:
+            self._emit(task_id, "task.warning", {
+                "message": "旧校准：无法校验画笔态（请重新校准以启用画笔/橡皮识别）"
+            })
+        else:
+            self._ensure_brush_before_draw(
+                task_id, tools_open, tools_collapsed, panel, slider_open,
+                fold_open, fold_closed, panel_open, mouse, target, image_size, client,
+            )
+
+        flat = self._build_draw_sequence(task_id, paths, params)
 
         handle.guard_active.set()
         self._transition(task_id, "DRAWING")
         last_pct = -1
         point_delay_s = max(0.0, params.point_delay_ms) / 1000
         stroke_delay_s = max(0.0, params.stroke_delay_ms) / 1000
-        active_tier: int | None = None
+        active_bucket: int | None = None
 
         for index in range(cursor, total):
             if handle.stop_event.is_set():
@@ -455,34 +533,41 @@ class ExecutorService:
             if not target.alive():
                 raise TaskError(409, "E_WINDOW_LOST", "绘制期间目标窗口丢失")
 
-            tier, canvas_path = flat[index]
+            bucket, target_frac, canvas_path = flat[index]
             if (
-                params.width_table
-                and slider_now is not None
-                and tier != active_tier
+                multi_width
+                and slider_open is not None
+                and bucket != active_bucket
             ):
-                # 换笔：点击滑杆到该档实测位置。置空静置光标，避免把滑杆点击
-                # 误判成用户接管。面板折叠时需先展开再点滑杆、点完折回；展开
-                # 失败则降级保持当前笔宽继续画，绝不盲点。
+                # 换笔：展开 → 校验画笔态 → 点滑杆到桶下缘 → 折叠。置空静置
+                # 光标，避免把滑杆点击误判成用户接管。展开失败则降级保持当前
+                # 笔宽继续画，绝不盲点。
                 handle.settled_cursor = None
                 switched = True
-                if panel_active and panel.is_open(slider_now) is False:
-                    switched = panel.unfold(slider_now, fold_now)
+                if panel is not None and panel_open is not True:
+                    switched = panel.unfold(slider_open, fold_closed)
+                    panel_open = True if switched else False
                     if not switched:
                         self._emit(task_id, "task.warning", {
-                            "message": f"工具面板无法展开，第 {tier + 1} 档沿用当前笔宽"
+                            "message": f"工具面板无法展开，第 {bucket + 1} 档沿用当前笔宽"
                         })
                 if switched:
-                    frac = params.width_table[min(tier, len(params.width_table) - 1)][0]
-                    sx = slider_now["x"] + slider_now["w"] * frac
-                    sy = slider_now["y"] + slider_now["h"] / 2.0
-                    px, py = image_point_to_screen(sx, sy, image_w, image_h, client)
-                    mouse.click(px, py)  # type: ignore[attr-defined]
+                    # 展开态工具格可见：换笔前再确认一次画笔态，非画笔则先切回。
+                    self._ensure_brush(
+                        task_id, tools_open, mouse, target, image_size, client,
+                    )
+                    # 点位取桶下缘（target_frac 即 bucket*tol），保证实际不粗于计划。
+                    sx = slider_open["x"] + slider_open["w"] * target_frac
+                    sy = slider_open["y"] + slider_open["h"] / 2.0
+                    self._click_image_point(mouse, target, (sx, sy), image_size, client)
                     time.sleep(0.25)
-                    active_tier = tier
-                    self._emit(task_id, "task.warning", {"message": f"已切换第 {tier + 1} 档笔宽"})
-                if panel_active:
-                    panel.fold(slider_now, fold_now)
+                    active_bucket = bucket
+                    self._emit(task_id, "task.warning", {
+                        "message": f"已切换第 {bucket + 1} 档笔宽（目标行程 {target_frac:.2f}）"
+                    })
+                if panel_active and slider_open is not None:
+                    if panel.fold(slider_open, fold_open):  # type: ignore[union-attr]
+                        panel_open = False
                     handle.settled_cursor = None
             screen_path = [
                 image_point_to_screen(
@@ -569,6 +654,25 @@ class ExecutorService:
 
     # ---------- 自动变粗 ----------
 
+    @staticmethod
+    def _band_rect(canvas: Rect) -> tuple[int, int, int, int]:
+        """画布顶部刻度带工作区：标定测试线与探测笔迹都落在这里。"""
+        height = max(1, min(int(canvas.h), BAND_MAX_H_PX))
+        return (int(canvas.x), int(canvas.y), int(canvas.w), height)
+
+    @classmethod
+    def _band_baseline(cls, target: DrawingTarget, canvas: Rect) -> float:
+        """取刻度带基线占用率。
+
+        取样纪律：必须在标定开始前、用与标定器同一块刻度带工作区取样，并夹到
+        [0,1]，否则标定器测到的是「测试线 + 残留底墨」，会把空画布的底墨算进
+        线宽；清空判定也会因基线失真而误判。
+        """
+        image = target.capture_image()
+        if image is None:
+            return 0.0
+        return max(0.0, min(1.0, ink_occupied_fraction(image, cls._band_rect(canvas))))
+
     def _run_pen_calibration(
         self,
         task_id: str,
@@ -580,6 +684,7 @@ class ExecutorService:
         canvas: Rect,
         slider: dict | None,
         undo: dict | None,
+        baseline_occupied: float,
         handle: _RunHandle,
     ) -> ExecParams | None:
         """绘制前笔宽标定；返回带 width_table 的新 params，被停止返回 None。"""
@@ -599,8 +704,9 @@ class ExecutorService:
             result = calibrator.run(
                 slider_track=slider,
                 undo_point=undo,
-                tiers=params.width_tiers,
+                tiers=CALIBRATION_PROBE_TIERS,
                 canvas=(canvas.x, canvas.y, canvas.w, canvas.h),
+                baseline_occupied=baseline_occupied,
                 on_progress=lambda msg: self._emit(task_id, "task.warning", {"message": msg}),
                 should_stop=handle.stop_event.is_set,
             )
@@ -618,27 +724,293 @@ class ExecutorService:
         self._store.update_task(task_id, exec_params=new_params.as_dict())
         return new_params
 
-    def _flatten_tiered_paths(
+    def _build_draw_sequence(
         self,
         task_id: str,
         paths: list[list[tuple[float, float]]],
         params: ExecParams,
-    ) -> list[tuple[int, list[tuple[float, float]]]]:
-        """有宽度表时按局部笔迹密度分桶重排（先粗后细），否则平铺为单桶。"""
-        tiers = len(params.width_table) if params.width_table else 0
-        if tiers < 2:
-            return [(0, p) for p in paths]
-        # 此处为过渡适配，Task 6 改为容差语义：现有参数只有档数，先换算为
-        # tol = 1/档数（档数≈桶数、整图换宽次数不变），再取新分桶结构的第 3 项
-        # 平铺成原有「(档号, 笔迹)」形状喂给下游换宽逻辑。
-        tol = 1.0 / max(1, tiers)
-        flat: list[tuple[int, list[tuple[float, float]]]] = []
-        for bucket, _edge, group in width_buckets(paths, tol):
-            # 顶桶（frac=1.0）会算出档号 tiers，压回最后一档，消除一次同位置
-            # 滑杆点击与「第 tiers+1 档」错误文案。
-            bucket = min(bucket, tiers - 1)
-            flat.extend((bucket, path) for path in group)
-        return flat
+    ) -> list[tuple[int, float, list[tuple[float, float]]]]:
+        """无宽度表时平铺为单桶；否则按容差 + 局部密度分桶（先粗后细）。
+
+        返回 [(桶号, 桶下缘行程, 笔迹)]，桶号越大越粗。续画会基于同一份
+        width_table 与容差重算，结果必须逐位一致（有锁定测试）。
+        """
+        if params.width_table is None:
+            return [(0, 0.0, p) for p in paths]
+        buckets = width_buckets(paths, params.width_tolerance)
+        self._emit(task_id, "task.warning", {
+            "message": f"按容差 {params.width_tolerance:.2f} 分 {len(buckets)} 档笔宽绘制"
+        })
+        return [
+            (bucket, edge, path)
+            for bucket, edge, group in buckets
+            for path in group
+        ]
+
+    @staticmethod
+    def _shift_rect(rect: dict | None, dx: float, dy: float) -> dict | None:
+        if rect is None:
+            return None
+        return {"x": rect["x"] + dx, "y": rect["y"] + dy, "w": rect["w"], "h": rect["h"]}
+
+    @staticmethod
+    def _shift_point(point, dx: float, dy: float) -> dict | None:
+        """点统一成 {"x","y"}（标定器/面板控制器都吃 dict）。"""
+        if point is None:
+            return None
+        if isinstance(point, dict):
+            return {"x": float(point["x"]) + dx, "y": float(point["y"]) + dy}
+        return {"x": float(point[0]) + dx, "y": float(point[1]) + dy}
+
+    @staticmethod
+    def _point_dict(point) -> dict | None:
+        """tuple / dict 点 → {"x","y"} dict。"""
+        if point is None:
+            return None
+        if isinstance(point, dict):
+            return {"x": float(point["x"]), "y": float(point["y"])}
+        return {"x": float(point[0]), "y": float(point[1])}
+
+    def _tool_bitmap(self, raw: dict | None, dx: float, dy: float) -> ToolBitmap | None:
+        """持久化的工具位图按画布平移，还原为运行时 ToolBitmap。
+
+        入参可能来自 JSON（点被序列化成 list/dict），这里统一成 tuple。
+        """
+        if not raw:
+            return None
+        data = dict(raw)
+
+        def shifted(name: str) -> tuple[float, float] | None:
+            point = data.get(name)
+            if point is None:
+                return None
+            if isinstance(point, dict):
+                return (float(point["x"]) + dx, float(point["y"]) + dy)
+            return (float(point[0]) + dx, float(point[1]) + dy)
+
+        slider_raw = data.get("slider")
+        slider = None
+        if slider_raw:
+            slider = {
+                "x": float(slider_raw["x"]) + dx,
+                "y": float(slider_raw["y"]) + dy,
+                "w": float(slider_raw["w"]),
+                "h": float(slider_raw["h"]),
+            }
+        return ToolBitmap(
+            brush=shifted("brush"),
+            eraser=shifted("eraser"),
+            slider=slider,
+            undo=shifted("undo"),
+            fold=shifted("fold"),
+            brush_selected_lum=data.get("brush_selected_lum"),
+            brush_idle_lum=data.get("brush_idle_lum"),
+        )
+
+    def _make_panel(
+        self,
+        params: ExecParams,
+        target: DrawingTarget,
+        mouse: object,
+        image_size: tuple[int, int],
+        client: object,
+        slider: dict | None,
+        fold: dict | None,
+    ) -> PanelController | None:
+        """面板开合控制器：仅自动变粗 + 滑杆与折叠按钮都有坐标时启用。"""
+        if not (params.auto_width and slider is not None and fold is not None):
+            return None
+        image_w, image_h = image_size
+        return PanelController(
+            probe=target,
+            mouse=mouse,
+            to_screen=lambda x, y: image_point_to_screen(x, y, image_w, image_h, client),
+        )
+
+    def _click_image_point(
+        self,
+        mouse: object,
+        target: DrawingTarget,
+        point: tuple[float, float],
+        image_size: tuple[int, int],
+        client: object,
+    ) -> None:
+        """图片坐标转屏幕后点击；点击前确保目标在前台。"""
+        if not target.foreground_matches():
+            target.activate()
+        image_w, image_h = image_size
+        px, py = image_point_to_screen(point[0], point[1], image_w, image_h, client)
+        mouse.click(px, py)  # type: ignore[attr-defined]
+
+    def _ensure_brush(
+        self,
+        task_id: str,
+        tools: ToolBitmap | None,
+        mouse: object,
+        target: DrawingTarget,
+        image_size: tuple[int, int],
+        client: object,
+    ) -> None:
+        """按画笔格亮度指纹确认当前为画笔；非画笔则点一次画笔按钮复检。
+
+        无完整指纹（brush 坐标缺失，或 selected/idle 亮度只到一侧）时无从判定，
+        降级放行——部分指纹只能用于定位坐标，不得代入亮度阈值。
+        """
+        if tools is None or tools.brush is None:
+            return
+        if tools.brush_selected_lum is None or tools.brush_idle_lum is None:
+            return
+        if self._brush_selected(tools, target):
+            return
+        self._click_image_point(mouse, target, tools.brush, image_size, client)
+        time.sleep(0.15)
+        if not self._brush_selected(tools, target):
+            raise TaskError(
+                409, "E_NOT_BRUSH",
+                "工具条画笔格未处于选中态，可能已被橡皮/其他工具占用；已停止以免擦除画面",
+            )
+        self._emit(task_id, "task.warning", {"message": "检测到非画笔工具，已自动切回画笔"})
+
+    def _brush_selected(self, tools: ToolBitmap, target: DrawingTarget) -> bool:
+        """画笔格中心亮度 >= (选中+未选中)/2 即视为选中。
+
+        取样盒与 ToolbarProber._cell_lum 一致（±4px 均值），否则探测得到的
+        指纹在绘制期不可比。截图失败时按「已选中」放行，避免误伤绘制。
+        """
+        if tools.brush_selected_lum is None or tools.brush_idle_lum is None:
+            return True
+        if tools.brush is None:
+            return True
+        image = target.capture_image()
+        if image is None:
+            return True
+        gray = image[..., 0] if image.ndim == 3 else image
+        x, y = int(tools.brush[0]), int(tools.brush[1])
+        crop = gray[max(0, y - 4) : y + 5, max(0, x - 4) : x + 5]
+        if crop.size == 0:
+            return True
+        lum = float(crop.mean())
+        return lum >= (tools.brush_selected_lum + tools.brush_idle_lum) / 2.0
+
+    def _ensure_brush_before_draw(
+        self,
+        task_id: str,
+        tools_open: ToolBitmap | None,
+        tools_collapsed: ToolBitmap | None,
+        panel: PanelController | None,
+        slider: dict | None,
+        fold_open: dict | None,
+        fold_closed: dict | None,
+        panel_open: bool | None,
+        mouse: object,
+        target: DrawingTarget,
+        image_size: tuple[int, int],
+        client: object,
+    ) -> None:
+        """首笔前画笔态校验：折叠态优先用折叠位图，否则展开按展开位图判定。"""
+        if panel_open is not True and tools_collapsed is not None and tools_collapsed.brush is not None:
+            self._ensure_brush(task_id, tools_collapsed, mouse, target, image_size, client)
+            return
+        state = panel_open
+        if state is None and panel is not None and slider is not None:
+            state = panel.is_open(slider)
+        unfolded = False
+        if panel is not None and slider is not None and state is False:
+            unfolded = panel.unfold(slider, fold_closed)
+        try:
+            self._ensure_brush(task_id, tools_open, mouse, target, image_size, client)
+        finally:
+            if unfolded:
+                panel.fold(slider, fold_open)  # type: ignore[union-attr]
+
+    def _probe_toolbar(
+        self,
+        task_id: str,
+        project_id: str,
+        calibration: object,
+        target: DrawingTarget,
+        mouse: object,
+        client: object,
+        image_size: tuple[int, int],
+        canvas: Rect,
+        fold: dict | None,
+        slider: dict | None,
+        undo: dict | None,
+        handle: _RunHandle,
+    ) -> ToolBitmap | None:
+        """旧校准的行为探测，成功后持久化为一条带双态位图的新校准记录。
+
+        失败只警告（回退旧单套坐标），不阻断绘制。
+        """
+        # 旧校准的既有坐标作为人工兜底传入；已被识别项不再重复探测。
+        manual = ToolBitmap(
+            brush=None,
+            eraser=None,
+            slider=dict(slider) if slider is not None else None,
+            undo=(undo["x"], undo["y"]) if undo is not None else None,
+            fold=(fold["x"], fold["y"]) if fold is not None else None,
+            brush_selected_lum=None,
+            brush_idle_lum=None,
+        )
+        image_w, image_h = image_size
+        prober = ToolbarProber(
+            probe=target,
+            mouse=mouse,
+            to_screen=lambda x, y: image_point_to_screen(x, y, image_w, image_h, client),
+        )
+        try:
+            tools = prober.run(
+                canvas=(canvas.x, canvas.y, canvas.w, canvas.h),
+                band=self._band_rect(canvas),
+                open_bitmap=manual,
+                on_progress=lambda msg: self._emit(task_id, "task.warning", {"message": msg}),
+                should_stop=handle.stop_event.is_set,
+            )
+        except ProbeError as exc:
+            if exc.code == "E_STOPPED":
+                return None
+            self._emit(task_id, "task.warning", {
+                "message": f"工具条自动探测失败（{exc.code}），沿用旧校准坐标"
+            })
+            return None
+        except Exception as exc:  # 探测是增强路径，任何异常都不得中断绘制
+            self._emit(task_id, "task.warning", {
+                "message": f"工具条自动探测异常（{exc.__class__.__name__}），沿用旧校准坐标"
+            })
+            return None
+
+        try:
+            self._persist_probed_calibration(project_id, calibration, tools)
+        except Exception as exc:  # 持久化失败不影响本次绘制
+            self._emit(task_id, "task.warning", {
+                "message": f"探测结果保存失败（{exc.__class__.__name__}），本次沿用内存坐标"
+            })
+        return tools
+
+    def _persist_probed_calibration(
+        self, project_id: str, calibration: object, tools: ToolBitmap
+    ) -> None:
+        """沿用既有校准记录其余字段、仅替换双态位图，存为新的最新 profile。"""
+        self._store.save_calibration(
+            project_id=project_id,
+            hwnd=calibration.hwnd,  # type: ignore[attr-defined]
+            window_title=calibration.window_title,  # type: ignore[attr-defined]
+            capture_method=calibration.capture_method,  # type: ignore[attr-defined]
+            rect_x=calibration.rect_x,  # type: ignore[attr-defined]
+            rect_y=calibration.rect_y,  # type: ignore[attr-defined]
+            rect_w=calibration.rect_w,  # type: ignore[attr-defined]
+            rect_h=calibration.rect_h,  # type: ignore[attr-defined]
+            dpi_scale=calibration.dpi_scale,  # type: ignore[attr-defined]
+            source=calibration.source,  # type: ignore[attr-defined]
+            confidence=calibration.confidence,  # type: ignore[attr-defined]
+            slider=calibration.slider,  # type: ignore[attr-defined]
+            undo=calibration.undo,  # type: ignore[attr-defined]
+            fold=calibration.fold,  # type: ignore[attr-defined]
+            tools_open=asdict(tools),
+            tools_collapsed=None,
+            device_kind=calibration.device_kind,  # type: ignore[attr-defined]
+            device_serial=calibration.device_serial,  # type: ignore[attr-defined]
+        )
 
     def _start_guard(
         self, mouse: object, target: DrawingTarget, params: ExecParams, handle: _RunHandle

@@ -108,9 +108,10 @@ class ExecParamsModel(CamelModel):
     focus_guard: bool = True
     cursor_takeover_px: float = Field(default=6.0, ge=2.0, le=100.0)
     guard_poll_ms: float = Field(default=50.0, ge=10.0, le=500.0)
-    # 自动变粗：绘制前自动标定小程序粗细滑杆并分档换笔（需校准页框选滑杆）。
-    auto_width: bool = False
-    width_tiers: int = Field(default=5, ge=2, le=10)
+    # 自动变粗：绘制前自动识别工具条、标定笔宽并按目标行程逐段换笔。
+    auto_width: bool = True
+    # 换宽容差：目标行程差超过该值才换一次笔（越小越细腻越慢）。
+    width_tolerance: float = Field(default=0.05, ge=0.02, le=0.20)
 
 
 class TaskCreate(CamelModel):
