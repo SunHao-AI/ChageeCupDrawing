@@ -41,7 +41,7 @@ CALIBRATION_PROBE_TIERS = 5
 
 # 刻度带工作区：画布顶部条带，标定/探测的测试线都画在这里。基线取样与探测
 # 观测必须与标定器用同一块工作区，否则底墨会被算进线宽或误判清空。
-BAND_MAX_H_PX = 160
+BAND_ROW_STEP_PX = 14  # 与 PenCalibrator 的最小行距一致
 
 
 class TaskError(Exception):
@@ -656,9 +656,20 @@ class ExecutorService:
 
     @staticmethod
     def _band_rect(canvas: Rect) -> tuple[int, int, int, int]:
-        """画布顶部刻度带工作区：标定测试线与探测笔迹都落在这里。"""
-        height = max(1, min(int(canvas.h), BAND_MAX_H_PX))
-        return (int(canvas.x), int(canvas.y), int(canvas.w), height)
+        """画布顶部刻度带工作区：标定测试线与探测笔迹都落在这里。
+
+        几何直接沿用 PenCalibrator 的布局常量（左边距 TEST_MARGIN、线长
+        TEST_LINE_LEN、首行 y = canvas.y + TEST_MARGIN + 4、最小行距 14px、
+        量宽窗上下各留 16/24+8px），使基线取样、探测观测与标定器的判定区域
+        是同一块刻度带，而不是整幅画布（整幅画布对几行测试线不敏感）。
+        """
+        margin = PenCalibrator.TEST_MARGIN
+        x0 = int(canvas.x) + margin
+        y0 = int(canvas.y) + margin
+        width = max(1, min(PenCalibrator.TEST_LINE_LEN + 10, int(canvas.w) - margin))
+        rows = CALIBRATION_PROBE_TIERS
+        height = max(1, min(int(canvas.h) - margin, 16 + (rows - 1) * BAND_ROW_STEP_PX + 32))
+        return (x0, y0, width, height)
 
     @classmethod
     def _band_baseline(cls, target: DrawingTarget, canvas: Rect) -> float:
