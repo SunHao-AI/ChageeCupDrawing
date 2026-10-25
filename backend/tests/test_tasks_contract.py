@@ -532,3 +532,66 @@ def test_task_endpoints_not_found(tmp_path: Path, device: FakeDevice, mouse_fact
         assert missing_plan.status_code == 404
     finally:
         client.__exit__(None, None, None)
+
+
+def test_create_task_accepts_frontend_exec_payload(
+    tmp_path: Path, device: FakeDevice, mouse_factory
+) -> None:
+    """前端 defaultExecParams() 的全部字段（camelCase）必须被后端接受并持久化。"""
+    client = _make_client(tmp_path, device, mouse_factory)
+    try:
+        plan_id = _ready_project(client)
+        created = client.post(
+            f"/api/plans/{plan_id}/tasks",
+            json={
+                "exec": {
+                    "eventStepPx": 1.0,
+                    "pointDelayMs": 1.5,
+                    "strokeDelayMs": 6.0,
+                    "clickHoldMs": 20,
+                    "noCoalesce": True,
+                    "shortStrokeProtect": True,
+                    "shortStrokeThresholdPx": 1.2,
+                    "focusGuard": True,
+                    "cursorTakeoverPx": 6,
+                    "guardPollMs": 50,
+                    "autoWidth": True,
+                    "widthTolerance": 0.05,
+                },
+                "countdownMs": 0,
+            },
+            headers=WRITE_HEADERS,
+        )
+        assert created.status_code == 201, created.text
+        task_id = created.json()["taskId"]
+
+        detail = client.get(f"/api/tasks/{task_id}").json()
+        exec_params = detail["exec"]
+        assert exec_params["widthTolerance"] == 0.05
+        assert exec_params["autoWidth"] is True
+        assert "widthTiers" not in exec_params
+
+        final = _wait_terminal(client, task_id)
+        assert final["status"] != "FAILED", final
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_create_task_rejects_legacy_width_tiers(
+    tmp_path: Path, device: FakeDevice, mouse_factory
+) -> None:
+    """旧前端字段 widthTiers 已不在契约中，extra=forbid 必须拒绝（400 E_INVALID_ARGUMENT）。"""
+    client = _make_client(tmp_path, device, mouse_factory)
+    try:
+        plan_id = _ready_project(client)
+        rejected = client.post(
+            f"/api/plans/{plan_id}/tasks",
+            json={"exec": {"widthTiers": 3}},
+            headers=WRITE_HEADERS,
+        )
+        assert rejected.status_code == 400, rejected.text
+        body = rejected.json()
+        assert body["errorCode"] == "E_INVALID_ARGUMENT"
+        assert "widthTiers" in body["detail"][0]["path"]
+    finally:
+        client.__exit__(None, None, None)

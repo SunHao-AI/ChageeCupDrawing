@@ -155,7 +155,7 @@ export const PLAN_GROUPS: { name: string; fields: FieldMeta[] }[] = [
   },
 ]
 
-/** ExecParams 全 10 字段，范围与 ExecParamsModel 一致。 */
+/** ExecParams 全字段，范围与 ExecParamsModel 一致。 */
 export const EXEC_FIELDS: FieldMeta[] = [
   { key: 'eventStepPx', label: '移动事件间隔', kind: 'slider', group: '节奏', min: 0.8, max: 5.0, step: 0.1, precision: 1, hint: '像素/事件，越小越密' },
   { key: 'pointDelayMs', label: '每点延迟', kind: 'slider', group: '节奏', min: 0.5, max: 10.0, step: 0.1, precision: 1, hint: '毫秒，落笔点之间' },
@@ -167,8 +167,8 @@ export const EXEC_FIELDS: FieldMeta[] = [
   { key: 'focusGuard', label: '离焦即停', kind: 'toggle', group: '守护', hint: '目标窗口失焦/最小化或鼠标被接管时立即抬笔暂停' },
   { key: 'cursorTakeoverPx', label: '光标接管阈值', kind: 'slider', group: '守护', min: 2, max: 40, step: 1, precision: 0, hint: '两笔之间光标偏离超过该像素数判定为接管' },
   { key: 'guardPollMs', label: '守护轮询', kind: 'slider', group: '守护', min: 20, max: 200, step: 10, precision: 0, hint: '毫秒，越小越灵敏' },
-  { key: 'autoWidth', label: '自动变粗', kind: 'toggle', group: '笔宽', hint: '绘制前自动扫描小程序粗细滑杆并实测笔宽，按明暗分档换笔（需校准页框选滑杆与撤销按钮）' },
-  { key: 'widthTiers', label: '笔宽档数', kind: 'slider', group: '笔宽', min: 2, max: 10, step: 1, precision: 0, hint: '按画面明暗分的粗细档位数，越多层次越细、耗时越长' },
+  { key: 'autoWidth', label: '自动变粗', kind: 'toggle', group: '笔宽', hint: '绘制前自动探测画板工具栏并标定笔宽，逐段分配笔宽、按容差合批换笔（默认开启）' },
+  { key: 'widthTolerance', label: '换宽粒度', kind: 'slider', group: '笔宽', min: 0.02, max: 0.2, step: 0.01, precision: 2, hint: '目标笔宽变化超过该值才换一次笔；越小层次越细、换笔越频繁（0.05 ≈ 最多 20 次）' },
 ]
 
 /** 创建/续画任务时的控制项。 */
@@ -213,8 +213,8 @@ export function defaultExecParams(): ExecParams {
     focusGuard: true,
     cursorTakeoverPx: 6,
     guardPollMs: 50,
-    autoWidth: false,
-    widthTiers: 5,
+    autoWidth: true,
+    widthTolerance: 0.05,
   }
 }
 

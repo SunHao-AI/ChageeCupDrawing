@@ -40,9 +40,10 @@ export interface ExecParams {
   focusGuard: boolean
   cursorTakeoverPx: number
   guardPollMs: number
-  /** 自动变粗：绘制前标定小程序粗细滑杆并分档换笔。 */
+  /** 自动变粗：绘制前自动探测工具条并标定笔宽，按容差逐段换笔。 */
   autoWidth: boolean
-  widthTiers: number
+  /** 换宽粒度：目标笔宽变化超过该值才换一次笔。 */
+  widthTolerance: number
 }
 
 export interface Rect {
