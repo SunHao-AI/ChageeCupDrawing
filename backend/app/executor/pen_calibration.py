@@ -98,7 +98,13 @@ class PenCalibrator:
         canvas: tuple[int, int, int, int],
         on_progress: Callable[[str], None],
         should_stop: Callable[[], bool],
+        baseline_occupied: float = 0.0,
     ) -> CalibrationResult:
+        """执行标定；``baseline_occupied`` 为标定开始前刻度带内既有墨量占比。
+
+        清空判定以该占比为基线：用户画布本就带墨时，只要墨量回落到基线附近
+        即视为测试线已撤净，不会把既有墨迹当成清空失败。
+        """
         track = self._validate_track(slider_track)
         tier_count = max(2, min(int(tiers), self.MAX_PROBE_STEPS))
 
@@ -112,6 +118,7 @@ class PenCalibrator:
         cleared = self._clear_canvas(
             undo_point=undo_point, strokes=len(rows),
             canvas=canvas, band=band, on_progress=on_progress, should_stop=should_stop,
+            baseline_occupied=baseline_occupied,
         )
         if not cleared:
             raise CalibrationError(
@@ -254,13 +261,21 @@ class PenCalibrator:
         band: tuple[int, int, int, int],
         on_progress: Callable[[str], None],
         should_stop: Callable[[], bool],
+        baseline_occupied: float = 0.0,
     ) -> bool:
+        """撤销测试线并判定刻度带已清空。
+
+        ``baseline_occupied`` = 标定开始前刻度带内既有墨量占比；判定阈值为
+        ``baseline_occupied + CLEAR_CONFIRM_OCCUPIED``，用户画布本有的墨迹
+        不会被当成「测试线没撤掉」。
+        """
         # 校验区域取「画布∩刻度带」：整幅画布的墨占比对几行测试线不敏感
         # （~0.5% < 旧阈值），撤销失败会被误判成已清空、直接开画留下脏线。
         check = band
+        limit = baseline_occupied + self.CLEAR_CONFIRM_OCCUPIED
         if not undo_point:
             image = self._grab()
-            return ink_occupied_fraction(image, check) <= self.CLEAR_CONFIRM_OCCUPIED
+            return ink_occupied_fraction(image, check) <= limit
         on_progress(f"清空标定测试线（撤销 {strokes} 笔）")
         for _ in range(strokes * 2 + 4):
             if should_stop():
@@ -269,7 +284,7 @@ class PenCalibrator:
             self._click(undo_point["x"], undo_point["y"])
             self._sleep(0.22)
             image = self._grab()
-            if ink_occupied_fraction(image, check) <= self.CLEAR_CONFIRM_OCCUPIED:
+            if ink_occupied_fraction(image, check) <= limit:
                 return True
         return False
 
