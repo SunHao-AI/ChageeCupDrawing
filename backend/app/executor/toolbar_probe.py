@@ -104,6 +104,8 @@ class ToolbarProber:
         # 探测自己画出且真正改变像素的笔数（与撤销历史一一对应），以及已消耗的撤销次数。
         self._probe_strokes = 0
         self._probe_undos = 0
+        # 正常路径清理成功后置 True；异常/停止路径的 finally 据此避免重复撤销。
+        self._ink_cleared = False
 
     # ---------- 对外主流程 ----------
 
@@ -141,6 +143,7 @@ class ToolbarProber:
         self._band_baseline_px = self._band_ink_pixels(first_image)
         self._probe_strokes = 0
         self._probe_undos = 0
+        self._ink_cleared = False
 
         if fold is None:
             skip = self._skip_points(slider=slider, undo=undo, eraser=eraser, brush=brush)
@@ -196,6 +199,7 @@ class ToolbarProber:
         try:
             self._require_panel_open(fold, check_stop, assume_open=slider_manual)
             self._clear_probe_ink(undo, check_stop)
+            self._ink_cleared = True
             if tools_probed and brush is not None:
                 check_stop()
             return ToolBitmap(
@@ -208,10 +212,38 @@ class ToolbarProber:
                 brush_idle_lum=idle_lum,
             )
         finally:
+            # 探测中途失败/被停止时同样要清掉刻度带测试线，否则残留墨会污染
+            # 下次重扫与标定；清理失败不得掩盖正在传播的原始异常。
+            self._best_effort_cleanup(undo, fold, slider, eraser, brush)
             # 探测中可能停在橡皮态；即便清理/展开抛错也要尽力切回画笔，否则上层
             # 探测失败时仍跳过画笔校验，后续绘制会擦掉用户画作。
             if tools_probed and brush is not None:
                 self._restore_brush(brush, fold)
+
+    def _best_effort_cleanup(
+        self,
+        undo: tuple[float, float] | None,
+        fold: tuple[float, float] | None,
+        slider: dict | None,
+        eraser: tuple[float, float] | None,
+        brush: tuple[float, float] | None,
+    ) -> None:
+        """异常/停止路径尽力清理探测笔迹，正常路径已清理则不重复。
+
+        清理不得因停止信号中断（no-op check_stop），失败也只吞掉自身异常，让
+        原始异常继续向外传播。``eraser``/``brush`` 仅作探测已识别控件的记录。
+        """
+        if self._ink_cleared:
+            return
+        try:
+            # 撤销按钮只在展开态可见；人工滑杆等价于用户保证展开态坐标可信。
+            if not self._ensure_panel_open(fold, lambda: None):
+                if slider is None:
+                    return
+            self._clear_probe_ink(undo, lambda: None)
+            self._ink_cleared = True
+        except Exception:  # 清理路径：任何失败都不得掩盖原始异常
+            pass
 
     def _restore_brush(
         self, brush: tuple[float, float], fold: tuple[float, float] | None

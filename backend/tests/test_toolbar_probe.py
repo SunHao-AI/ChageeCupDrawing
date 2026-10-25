@@ -666,6 +666,40 @@ def test_probe_restores_brush_when_cleanup_raises(monkeypatch):
     assert board.tool == "brush"
 
 
+def test_probe_cleans_ink_when_probe_raises(monkeypatch):
+    """I1：探测中途抛错时也要清掉刻度带测试线，且原始异常照常向外传播。
+
+    正常清理路径首次抛 E_PROBE_NO_TOOLBAR；异常路径的 finally 必须再尽力清理
+    一次，否则残留墨会污染用户画布与下一次重扫/标定。
+    """
+    board = ToolbarBoard()
+    prober, _ = _prober(board)
+    real_clear = prober._clear_probe_ink
+    calls = {"n": 0}
+
+    def fail_first(undo, check_stop):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ProbeError("E_PROBE_NO_TOOLBAR", "模拟清理前展开失败")
+        return real_clear(undo, check_stop)
+
+    monkeypatch.setattr(prober, "_clear_probe_ink", fail_first)
+
+    with pytest.raises(ProbeError) as exc:
+        prober.run(
+            canvas=CANVAS,
+            band=BAND,
+            open_bitmap=None,
+            on_progress=lambda _m: None,
+            should_stop=lambda: False,
+        )
+
+    assert exc.value.code == "E_PROBE_NO_TOOLBAR"
+    assert calls["n"] == 2  # 正常清理一次失败 + 异常路径重试一次
+    assert board.band_ink() == 0.0  # 带内墨迹回到基线
+    assert board.tool == "brush"  # 工具态也恢复为画笔
+
+
 def test_probe_stops_on_should_stop():
     board = ToolbarBoard()
     with pytest.raises(ProbeError) as exc:

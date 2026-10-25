@@ -143,6 +143,18 @@ def calibrate(project_id: str, payload: CalibrationRequest, request: Request) ->
         rect = Rect(left, top, right - left, bottom - top)
         confidence = 1.0
 
+    tools_open = payload.tools_open
+    tools_collapsed = payload.tools_collapsed
+    if tools_open is None and tools_collapsed is None:
+        # 人工兜底重标（校准页 POST 不带 tools 字段）不应丢弃自动探测成果，
+        # 否则执行器会回退 legacy 路径并跳过画笔校验。显式传入任一字段时以
+        # 请求为准（显式 null 与未传在 Pydantic 中同为 None，故只在两者皆
+        # None 时才继承上一份校准的位图）。
+        previous = store.latest_calibration(project_id)
+        if previous is not None:
+            tools_open = previous.tools_open
+            tools_collapsed = previous.tools_collapsed
+
     profile = store.save_calibration(
         project_id=project_id,
         hwnd=payload.hwnd,
@@ -158,8 +170,8 @@ def calibrate(project_id: str, payload: CalibrationRequest, request: Request) ->
         slider=payload.slider.model_dump() if payload.slider else None,
         undo=payload.undo.model_dump() if payload.undo else None,
         fold=payload.fold.model_dump() if payload.fold else None,
-        tools_open=payload.tools_open,
-        tools_collapsed=payload.tools_collapsed,
+        tools_open=tools_open,
+        tools_collapsed=tools_collapsed,
         device_kind=payload.device_kind,
         device_serial=payload.device_serial,
     )

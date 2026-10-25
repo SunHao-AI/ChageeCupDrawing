@@ -20,6 +20,7 @@ from app.device.geometry import Rect, image_point_to_screen
 from app.device.service import DeviceService
 from app.device.target import DrawingTarget, resolve_target
 from app.executor.guard import GuardProbe, Win32GuardProbe, evaluate_signals
+from app.executor.ink_measure import ink_occupied_fraction
 from app.executor.native_mouse import NativeMouse, path_length
 from app.executor.panel_control import PanelController
 from app.executor.pen_calibration import CalibrationError, PenCalibrator
@@ -41,6 +42,11 @@ CALIBRATION_PROBE_TIERS = 5
 # 探测刻度带工作区：画布顶部条带，只用于工具栏探测自己的落笔与观测。
 # 标定基线已改由 PenCalibrator 用其真实 band 计算，不再复用这里的推导。
 BAND_ROW_STEP_PX = 14  # 与 PenCalibrator 的最小行距一致
+
+# 工具条行为探测的空白前提：探测会在画布下方候选区逐点盲点，若画布已有墨迹
+# （用户画作或上次未清理的笔迹），可能点中「清空/颜色」等无法恢复的控件。
+# 因此墨迹占比超过该阈值即跳过自动探测，改由用户在校准页人工标注。
+PROBE_BLANK_MAX = 0.01
 
 
 class TaskError(Exception):
@@ -470,31 +476,39 @@ class ExecutorService:
         # 记录；人工锚点只作为探测输入（open_bitmap），不再作为探测开关。失败
         # 只警告、沿用旧单套坐标，不阻断绘制。
         if params.auto_width and cursor == 0 and calibration.tools_open is None:
-            probed = self._probe_toolbar(
-                task_id, plan.project_id, calibration, target, mouse, client, image_size,
-                new_rect, dx, dy, fold_closed, slider_open, undo_open, handle,
-            )
-            if handle.stop_event.is_set():
-                self._finish_stopped(task_id, cursor, total, started, handle)
-                return
-            if probed is not None:
-                tools_open = self._tool_bitmap(asdict(probed), 0.0, 0.0)
-                slider_open = tools_open.slider if tools_open is not None else slider_open
-                undo_open = self._point_dict(tools_open.undo) if tools_open else undo_open
-                fold_open = (
-                    self._point_dict(tools_open.fold) if tools_open else None
-                ) or fold_open
-                fold_closed = (
-                    self._point_dict(tools_collapsed.fold) if tools_collapsed else None
-                ) or fold_open
-                legacy_mode = False
-                # 探测过程中会开合面板，状态未知，按实际截图重判。
-                panel_open = None
-                # 旧校准的 panel 可能已存在，但其滑杆/折叠坐标已被探测结果替换，
-                # 必须按新坐标重建。
-                panel = self._make_panel(
-                    params, target, mouse, image_size, client, slider_open, fold_open
+            if not self._canvas_is_blank(target, new_rect):
+                # 画布已有墨迹时盲点下方候选可能命中「清空」类不可恢复控件，
+                # 宁可跳过探测、退化为单细笔/旧路径，也不冒险毁掉用户画作。
+                self._emit(task_id, "task.warning", {
+                    "message": "画布非空白，已跳过工具条自动探测（避免误触清空类控件）；"
+                               "请到校准页手动标注控件/滑杆"
+                })
+            else:
+                probed = self._probe_toolbar(
+                    task_id, plan.project_id, calibration, target, mouse, client, image_size,
+                    new_rect, dx, dy, fold_closed, slider_open, undo_open, handle,
                 )
+                if handle.stop_event.is_set():
+                    self._finish_stopped(task_id, cursor, total, started, handle)
+                    return
+                if probed is not None:
+                    tools_open = self._tool_bitmap(asdict(probed), 0.0, 0.0)
+                    slider_open = tools_open.slider if tools_open is not None else slider_open
+                    undo_open = self._point_dict(tools_open.undo) if tools_open else undo_open
+                    fold_open = (
+                        self._point_dict(tools_open.fold) if tools_open else None
+                    ) or fold_open
+                    fold_closed = (
+                        self._point_dict(tools_collapsed.fold) if tools_collapsed else None
+                    ) or fold_open
+                    legacy_mode = False
+                    # 探测过程中会开合面板，状态未知，按实际截图重判。
+                    panel_open = None
+                    # 旧校准的 panel 可能已存在，但其滑杆/折叠坐标已被探测结果替换，
+                    # 必须按新坐标重建。
+                    panel = self._make_panel(
+                        params, target, mouse, image_size, client, slider_open, fold_open
+                    )
 
         if rendering_calibration and not legacy_mode:
             # 标定会用测试笔在刻度带试画；若当前停在橡皮态，试画会先擦掉用户画作。
@@ -525,6 +539,7 @@ class ExecutorService:
                     params = self._run_pen_calibration(
                         task_id, params, mouse, target, client, image_size,
                         new_rect, slider_open, undo_open, handle,
+                        cursor=cursor, total=total,
                     )
                     if params is None:  # 标定被停止，已落 STOPPED
                         return
@@ -535,12 +550,32 @@ class ExecutorService:
         multi_width = has_width_table and len(params.width_table or ()) >= 2
 
         # 开画前收起工具面板（滑杆不再需要常开）。面板位于画布下方的工具条，
-        # 收起只腾出可视区域、不改变画布矩形，落笔映射沿用 new_rect。
+        # 收起后画布可能扩大并盖住滑杆区域（见 panel_control）：必须按收起态
+        # 重取矩形并校验漂移，超限即停，避免映射基准错位让整幅笔迹偏移。
         panel_active = panel is not None and has_width_table
+        mapping_rect = new_rect
         if panel_active:
             if slider_open is not None and panel.fold(slider_open, fold_open):
                 panel_open = False
             handle.settled_cursor = None
+            if panel_open is False:
+                collapsed_rect = self._current_canvas_rect(target)
+                if collapsed_rect is None:
+                    self._emit(task_id, "task.warning", {
+                        "message": "无法确认收起态画布矩形，落笔映射沿用任务开局矩形"
+                    })
+                else:
+                    if self._canvas_size_drifted(collapsed_rect, new_rect):
+                        raise TaskError(
+                            409,
+                            "E_CANVAS_DRIFT",
+                            "工具面板开合改变了画布矩形（开局 x,y,w,h="
+                            f"{new_rect.x},{new_rect.y},{new_rect.w},{new_rect.h} / 收起 "
+                            f"{collapsed_rect.x},{collapsed_rect.y},"
+                            f"{collapsed_rect.w},{collapsed_rect.h}），"
+                            "本任务已停止以免笔迹错位；请在面板收起状态重新校准",
+                        )
+                    mapping_rect = collapsed_rect
 
         # 首笔前强制画笔校验：绝不在橡皮态下笔。旧校准无法判定，降级放行并提示。
         if legacy_mode:
@@ -628,8 +663,8 @@ class ExecutorService:
                     handle.settled_cursor = None
             screen_path = [
                 image_point_to_screen(
-                    new_rect.x + x * new_rect.w / max(1, calibration.rect_w),
-                    new_rect.y + y * new_rect.h / max(1, calibration.rect_h),
+                    mapping_rect.x + x * mapping_rect.w / max(1, calibration.rect_w),
+                    mapping_rect.y + y * mapping_rect.h / max(1, calibration.rect_h),
                     image_w,
                     image_h,
                     client,
@@ -738,6 +773,9 @@ class ExecutorService:
         slider: dict | None,
         undo: dict | None,
         handle: _RunHandle,
+        *,
+        cursor: int,
+        total: int,
     ) -> ExecParams | None:
         """绘制前笔宽标定；返回带 width_table 的新 params，被停止返回 None。"""
         if slider is None:
@@ -763,7 +801,9 @@ class ExecutorService:
             )
         except CalibrationError as exc:
             if exc.code == "E_STOPPED":
-                self._finish_stopped(task_id, 0, 0, time.monotonic(), handle)
+                # 标定发生在绘制之前：进度必须如实反映已画笔数与总数，否则前端
+                # totalPaths 变 0、续画入口错乱。
+                self._finish_stopped(task_id, cursor, total, time.monotonic(), handle)
                 return None
             raise TaskError(422, exc.code, exc.message) from exc
 
@@ -1049,6 +1089,38 @@ class ExecutorService:
             return None
         left, top, right, bottom = found
         return Rect(left, top, right - left, bottom - top)
+
+    @staticmethod
+    def _canvas_size_drifted(current: Rect, baseline: Rect) -> bool:
+        """收起态画布与开局矩形的偏差是否超过 max(8px, 3% 对应边长)。
+
+        收起面板可能让画布区域变大（甚至盖住工具条）；偏差过大说明映射基准
+        不可信，继续落笔会让整幅笔迹整体错位，必须停止而不是静默沿用。
+        """
+        checks = (
+            (current.x, baseline.x, baseline.w),
+            (current.y, baseline.y, baseline.h),
+            (current.w, baseline.w, baseline.w),
+            (current.h, baseline.h, baseline.h),
+        )
+        return any(
+            abs(float(a) - float(b)) > max(8.0, 0.03 * float(side))
+            for a, b, side in checks
+        )
+
+    def _canvas_is_blank(self, target: DrawingTarget, canvas: Rect) -> bool:
+        """探测前空白门禁：画布已有墨迹时不得在下方候选区盲点。
+
+        截图失败按空白处理并继续（无法判定时不因门禁额外阻断）；墨迹占比超过
+        ``PROBE_BLANK_MAX`` 即视为非空白，可能已有用户画作或未清理的笔迹。
+        """
+        image = target.capture_image()
+        if image is None:
+            return True
+        fraction = ink_occupied_fraction(
+            image, (canvas.x, canvas.y, canvas.w, canvas.h)
+        )
+        return fraction <= PROBE_BLANK_MAX
 
     def _probe_toolbar(
         self,

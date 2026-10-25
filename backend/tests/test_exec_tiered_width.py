@@ -352,6 +352,77 @@ def test_slider_click_uses_current_frame_canvas(monkeypatch) -> None:
 TABLE_3 = ((0.0, 2.0), (0.5, 4.0), (1.0, 8.0))
 
 
+def test_fold_changes_canvas_rect_stops_before_drawing(monkeypatch) -> None:
+    """C1：收起面板后画布变大（盖住滑杆区域）时必须停止，不能用旧矩形落笔。
+
+    映射基准若仍是开局（展开态）矩形，整幅笔迹都会整体错位；安全优先即停。
+    """
+    board = _TrackBoard(open_=True)
+
+    def detect(_image):
+        return CANVAS_EXPANDED if board.open else CANVAS_FOLDED
+
+    monkeypatch.setattr(service, "detect_canvas_rect", detect)
+    monkeypatch.setattr(panel_control, "detect_canvas_rect", detect)
+    calibration = _calibration(tools_open=_tools(slider=SLIDER_LOW))
+    # 开局（展开态）画布与校准一致，只让「收起后」的画布发生漂移。
+    calibration.rect_x, calibration.rect_y = 0, 0
+    calibration.rect_w, calibration.rect_h = 400, 430
+    store = FakeStore(calibration)
+    params = ExecParams(auto_width=True, width_table=TABLE_3, width_tolerance=0.05)
+    mouse = FakeMouse(board)
+
+    with pytest.raises(TaskError) as excinfo:
+        _run(store, board, _paths(1), params, mouse=mouse)
+
+    assert excinfo.value.code == "E_CANVAS_DRIFT"
+    assert "工具面板开合改变了画布矩形" in excinfo.value.message
+    assert "收起" in excinfo.value.message
+    assert mouse.drags == []  # 未落下任何笔迹
+    assert board.open is False  # 面板已收起，等用户重新校准
+
+
+def test_calibration_stop_reports_cursor_and_total(monkeypatch) -> None:
+    """I5：标定被停止时进度须带真实的 cursor/total，而不是 0/0。"""
+
+    class StoppingCalibrator:
+        TEST_MARGIN = 6
+        TEST_LINE_LEN = 46
+        MIN_SPREAD_RATIO = 0.18
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def run(self, **_kwargs):
+            raise service.CalibrationError("E_STOPPED", "标定被停止")
+
+    monkeypatch.setattr(service, "PenCalibrator", StoppingCalibrator)
+    store = FakeStore(_calibration(tools_open=_tools()))
+    board = FakeBoard(open_=True)
+    svc = _service(store, FakeMouse(board))
+
+    result = svc._run_pen_calibration(
+        "t-stop",
+        ExecParams(auto_width=True),
+        FakeMouse(board),
+        FakeTarget(board),
+        None,
+        (SIZE[1], SIZE[0]),
+        service.Rect(150, 200, 300, 450),
+        dict(TRACK),
+        dict(UNDO),
+        _RunHandle(),
+        cursor=2,
+        total=7,
+    )
+
+    assert result is None
+    done = [payload for kind, payload in store.events if kind == "task.done"]
+    assert done[-1]["status"] == "STOPPED"
+    assert done[-1]["donePaths"] == 2
+    assert done[-1]["totalPaths"] == 7
+
+
 def test_buckets_switch_only_when_crossing(monkeypatch) -> None:
     # 0.95 → 桶 19（第 20 档）；0.93 与 0.90 同落桶 18（第 19 档）：只换一次宽。
     monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
@@ -768,3 +839,39 @@ def test_probe_runs_before_brush_guard_and_calibration(monkeypatch) -> None:
     assert events.index("probe") < events.index("brush-click")
     assert events.index("brush-click") < events.index("calibrate")
     assert events.index("calibrate") < events.index("slider-click")
+
+
+class _InkedBoard(FakeBoard):
+    """画布左上角已有一块用户墨迹（占比 > PROBE_BLANK_MAX）。"""
+
+    def image(self) -> np.ndarray:
+        grid = super().image()
+        l, t, _r, _b = CANVAS
+        grid[t + 20 : t + 80, l + 20 : l + 80] = 0
+        return grid
+
+
+def test_probe_skipped_when_canvas_not_blank(monkeypatch) -> None:
+    """C2：画布非空白时绝不盲点工具条候选（可能点中清空类控件）。"""
+    prober_calls: list[object] = []
+
+    class RecordingProber(_FakeProber):
+        def __init__(self, **kwargs) -> None:
+            prober_calls.append(self)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(service, "ToolbarProber", RecordingProber)
+    calibration = _calibration(tools_open=None, slider=None, fold=None)
+    store = FakeStore(calibration)
+    board = _InkedBoard(open_=True)
+    params = ExecParams(auto_width=True, width_table=None, width_tolerance=0.05)
+
+    mouse = _run(store, board, _paths(1), params)
+
+    assert prober_calls == []  # 探测根本未启动
+    assert store.saved == []  # 没有写入任何探测结果
+    assert any("画布非空白，已跳过工具条自动探测" in m for m in store.warnings())
+    # 沿用既有降级：无滑杆 → 单细笔绘制，仍完成任务。
+    assert any("未标定粗细滑杆" in m for m in store.warnings())
+    assert len(mouse.drags) == 1
+    assert store.status == "DONE"

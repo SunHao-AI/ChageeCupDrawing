@@ -557,3 +557,24 @@ def test_calibration_without_tools_bitmaps_returns_none(client: TestClient) -> N
     body = _calibrate(client, project["projectId"])
     assert body["toolsOpen"] is None
     assert body["toolsCollapsed"] is None
+
+
+def test_calibration_without_tools_inherits_previous_bitmaps(client: TestClient) -> None:
+    """I3：人工兜底重标（不带 tools）不得静默丢弃自动探测成果。"""
+    project = _upload(client)
+    tools_open = {"brush": {"x": 10, "y": 500}, "brushSelectedLum": 180.0}
+    first = client.post(
+        f"/api/projects/{project['projectId']}/calibration",
+        json={"hwnd": GOOD_HWND, "mode": "auto", "toolsOpen": tools_open},
+        headers=WRITE_HEADERS,
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["toolsOpen"] == tools_open
+
+    # 校准页只重标画布矩形：不带 tools 字段，应继承上一份探测位图。
+    second = _calibrate(client, project["projectId"])
+    assert second["toolsOpen"] == tools_open
+    profile = client.app.state.store.latest_calibration(project["projectId"])
+    assert profile.tools_open == tools_open
+    assert profile.tools_collapsed is None
+
