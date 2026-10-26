@@ -127,6 +127,13 @@ class ToolbarProber:
         undo = self._clean_point(manual.undo if manual else None)
         eraser = self._clean_point(manual.eraser if manual else None)
         brush = self._clean_point(manual.brush if manual else None)
+        # 人工兜底/上次探测已知坐标的「工具行」：用于候选排序先验。工具格、
+        # 撤销与滑杆几乎总在同一行；优先扫这一行可把扫描从全网格降到单行。
+        manual_rows = [
+            point[1]
+            for point in (undo, eraser, brush)
+            if point is not None
+        ]
         selected_lum = manual.brush_selected_lum if manual else None
         idle_lum = manual.brush_idle_lum if manual else None
         slider_manual = slider is not None
@@ -166,6 +173,17 @@ class ToolbarProber:
                     "E_PROBE_NO_SLIDER", "面板展开态下未找到笔宽滑杆轨道（请人工框选滑杆）"
                 )
             on_progress("已识别 滑杆轨道")
+
+        # 结构先验：撤销/画笔/橡皮与折叠钮、滑杆几乎总在同一条工具行上。已识别
+        # 控件所在行（±半格）的候选排到最前，其余按原序垫后——后续扫描（撤销/
+        # 工具格）在常见布局下只需扫一行，把最坏路径从「全网格·分钟级」压到
+        # 「单行·秒级」，同时缩小观测失效时的空耗面。
+        anchors = [fold[1]] if fold is not None else []
+        if slider is not None:
+            anchors.append(slider["y"] + slider["h"] / 2.0)
+        anchors += manual_rows
+        if anchors:
+            self._candidates = self._prioritize_row(self._candidates, anchors)
 
         if undo is None:
             undo = self._probe_undo(fold, slider, eraser, brush, check_stop)
@@ -312,6 +330,26 @@ class ToolbarProber:
                     continue
                 points.append(point)
         return points
+
+    @staticmethod
+    def _prioritize_row(
+        points: list[tuple[int, int]], anchor_rows: list[float]
+    ) -> list[tuple[int, int]]:
+        """把落在任一锚点行 ±半格内的候选排到最前，其余保持原序。
+
+        工具条控件同行是普遍布局；锚点来自已识别控件或人工坐标，行匹配容差
+        取半格（14px），行内再按距锚点行的远近升序，保证最可能的行最先被扫。
+        """
+        half = ToolbarProber.CANDIDATE_STEP // 2
+        in_row, rest = [], []
+        for p in points:
+            distance = min(abs(p[1] - row) for row in anchor_rows)
+            if distance <= half:
+                in_row.append((distance, len(in_row) + len(rest), p))
+            else:
+                rest.append(p)
+        in_row.sort(key=lambda item: (item[0], item[1]))
+        return [p for _, _, p in in_row] + rest
 
     @staticmethod
     def _inside(rect: tuple[int, int, int, int], point: tuple[float, float]) -> bool:
@@ -643,9 +681,10 @@ class ToolbarProber:
     def _draw_band_line(self) -> bool:
         """在刻度带固定位置画一条测试线；返回该笔是否新增了墨。
 
-        落笔位置必须固定：橡皮判定依赖「重描后整条线消失」。只在像素确实
-        改变时计入探测笔数——没改变像素的试画（橡皮划过空白）不会留下撤销
-        历史，也不该在清理阶段多撤一次。
+        落笔位置必须固定：橡皮判定依赖「重描后整条线消失」。撤销预算按「实际
+        发出的笔数」计：真实应用的撤销历史对每笔（含重叠重描、橡皮空划）都留
+        一条记录，只数「像素有变化」的笔会低估预算，撤不干净 → E_PROBE_UNCLEANED
+        把整个探测成果丢掉。越撤风险由 _clear_probe_ink 的「回到基线即停」兜底。
         """
         bx = self._band[0] + 8
         by = self._band[1] + self._band[3] // 2
@@ -653,10 +692,8 @@ class ToolbarProber:
         self._ensure_foreground()
         self._stroke((bx, by), (bx + self.BAND_LINE_LEN, by))
         self._sleep(0.12)
-        after = self._band_ink_pixels()
-        if after != before:
-            self._probe_strokes += 1
-        return after > before
+        self._probe_strokes += 1
+        return self._band_ink_pixels() > before
 
     def _band_ink_pixels(self, image=None) -> int:
         gray = self._grab() if image is None else image

@@ -244,10 +244,12 @@ class ToolbarMouse:
         self.down_flag = True
 
     def up(self):
-        if self.board.pending and self.board.pending_touched:
+        if self.board.pending:
+            # 与真实画板一致：每笔都进撤销历史，哪怕没改变像素（重叠重描、
+            # 橡皮空划）。探测的撤销预算按发出笔数计，桩若只为变化记账，
+            # 预算与历史深度就不匹配，掩盖真机「撤不干净」的问题。
             self.board.strokes.append(self.board.pending)
-            self.board.pending = []
-        elif not self.board.pending:
+        else:
             # 无位移的按下-抬起才算一次「点击」；带位移的按下属于描线。
             self.board.clicks.append(self.press_pos)
         self.board.pending = []
@@ -705,6 +707,27 @@ def test_probe_stops_on_should_stop():
     with pytest.raises(ProbeError) as exc:
         _run(board, should_stop=lambda: True)
     assert exc.value.code == "E_STOPPED"
+
+
+def test_prioritize_row_moves_anchor_row_first():
+    points = [(14, 428), (42, 512), (14, 512), (70, 540), (14, 524)]
+    ordered = ToolbarProber._prioritize_row(points, [516.0])
+    # 锚点行 ±半格（502..530）内的候选排前、按行距升序；其余保持原序垫后。
+    assert ordered == [(42, 512), (14, 512), (14, 524), (14, 428), (70, 540)]
+
+
+def test_probe_undo_scan_starts_on_anchor_row():
+    """折叠钮命中后，撤销扫描必须先扫同一工具行，而不是从最远的行重扫全网格。"""
+    board = ToolbarBoard()
+    _run(board)
+    fold_click = next(
+        i
+        for i, point in enumerate(board.clicks)
+        if _inside(ToolbarBoard.FOLD, point)
+    )
+    # 折叠命中后的下一次点击即撤销扫描的第一击：必须落在折叠钮所在行。
+    undo_first = board.clicks[fold_click + 1]
+    assert abs(undo_first[1] - 512.0) <= ToolbarProber.CANDIDATE_STEP // 2
 
 
 def test_probe_stops_mid_scan():
