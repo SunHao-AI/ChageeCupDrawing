@@ -123,3 +123,44 @@ def test_unfold_gives_up_after_max_clicks() -> None:
     ctrl = _controller(board)
     assert ctrl.unfold(TRACK, FOLD) is False
     assert len(board.clicks) == MAX_CLICKS
+
+
+def test_stopped_aborts_before_any_click_or_activate() -> None:
+    # 用户已请求停止：绝不点击、绝不把用户刚切走的窗口抢回前台——反复抢前台
+    # 会让守护的 focus_lost 判定迟迟不成立，停笔被拖成秒级。
+    class StealingBoard(FakePanelBoard):
+        def __init__(self) -> None:
+            super().__init__(open_=False)
+            self.activations = 0
+
+        def foreground_matches(self) -> bool:
+            return False
+
+        def activate(self) -> bool:
+            self.activations += 1
+            return True
+
+    board = StealingBoard()
+    ctrl = PanelController(
+        probe=board, mouse=FakeMouse(board), to_screen=lambda x, y: (x, y),
+        sleep=lambda _s: None, stopped=lambda: True,
+    )
+    assert ctrl.unfold(TRACK, FOLD) is False
+    assert board.clicks == []
+    assert board.activations == 0
+
+
+def test_stop_during_settle_wins_over_further_clicks() -> None:
+    # 第一次点击后用户按下停止：settle 立即醒来且不再补第二轮点击。
+    board = FakePanelBoard(open_=False, toggle_enabled=False)
+    state = {"stop": False}
+
+    def settle(_seconds: float) -> None:
+        state["stop"] = True
+
+    ctrl = PanelController(
+        probe=board, mouse=FakeMouse(board), to_screen=lambda x, y: (x, y),
+        sleep=settle, stopped=lambda: state["stop"],
+    )
+    assert ctrl.unfold(TRACK, FOLD) is False
+    assert len(board.clicks) == 1

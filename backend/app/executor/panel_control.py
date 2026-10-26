@@ -43,11 +43,15 @@ class PanelController:
         mouse: object,
         to_screen: Callable[[float, float], tuple[float, float]],
         sleep: Callable[[float], None] = time.sleep,
+        stopped: Callable[[], bool] = lambda: False,
     ) -> None:
         self._probe = probe
         self._mouse = mouse
         self._to_screen = to_screen
         self._sleep = sleep
+        # 停止意图：开合一次要点 1-2 下、每下都截图+等待，慢环境里累计可达数秒；
+        # 期间用户 ESC/最小化必须能立刻打断（含不再把用户刚切走的窗口抢回来）。
+        self._stopped = stopped
 
     def is_open(self, slider_rect: dict) -> bool | None:
         image = self._probe.capture_image()
@@ -72,11 +76,15 @@ class PanelController:
 
     def _set(self, slider_rect: dict, fold_point: dict, *, want_open: bool) -> bool:
         for _ in range(MAX_CLICKS):
+            if self._stopped():
+                return False
             state = self.is_open(slider_rect)
             if state is None:
                 return False
             if state == want_open:
                 return True
+            if self._stopped():
+                return False
             image = self._probe.capture_image()
             if image is None:
                 return False
@@ -90,10 +98,15 @@ class PanelController:
             sx, sy = self._to_screen(fold_point["x"], fold_point["y"])
             getattr(self._mouse, "click")(sx, sy)
             self._sleep(SETTLE_S)
+        if self._stopped():
+            return False
         state = self.is_open(slider_rect)
         return state is not None and state == want_open
 
     def _ensure_foreground(self) -> None:
-        if not self._probe.foreground_matches():
-            self._probe.activate()
-            self._sleep(0.15)
+        # 已请求停止时绝不 activate：那会把用户刚切走/最小化的窗口抢回前台，
+        # 前台反复易手会让守护的 focus_lost 判定迟迟不成立，停笔被拖成秒级。
+        if self._stopped() or self._probe.foreground_matches():
+            return
+        self._probe.activate()
+        self._sleep(0.15)

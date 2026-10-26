@@ -464,7 +464,10 @@ class ExecutorService:
         # 开合面板，不复用任何工具格/滑杆坐标，因此不会造成跨态误点。
         fold_closed = self._point_dict(tools_collapsed.fold if tools_collapsed else None) or fold_open
 
-        panel = self._make_panel(params, target, mouse, image_size, client, slider_open, fold_open)
+        panel = self._make_panel(
+            params, target, mouse, image_size, client, slider_open, fold_open,
+            handle.stop_event,
+        )
         # 面板当前态：None 表示未知（旧校准无折叠按钮，坐标直接可用）。
         panel_open: bool | None = None
         if panel is not None and slider_open is not None:
@@ -509,7 +512,8 @@ class ExecutorService:
                     # 旧校准的 panel 可能已存在，但其滑杆/折叠坐标已被探测结果替换，
                     # 必须按新坐标重建。
                     panel = self._make_panel(
-                        params, target, mouse, image_size, client, slider_open, fold_open
+                        params, target, mouse, image_size, client, slider_open,
+                        fold_open, handle.stop_event,
                     )
 
         if rendering_calibration and not legacy_mode:
@@ -631,7 +635,7 @@ class ExecutorService:
                             "message": f"工具面板无法展开，第 {bucket + 1} 档沿用当前笔宽"
                         })
                 try:
-                    if switched:
+                    if switched and not handle.stop_event.is_set():
                         # 面板展开后画布可能被工具条撑大（折叠态盖住滑杆区域），
                         # 必须按当前帧重新取画布做守卫，否则滑杆/画笔坐标会被
                         # 折叠态的旧矩形判成「落在画布内」而全部拒点。
@@ -648,7 +652,9 @@ class ExecutorService:
                             mouse, target, (sx, sy), image_size, client,
                             canvas=guard_canvas,
                         ):
-                            time.sleep(0.25)
+                            if handle.stop_event.wait(0.25):
+                                self._finish_stopped(task_id, index, total, started, handle)
+                                return
                             self._emit(task_id, "task.warning", {
                                 "message": f"已切换第 {bucket + 1} 档笔宽（目标行程 {target_frac:.2f}）"
                             })
@@ -659,7 +665,10 @@ class ExecutorService:
                         active_bucket = bucket
                 finally:
                     # 任何异常（含 E_NOT_BRUSH）都先把面板收起，避免遮挡画布下部。
-                    if panel_active and slider_open is not None:
+                    # 停止意图优先于收尾：已停笔则不再绘制，折叠与映射漂移校验毫无
+                    # 意义，且它们在慢环境里各要一次截图，会把停笔拖成秒级。
+                    if (panel_active and slider_open is not None
+                            and not handle.stop_event.is_set()):
                         if panel.fold(slider_open, fold_open):  # type: ignore[union-attr]
                             panel_open = False
                         else:
@@ -670,6 +679,10 @@ class ExecutorService:
                                 primary_exc=sys.exc_info()[0] is not None,
                             )
                     handle.settled_cursor = None
+            if handle.stop_event.is_set():
+                # 换宽过程中被停止（ESC/最小化/接管）：立即收尾，不再补画当前笔。
+                self._finish_stopped(task_id, index, total, started, handle)
+                return
             screen_path = [
                 image_point_to_screen(
                     mapping_rect.x + x * mapping_rect.w / max(1, calibration.rect_w),
@@ -928,6 +941,7 @@ class ExecutorService:
         client: object,
         slider: dict | None,
         fold: dict | None,
+        stop_event: threading.Event,
     ) -> PanelController | None:
         """面板开合控制器：仅自动变粗 + 滑杆与折叠按钮都有坐标时启用。"""
         if not (params.auto_width and slider is not None and fold is not None):
@@ -937,6 +951,10 @@ class ExecutorService:
             probe=target,
             mouse=mouse,
             to_screen=lambda x, y: image_point_to_screen(x, y, image_w, image_h, client),
+            stopped=stop_event.is_set,
+            # 面板开合的每次 settle 都以「停止即醒」等待实现：慢环境里
+            # 0.45s×多轮的开合等待会把用户 ESC/最小化的停笔拖成秒级。
+            sleep=stop_event.wait,
         )
 
     def _click_image_point(
