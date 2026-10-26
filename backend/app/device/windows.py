@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import time
 from ctypes import wintypes
 from dataclasses import dataclass
 
@@ -86,11 +87,65 @@ def window_title(hwnd: int) -> str:
     return buffer.value
 
 
-def activate_window(hwnd: int) -> bool:
-    """把目标窗口带到前台（尽力而为）。
+def _window_thread_id(hwnd: int) -> int:
+    _user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    return int(_user32.GetWindowThreadProcessId(ctypes.c_void_p(int(hwnd)), None) or 0)
 
-    Windows 前台锁只允许当前前台进程改前台，直接 SetForegroundWindow 常被忽略；
-    经典绕法是把自己的输入线程附加到前台线程再调用。恢复最小化后一并处理。
+
+def _attach_thread_input(id_attach: int, id_attach_to: int, attach: bool) -> bool:
+    _user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    _user32.AttachThreadInput.restype = wintypes.BOOL
+    return bool(_user32.AttachThreadInput(
+        ctypes.c_ulong(id_attach), ctypes.c_ulong(id_attach_to), attach))
+
+
+def _set_foreground_window(hwnd: int) -> None:
+    _user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+    _user32.SetForegroundWindow.restype = wintypes.BOOL
+    _user32.SetForegroundWindow(ctypes.c_void_p(int(hwnd)))
+
+
+def _activate_via_foreground_thread(target: int) -> bool:
+    """经典绕法：把自己附加到「当前前台线程」后调用 SetForegroundWindow。
+
+    注意附加方向——必须附到前台线程（而非目标线程）：系统据此认定本线程
+    参与了前台窗口的输入处理，才放行前台切换。附错方向等于没绕，前台锁
+    （SPI_GETFOREGROUNDLOCKTIMEOUT，可被程序改到任意大）仍然拒绝。
+    """
+    current_tid = _kernel32.GetCurrentThreadId()
+    fg_tid = _window_thread_id(foreground_hwnd())
+    if not fg_tid or fg_tid == current_tid:
+        return False
+    if not _attach_thread_input(current_tid, fg_tid, True):
+        return False
+    try:
+        _user32.BringWindowToTop.argtypes = [ctypes.c_void_p]
+        _user32.BringWindowToTop.restype = wintypes.BOOL
+        _user32.BringWindowToTop(ctypes.c_void_p(target))
+        _set_foreground_window(target)
+        _user32.SetActiveWindow.argtypes = [ctypes.c_void_p]
+        _user32.SetActiveWindow.restype = ctypes.c_void_p
+        _user32.SetActiveWindow(ctypes.c_void_p(target))
+        return foreground_matches(target)
+    finally:
+        _attach_thread_input(current_tid, fg_tid, False)
+
+
+def _tap_alt() -> None:
+    """轻点一次 Alt：系统会给最近的输入注入者临时的前台切换权限。"""
+    VK_MENU, KEYEVENTF_KEYUP = 0x12, 0x02
+    _user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_void_p]
+    _user32.keybd_event(VK_MENU, 0, 0, None)
+    _user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, None)
+
+
+def activate_window(hwnd: int) -> bool:
+    """把目标窗口带到前台（尽力而为，三级策略逐级降级）。
+
+    Windows 前台锁（超时可被改成分钟级）会让 SetForegroundWindow 只闪任务栏。
+    依次尝试：附加前台线程 → Alt 轻点后重试 → SwitchToThisWindow（Alt-Tab 的
+    内部入口，不受前台锁限制）。全程以实际前台归属判定成功，不信任返回值。
     """
     target = int(hwnd)
     if not window_alive(target):
@@ -100,32 +155,25 @@ def activate_window(hwnd: int) -> bool:
     if _user32.IsIconic(ctypes.c_void_p(target)):
         SW_RESTORE = 9
         _user32.ShowWindow(ctypes.c_void_p(target), SW_RESTORE)
+    if foreground_matches(target):
+        return True
 
-    fg = foreground_hwnd()
-    _user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
-    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-    target_tid = _user32.GetWindowThreadProcessId(ctypes.c_void_p(target), None)
-    _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
-    current_tid = _kernel32.GetCurrentThreadId()
-    attached = False
-    if fg and target_tid and target_tid != current_tid:
-        _user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
-        _user32.AttachThreadInput.restype = wintypes.BOOL
-        attached = bool(_user32.AttachThreadInput(ctypes.c_ulong(target_tid), ctypes.c_ulong(current_tid), True))
-    try:
-        _user32.BringWindowToTop.argtypes = [ctypes.c_void_p]
-        _user32.BringWindowToTop.restype = wintypes.BOOL
-        _user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
-        _user32.SetForegroundWindow.restype = wintypes.BOOL
-        _user32.SetActiveWindow.argtypes = [ctypes.c_void_p]
-        _user32.SetActiveWindow.restype = ctypes.c_void_p
-        _user32.BringWindowToTop(ctypes.c_void_p(target))
-        _user32.SetForegroundWindow(ctypes.c_void_p(target))
-        if attached:
-            # 附加期间把窗口激活一并转交，成功率更高。
-            _user32.SetActiveWindow(ctypes.c_void_p(target))
-        # 以实际前台归属判定成功：SetForegroundWindow 被前台锁拒绝时只闪任务栏。
-        return foreground_matches(target)
-    finally:
-        if attached:
-            _user32.AttachThreadInput(ctypes.c_ulong(target_tid), ctypes.c_ulong(current_tid), False)
+    if _activate_via_foreground_thread(target):
+        return True
+
+    _tap_alt()
+    _set_foreground_window(target)
+    if foreground_matches(target):
+        return True
+    if _activate_via_foreground_thread(target):
+        return True
+
+    _user32.SwitchToThisWindow.argtypes = [ctypes.c_void_p, wintypes.BOOL]
+    _user32.SwitchToThisWindow.restype = None
+    _user32.SwitchToThisWindow(ctypes.c_void_p(target), True)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if foreground_matches(target):
+            return True
+        time.sleep(0.05)
+    return foreground_matches(target)
