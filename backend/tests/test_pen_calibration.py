@@ -159,9 +159,11 @@ def test_scan_builds_monotonic_table_and_clears() -> None:
 def test_clear_accepts_preexisting_ink() -> None:
     """用户画布刻度带本就有墨（占比≈0.01）时，撤掉测试线即判清空成功。"""
     board = FakeBoard()
-    # 首根测试线正上方一行既有墨迹（用户画布残留）：落进刻度带校验区，
+    # 既有墨迹放在校验带内、首行测试线墨区之上（首档内缩后笔宽 ~6px，
+    # 墨区 67..73；放 68 会被测试线盖住，撤销时连用户墨迹一起抹掉——真实
+    # 画板撤销是恢复上一帧而非刷白，故测试把墨迹摆在互不重叠处）：
     # 要被清空判定的相对基线吸收；旧实现按绝对阈值会误判「未清空」。
-    board.grid[68:69, 46:92] = 0
+    board.grid[64:65, 46:92] = 0
     probe = FakeProbe(board, TRACK)
     calib, _ = _calibrator(board, probe, 5)
     result = calib.run(
@@ -173,7 +175,7 @@ def test_clear_accepts_preexisting_ink() -> None:
     # 基线由标定器用最终 band 在首张图上实测，而不是外部常量推导。
     assert 0.0 < result.baseline_occupied < 0.1
     # 既有墨迹不属于测试线，撤销后必须还在（不能为凑清空多撤别人的笔）。
-    assert board.grid[68, 46:92].max() == 0
+    assert board.grid[64, 46:92].max() == 0
 
 
 def test_uniform_pen_width_falls_back() -> None:

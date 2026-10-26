@@ -247,14 +247,18 @@
         place(eraserBtn, 0.54)
         place(undoBtn, 0.78)
 
-        // 滑杆：透明命中区（160x42）里只放一条 6px 深色条。深色条供识别，
-        // 命中区向下延伸，让候选行 2/3 也能点到滑块（后端按识别到的轨道坐标点）。
+        // 滑杆：透明命中区里只放一条 6px 深色条。深色条供识别，命中区覆盖
+        // 深色条附近一整段，让相邻候选行也能点到滑块（后端按识别到的轨道坐标点）。
+        //
+        // 轨道必须整条位于按钮行（top -1..55）之下：此前轨道 top 44 与按钮下半段
+        // 垂直重叠，后端暗行扫描会把同排深色按钮并进轨道同一个 run，识别出的
+        // rect 左缘被折叠钮拉偏，首尾档点击直接脱靶误触按钮。
         slider.style.left = '12px'
-        slider.style.top = '44px'
+        slider.style.top = '58px'
         slider.style.width = '160px'
-        slider.style.height = '42px'
+        slider.style.height = '34px'
         track.style.left = '0px'
-        track.style.top = '0px'
+        track.style.top = '6px'
         track.style.width = '160px'
         track.style.height = '6px'
         knob.style.width = '14px'

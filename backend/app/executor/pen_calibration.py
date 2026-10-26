@@ -67,6 +67,9 @@ class PenCalibrator:
     MAX_PROBE_STEPS = 14
     # 各档实测宽度差异小于该比例时认为滑杆无效（小程序不支持调宽）。
     MIN_SPREAD_RATIO = 0.18
+    # 档位点击在轨道两端各内缩的比例：识别框边缘可能略超出真实可点行程，
+    # 首尾档贴着边点会脱靶（脱靶点还可能误触轨道旁的其它控件）。
+    TRACK_EDGE_INSET = 0.12
     # 清空判定只看刻度带区域（测试线实际画在哪就查哪）：按整幅画布算占比时，
     # 几行测试线只占 ~0.5%，撤销失败也会被误判成「已清空」。
     CLEAR_CONFIRM_OCCUPIED = 0.003
@@ -166,6 +169,12 @@ class PenCalibrator:
         """
         x, y, w, h = track
         mid_y = y + h / 2.0
+        # 档位点击位置两端内缩：识别框边缘可能压着轨道旁的控件（折叠钮/橡皮格
+        # 与轨道同色同排时，暗行扫描会把它们并进同一个 run），贴边点击会误触
+        # 它们。内缩后 frac 记录的是「实际按住的行程位置」，绘制期执行器按同一
+        # frac 点击，宽度表与落点始终一致。
+        inset = self.TRACK_EDGE_INSET
+        frac_span = 1.0 - 2.0 * inset
         # 测试线放在画布顶部刻度带。行距按「历史最大宽度」增大（滑杆宽度非单调，
         # 只看上一行会让后面的宽线窜进上一行测宽窗）；测宽窗口从上一根线的
         # 下缘起算，上下两根线各占各的窗口；纵向超出画布后换列继续。
@@ -184,7 +193,7 @@ class PenCalibrator:
         for step in range(probe_steps):
             if should_stop():
                 raise CalibrationError("E_STOPPED", "标定被停止")
-            frac = step / max(1, probe_steps - 1)
+            frac = inset + frac_span * step / max(1, probe_steps - 1)
             sx = x + w * frac
             self._ensure_foreground()
             self._click(sx, mid_y)
@@ -225,10 +234,10 @@ class PenCalibrator:
                 image = self._grab()
                 width = measure_ink_width(image, region)
             if width is None:
-                raise CalibrationError(
-                    "E_CALIBRATION_NO_INK",
-                    "标定测试线未出现在画布上（检查滑杆/画布区域框选是否正确）",
-                )
+                # 该档始终没落墨（滑杆某段失灵/被遮挡）：只丢这一档。
+                # 已有档位照常建表，单档脱靶不该毁掉整次标定。
+                on_progress(f"笔宽标定 {step + 1}/{probe_steps}：未落墨，跳过该档")
+                continue
             prev_w = width
             max_w = max(max_w, width)
             results.append((frac, width))
@@ -236,6 +245,11 @@ class PenCalibrator:
             band_bottom = max(band_bottom, band_y + width / 2.0 + 4)
             band_top = min(band_top, band_y - width / 2.0 - 4)
             on_progress(f"笔宽标定 {step + 1}/{probe_steps}：实测 {width:.1f}px")
+        if not results:
+            raise CalibrationError(
+                "E_CALIBRATION_NO_INK",
+                "标定测试线全部未出现在画布上（检查滑杆/画布区域框选是否正确）",
+            )
         band = (int(band_x0), int(band_top), int(band_right - band_x0),
                 int(band_bottom - band_top))
         return results, band
