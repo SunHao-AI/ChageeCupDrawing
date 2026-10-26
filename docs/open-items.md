@@ -1,21 +1,23 @@
 # 未完成事项清单
 
-> 生成时间：2026-10-24（§1.2 验收脚本 BYOK 适配完成后更新）  
-> 用途：本会话收尾盘点，供新会话按条处理。每条包含「描述 / 背景 / 要求 / 完成判据 / 关联文件」。  
-> 本轮（输入主权守护 + 多设备）新增项集中在 **§1A**，已交付项见 §6。
+> 生成时间：2026-10-26（逐段笔宽合入 main 并推送后全面刷新）  
+> 用途：会话收尾盘点，供新会话按条处理。每条包含「描述 / 背景 / 要求 / 完成判据 / 关联文件」。  
+> 真机走查项集中在 **§1A**，本轮逐段笔宽新增工程债集中在 **§1B**，已交付项见 §6。
 
 ## 0. 当前状态快照
 
 | 项目 | 状态 |
 | --- | --- |
-| 后端测试 | `pytest` 全量 **662 项通过**（含守护/设备契约测试，2026-10-25 逐段笔宽 E2E 夹具加固后实测；上一记录为 609） |
-| 后端服务 | 运行中，`127.0.0.1:8765`，`/api/health` = 200（已加载 B2 镜像目标代码） |
+| 后端测试 | `pytest` 全量 **673 项通过**（2026-10-26 镜像 E2E 修复合入后实测） |
+| 无手机全链路 | `tests/manual/mirror_e2e/run_mirror_e2e.py` **ALL PASS（13/13）**（2026-10-26 实测：探测五控件全识别、标定 5 档建表 4/7/8/11/14px、逐段换宽、停笔 719ms、断点续画 DONE） |
+| 逐段笔宽 | 已合入 `main` 并推送远端（fast-forward 至 `0be9314`，含设计/8 Task/终审整改/E2E 阻塞修复共 34 提交）；**真机走查未做**（§1A.6） |
+| 后端服务 | 运行中，`127.0.0.1:8765`，`/api/health` = 200；**运行当前 main 代码** |
+| 运行时数据 | 已重置（2026-10-26）：`cupdraw.db`/uploads/plans/edits 全删，应用自动重建空库；`data/examples/`、`config.json`、`mc_acceptance` 批次保留 |
+| 前端构建 | `frontend/dist` 已重建（2026-10-26 14:22，含换宽粒度参数与提示文案改动） |
 | HTTPS 反代 | 已按要求停止并删除 `deploy/`（2026-10-24），开发直连 `http://127.0.0.1:8765` |
-| 前端构建 | `frontend/dist` 已构建（含 BYOK 改造、响应式断点体系、iPad 字号修复） |
-| 无手机全链路 | `tests/manual/mirror_e2e/run_mirror_e2e.py` ALL PASS（注册→校准→规划→绘制→守护 62ms 停笔→断点续画 2/4→DONE）（2026-10-24 旧夹具通过；双态工具栏夹具 2026-10-25 因输入被全屏独占占用未能实跑，仅静态核对） |
-| 逐段笔宽 | 实现完成（探测+双态位图+容差合批），待真机走查 |
 | 开机自启 | 已按用户要求移除（开发机不做运维配置） |
-| 代码提交 | 本轮全部改动已提交（2026-10-25，未推送远端），见 §3 |
+| 仓库 | 工作区干净；`main` 与 `origin/main` 同步；`feat/per-stroke-width` 已并入并删除 |
+| 已知环境事实 | 本机前台锁 `SPI_GETFOREGROUNDLOCKTIMEOUT`=200000ms（第三方程序所致）；`activate_window` 已用三级降级策略绕开（提交 `6d931cb`），无需改系统设置 |
 
 ---
 
@@ -84,7 +86,7 @@
 
 ### 1A.6 真机控件探测与逐段换宽走查 ❗高
 
-- **状态**：夹具与断言已就绪，**待桌面可交互后复跑**（2026-10-25 首次尝试因输入注入被全屏独占程序占用而 BLOCKED）。
+- **状态**：**镜像夹具 E2E 已全绿**（2026-10-26，13/13 ALL PASS）；仍待真实「霸王茶姬」小程序画板走查（真机控件外观/延迟/折叠行为与夹具不同）。
 - **描述**：在真实小程序画板上验收「首绘前行为探测 + 按容差分桶换宽」。无手机 E2E 夹具已按探测要求合成工具条（折叠/画笔/橡皮/撤销/滑杆，见 [canvas.html](file:///d:/Workplace/ChageeCupDrawing/backend/tests/manual/mirror_e2e/canvas.html)），但真实小程序的控件外观、响应延迟与折叠行为只有真机能确认。
 - **背景**：探测按行为判据工作（折叠看滑杆轨道消失/出现、撤销看刻度带墨量掉到 40% 以下、橡皮/画笔看重描后线是否消失），任一控件外观或行为与假设不符都会退化为「探测失败 → 回退单细笔」或误点。夹具初始即橡皮态，用于验证「首绘前自动切回画笔」这条路径。
 - **要求**：
@@ -95,6 +97,28 @@
   5. **探测耗时**：记录首绘从 `ARMING` 到第一笔的实际耗时（候选点逐点截图，期望 ≤ 3 分钟；若明显超时需评估缩小扫描行数）。
 - **完成判据**：上述 5 项均有实测记录；探测失败时能按警告回退单细笔且不误点画布。
 - **关联**：[toolbar_probe.py](file:///d:/Workplace/ChageeCupDrawing/backend/app/executor/toolbar_probe.py)、[service.py](file:///d:/Workplace/ChageeCupDrawing/backend/app/executor/service.py) 的 `_arm_and_draw`、[pen_calibration.py](file:///d:/Workplace/ChageeCupDrawing/backend/app/executor/pen_calibration.py)
+
+---
+
+## 1B. 逐段笔宽工程债（2026-10-26 终审/实现遗留，可独立开工）
+
+### 1B.1 探测结果未回写 slider/undo/fold 列，RunView 横幅常驻 ✅已按方案 A 修复（2026-10-26）
+
+- **描述**：探测成功后 `_persist_probed_calibration`（[service.py](file:///d:/Workplace/ChageeCupDrawing/backend/app/executor/service.py) 约 L1252）只写 `tools_open` 位图，`slider`/`undo`/`fold` 三列仍传旧值 `calibration.slider` 等（人工未标则恒为 None）。前端 [RunView.vue](file:///d:/Workplace/ChageeCupDrawing/frontend/src/views/RunView.vue) L132 的横幅判据是 `autoWidth && !calibration.slider`，导致探测完全成功的项目横幅也常驻，误导用户去校准页手动补标。
+- **落地情况**：采纳方案 A——横幅判据改为 `autoWidth && !slider && !toolsOpen`（探测成功即 `tools_open` 有值，横幅消失；探测失败仍显示）。列语义保持「人工标注」，探测与人工不混存。前端无测试框架，为单个 `v-if` 引入 vitest 不成比例；数据链路已由 `test_api_contract.py` 的 `toolsOpen` 回传用例覆盖。已验证：`vue-tsc + vite build` 通过、`dist` 已重建、后端相关 54 项测试通过。
+- **关联**：同上；[settings_store.py](file:///d:/Workplace/ChageeCupDrawing/backend/app/services/settings_store.py)
+
+### 1B.2 `tools_collapsed` 恒为 None 的死路径 ✅已按方向 ② 处置（2026-10-26）
+
+- **描述**：探测只产出展开态位图，写回时 `tools_collapsed=None`（[service.py](file:///d:/Workplace/ChageeCupDrawing/backend/app/executor/service.py) L1284）。执行器里所有走 `tools_collapsed` 的分支（收起态画笔校验 [L1070-1078](file:///d:/Workplace/ChageeCupDrawing/backend/app/executor/service.py)、`fold_closed` 回退 L465）对自动探测的项目永远不生效，只有人工校准显式提供才有意义。
+- **落地情况**：采纳方向 ②——无行为改动；[models.py](file:///d:/Workplace/ChageeCupDrawing/backend/app/store/models.py) 字段注释、`_persist_probed_calibration` 写回处注释、[per-stroke-width-design.md](file:///d:/Workplace/ChageeCupDrawing/docs/per-stroke-width-design.md) §2 均已明示：收起态位图无自动产出路径，校准页亦无收起态标注 UI，仅可能由校准 API 透传写入（注：方向 ①「探测顺手补采收起态位图」如未来要做，需连同校准页收起态标注 UI 一并考虑）。
+- **关联**：同前。
+
+### 1B.3 I2「画笔态未知放行」与计划全局约束冲突 ✅已裁决：维持报错终止（2026-10-26）
+
+- **描述**：计划（docs/superpowers/plans/2026-10-25-per-stroke-width.md）全局约束写「旧校准必须能继续工作、只 warning 不报错」；而实现里 `E_NOT_BRUSH` 在「点画笔后复检仍非画笔」时会**报错终止**。两种语义在「旧校准 + 疑似橡皮态」场景下冲突：保守拒绝绘制可能挡住本可完成的续画，放行则可能用橡皮擦用户画作。
+- **裁决与落地**：用户裁决维持现状（安全侧：宁可停下也不误擦）。已修订计划文档 Global Constraints，在「不得报错」条目下注明安全侧例外——该约束只覆盖坐标缺失/降级路径，「点画笔后复检仍非画笔」视为工具条不可信，报 `E_NOT_BRUSH` 终止。实现不动；设计文档 §2「绝不下笔」表述本就与实现一致。
+- **现状**：计划文档、实现行为、本清单三者对「画笔态不可确认」的表述已一致。
 
 ---
 
@@ -171,3 +195,5 @@
 - **B2 镜像目标**：`MirrorService`（scrcpy 启动 + adb 枚举 + 注册表持久化）+ `MirrorTarget` + `GET/POST/DELETE /api/devices*` + 校准记录带 `deviceKind/deviceSerial`
 - **多设备控制端**：全局 `.split` 断点体系（<1024px 单列）、触摸目标 ≥44 px、iPad 字号判据修正为 `(pointer: coarse), (max-width: 1376px)`（防 iPadOS 桌面级浏览伪装指针）、`CUPDRAW_BIND` 局域网模式
 - 无手机全链路夹具 `backend/tests/manual/mirror_e2e/`（可重复回归镜像链路）
+- **逐段笔宽（2026-10-26 合入 main，见 `0be9314`）**：`ToolbarProber` 行为探测（折叠/滑杆/撤销/橡皮/画笔）、双态工具位图持久化、`width_buckets` 容差分桶（桶数由 `widthTolerance` 推导）、`PenCalibrator` 相对基线清理、探测结果写回校准记录、前端「换宽粒度」参数取代档数
+- **探测/标定/守护稳定性修复（同一批合入）**：窗口前置三级降级策略（绕开分钟级前台锁，`6d931cb`）；撤销预算按发出笔数全计 + 候选同行结构先验（`435d1fe`）；标定档位两端内缩 + 单档无墨跳过 + 夹具轨道脱离按钮行（`18515bc`）；面板开合与换宽收尾响应停止意图，停笔延迟 2s+→0.7s（`d439b5e`）

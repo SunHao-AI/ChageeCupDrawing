@@ -46,7 +46,10 @@ class CanvasProfile:
     undo: dict | None = None
     # 画板下方工具面板折叠按钮中心点 {"x","y"}：换笔间隙自动收起面板。
     fold: dict | None = None
-    # 面板展开/折叠两态工具位图（ToolbarProber 行为探测产物，人工兜底可覆盖单项）。
+    # 面板展开/折叠两态工具位图（人工兜底可覆盖单项）。ToolbarProber 行为探测
+    # 只在展开态跑，仅产出 tools_open；tools_collapsed 无自动产出路径，校准页
+    # 也暂未提供收起态标注 UI，当前只可能由校准 API 透传写入，故自动项目该列
+    # 恒为 None（执行器收起态画笔校验分支对其不生效）。
     tools_open: dict | None = None
     tools_collapsed: dict | None = None
     # 绘制目标类型：pc=本机窗口；mirror=scrcpy 投屏窗口（注入与守护同 PC 窗口）；

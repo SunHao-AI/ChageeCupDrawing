@@ -1281,6 +1281,8 @@ class ExecutorService:
             undo=calibration.undo,  # type: ignore[attr-defined]
             fold=calibration.fold,  # type: ignore[attr-defined]
             tools_open=asdict(stored),
+            # 探测只在展开态完成，不产出收起态位图；tools_collapsed 无自动产出
+            # 路径（校准页亦无收起态标注 UI），自动探测的项目该列始终为 None。
             tools_collapsed=None,
             device_kind=calibration.device_kind,  # type: ignore[attr-defined]
             device_serial=calibration.device_serial,  # type: ignore[attr-defined]

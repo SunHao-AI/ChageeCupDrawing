@@ -39,6 +39,8 @@ toolsOpen:       { brush, eraser, slider, undo, fold, brushSelectedLum, brushIdl
 toolsCollapsed:  { 同上（折叠态各点位；折叠态无滑杆时 slider=None） }
 ```
 
+- 当前实现中 `toolsCollapsed` 无自动产出路径（探测只在展开态完成），校准页亦无收起态标注 UI，仅可能由校准 API 透传写入；执行器的收起态画笔校验与 `fold_closed` 回退分支对自动探测的项目不生效，行为安全地降级为「展开后按展开位图校验」。
+
 - 旧记录（无新字段）读取为 `None`：行为回退现状（单套坐标、无画笔校验），发 `task.warning`「旧校准：无法校验画笔态」，不阻塞续画。
 - 绘制时先用 `PanelController.is_open` 判当前态，**取对应态坐标集**，不再跨态平移。
 - **换笔时序固化**：展开(校验) → 校验画笔态，非画笔则点 brush 并复检 → 点滑杆到目标位 → 折叠(校验)。橡皮按钮绘制全程永不点击。

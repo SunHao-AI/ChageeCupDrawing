@@ -129,7 +129,7 @@ onUnmounted(() => {
         @change="onParamChanged"
       />
       <div
-        v-if="paramsStore.exec.autoWidth && !projectStore.calibration?.slider"
+        v-if="paramsStore.exec.autoWidth && !projectStore.calibration?.slider && !projectStore.calibration?.toolsOpen"
         class="banner banner-warn auto-width-tip"
       >
         程序会先自动探测工具栏控件；个别控件识别失败时，再到「校准」页手动补标粗细滑杆轨道（建议同时标记撤销按钮与「∨」折叠按钮，分别用于标定后自动清空画布、绘制时自动折叠工具面板）。
