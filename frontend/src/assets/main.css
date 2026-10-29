@@ -46,6 +46,12 @@ button {
   font-family: inherit;
 }
 
+/* 统一焦点环：键盘导航时所有可交互控件给出一致的金色描边（outline 自动跟随圆角） */
+:focus-visible {
+  outline: 2px solid var(--gold-soft);
+  outline-offset: 1px;
+}
+
 a {
   color: var(--gold);
 }
@@ -60,6 +66,7 @@ a {
   border: 1px solid var(--line-soft);
   border-radius: var(--radius);
   padding: 14px 16px;
+  box-shadow: 0 10px 28px -22px rgba(0, 0, 0, 0.9);
 }
 
 .card-title {
@@ -108,8 +115,13 @@ a {
 }
 
 .btn-danger {
-  border-color: var(--red);
+  border-color: rgba(217, 108, 95, 0.55);
   color: var(--red);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: rgba(217, 108, 95, 0.12);
+  border-color: var(--red);
 }
 
 .btn-sm {

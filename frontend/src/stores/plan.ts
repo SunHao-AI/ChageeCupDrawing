@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { shallowRef } from 'vue'
 import * as api from '@/api/endpoints'
-import type { PlanSummary } from '@/api/types'
+import type { PlanParams, PlanSummary } from '@/api/types'
 import { errorMessage } from '@/utils/error'
 import { useParamsStore } from './params'
 import { useProjectStore } from './project'
@@ -100,5 +100,14 @@ export const usePlanStore = defineStore('plan', () => {
     }
   }
 
-  return { summary, pending, error, schedule, run, cancel, clear }
+  /** 刷新后恢复上次规划结果；参数与签名对齐，避免挂载时的 watch 触发重规划。 */
+  function restore(saved: PlanSummary & { params: PlanParams }) {
+    const paramsStore = useParamsStore()
+    paramsStore.replacePlan(saved.params)
+    paramsStore.markPlanned()
+    summary.value = saved
+    lastSignature = JSON.stringify(paramsStore.plan)
+  }
+
+  return { summary, pending, error, schedule, run, cancel, clear, restore }
 })

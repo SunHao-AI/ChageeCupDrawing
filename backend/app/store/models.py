@@ -41,21 +41,31 @@ class CanvasProfile:
     source: str
     confidence: float
     captured_at: str
+    # 产出本份校准那一刻的截图帧尺寸（0=旧库无此信息）：校准页标注层据此
+    # 对齐坐标系，避免回退实时截图 naturalSize 时两帧不一致导致缩放失真。
+    frame_w: int = 0
+    frame_h: int = 0
     # 自动变粗（粗细滑杆标定）：截图坐标系下的轨道区域 {"x","y","w","h"} 与撤销按钮 {"x","y"}。
     slider: dict | None = None
     undo: dict | None = None
     # 画板下方工具面板折叠按钮中心点 {"x","y"}：换笔间隙自动收起面板。
     fold: dict | None = None
-    # 面板展开/折叠两态工具位图（人工兜底可覆盖单项）。ToolbarProber 行为探测
-    # 只在展开态跑，仅产出 tools_open；tools_collapsed 无自动产出路径，校准页
-    # 也暂未提供收起态标注 UI，当前只可能由校准 API 透传写入，故自动项目该列
-    # 恒为 None（执行器收起态画笔校验分支对其不生效）。
+    # 面板展开/折叠两态工具位图（人工兜底可覆盖单项）。展开态由 ToolbarProber
+    # 行为探测产出；tools_collapsed 由一键自动校准末尾的「收起面板→重扫」追加
+    # 产出（收起态重扫失败时仍为 None），校准 API 也可透传覆盖。
     tools_open: dict | None = None
     tools_collapsed: dict | None = None
+    # 自动校准快照 ID：产出本份校准那一刻的截图帧存为项目目录下
+    # snapshot_{id}.jpg，校准页标注层据此锚定同一帧（帧不符则淡出标注）。
+    snapshot_id: str | None = None
     # 绘制目标类型：pc=本机窗口；mirror=scrcpy 投屏窗口（注入与守护同 PC 窗口）；
     # adb=直连预留。serial 标识来源设备，供设备丢失时给出准确提示。
     device_kind: str = "pc"
     device_serial: str | None = None
+    # 空白画布基线掩码（canvas_blankness L2）：{"w","h","mask"}，mask 为 1/8
+    # 下采样墨迹布尔掩码的 base64。判空白时与当前帧掩码比对，水印/纹理等常驻
+    # 背景进基线后不再干扰。
+    blank_baseline: dict | None = None
 
 
 @dataclass(frozen=True)

@@ -51,6 +51,8 @@ export const useEditStore = defineStore('edit', () => {
     error.value = null
     try {
       const result = await api.revertProject(project.projectId, targetVersion)
+      // 复原在途时项目已被清除/更换：写回旧项目会让它在前端「复活」。
+      if (!projectStore.isCurrentProject(project.projectId)) return
       projectStore.project = {
         ...project,
         imageUrl: `${result.imageUrl}?v=${result.sourceVersion}`,
@@ -115,9 +117,13 @@ export const useEditStore = defineStore('edit', () => {
     if (!current || busy.value) return
     busy.value = true
     error.value = null
+    const projectId = useProjectStore().project?.projectId
     try {
       const result = await api.applyEdit(current.editId)
       const projectStore = useProjectStore()
+      // 应用（走模型，可达数十秒）在途时项目已被清除/更换：不得把编辑结果写回
+      // 别的项目，更不能对已清除的项目重新规划。
+      if (!projectId || !projectStore.isCurrentProject(projectId)) return
       if (projectStore.project) {
         projectStore.project = {
           ...projectStore.project,

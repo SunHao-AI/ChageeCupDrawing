@@ -34,3 +34,14 @@ def create_preset(payload: PresetCreate, request: Request) -> dict[str, object]:
         name=name, params=payload.params.model_dump(by_alias=True)
     )
     return _preset(preset)
+
+
+@router.delete("/presets/{preset_id}", status_code=204)
+def delete_preset(preset_id: str, request: Request) -> None:
+    store = request.app.state.store
+    if store.delete_preset(preset_id):
+        return
+    # 删不动的两种情况分开报：内置不可删 vs 根本不存在，前端提示才准确。
+    if any(p.id == preset_id for p in store.list_presets()):
+        raise ApiError(409, "E_BUILTIN_PRESET", "内置预设不可删除")
+    raise ApiError(404, "E_NOT_FOUND", "预设不存在")

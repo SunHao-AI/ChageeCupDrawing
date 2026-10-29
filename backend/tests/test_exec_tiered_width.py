@@ -126,6 +126,8 @@ class FakeMouse:
 
 
 class FakeTarget:
+    kind = "win32"
+
     def __init__(self, board: FakeBoard) -> None:
         self.board = board
 
@@ -226,6 +228,7 @@ def _calibration(*, tools_open=None, tools_collapsed=None, slider=TRACK, fold=FO
         fold=dict(fold) if fold is not None else None,
         tools_open=tools_open,
         tools_collapsed=tools_collapsed,
+        blank_baseline=None,
         hwnd=1,
         window_title="fake",
         capture_method="win32",
@@ -584,6 +587,63 @@ def test_uses_collapsed_bitmap_when_panel_folded() -> None:
     assert len(mouse.drags) == 2
 
 
+def test_missing_collapsed_bitmap_triggers_rescan(monkeypatch) -> None:
+    """N-4：复制的校准只有 tools_open、缺 tools_collapsed 且面板折叠时，按需补学展开钮。
+
+    展开钮缺失会导致「面板无法展开→标定跳过→单细笔+跳过画笔校验」；补学后应
+    展开、标定、换宽全链路恢复正常，并把收起态位图（含展开钮）持久化。
+    """
+    calls: list[dict] = []
+
+    class RescanProber:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def run(self, **kwargs) -> ToolBitmap:
+            calls.append(kwargs)
+            return ToolBitmap(
+                brush=BRUSH_OPEN,
+                eraser=ERASER_OPEN,
+                slider=dict(TRACK),
+                undo=(UNDO["x"], UNDO["y"]),
+                fold=(FOLD["x"], FOLD["y"]),
+                brush_selected_lum=SELECTED_LUM,
+                brush_idle_lum=IDLE_LUM,
+                collapsed=ToolBitmap(
+                    brush=BRUSH_CLOSED,
+                    eraser=ERASER_OPEN,
+                    slider=None,
+                    undo=(UNDO["x"], UNDO["y"]),
+                    fold=(FOLD["x"], FOLD["y"]),
+                    brush_selected_lum=SELECTED_LUM,
+                    brush_idle_lum=IDLE_LUM,
+                ),
+            )
+
+    monkeypatch.setattr(service, "ToolbarProber", RescanProber)
+    monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    _CALIBRATOR_INSTANCES.clear()
+    calibration = _calibration(tools_open=_tools())
+    store = FakeStore(calibration)
+    board = FakeBoard(open_=False)
+    params = ExecParams(auto_width=True, width_table=None, width_tolerance=0.05)
+
+    mouse = _run(store, board, _paths(3), params)
+
+    # 触发了收起态重扫，且把已知展开态位图整体作为兜底传入。
+    assert calls and calls[-1].get("rescan_collapsed") is True
+    assert calls[-1]["open_bitmap"].fold == pytest.approx((FOLD["x"], FOLD["y"]))
+    # 收起态位图（含展开钮）被持久化，下次读取即获得展开能力。
+    saved = store.saved[-1]
+    assert saved["tools_collapsed"] is not None
+    assert saved["tools_collapsed"]["fold"] == pytest.approx((FOLD["x"], FOLD["y"]))
+    # 补学展开钮后标定与换宽恢复：不再「面板无法展开→单细笔」。
+    assert _CALIBRATOR_INSTANCES
+    assert _slider_clicks(mouse)
+    assert store.status == "DONE"
+
+
 class _FakeProber:
     """探测成功并返回本次截图帧（new_rect 坐标系）下的工具位图。"""
 
@@ -904,9 +964,85 @@ def test_probe_skipped_when_canvas_not_blank(monkeypatch) -> None:
 
     assert prober_calls == []  # 探测根本未启动
     assert store.saved == []  # 没有写入任何探测结果
-    assert any("画布非空白，已跳过工具条自动探测" in m for m in store.warnings())
+    assert any("画布上已有笔迹，已跳过工具条自动探测" in m for m in store.warnings())
     # 沿用既有降级：无滑杆 → 单细笔绘制，仍完成任务。
     assert any("未标定粗细滑杆" in m for m in store.warnings())
+    assert len(mouse.drags) == 1
+    assert store.status == "DONE"
+
+
+def _warning_codes(store: FakeStore) -> list[str | None]:
+    return [
+        payload.get("code")
+        for event_type, payload in store.events
+        if event_type == "task.warning"
+    ]
+
+
+def test_probe_runs_without_auto_width(monkeypatch) -> None:
+    """§6.1：探测与自动变粗解耦——单细笔模式首画且无双态位图也探测。
+
+    撤销/折叠/画笔坐标的价值独立于笔宽；探测成功即持久化，且单细笔模式
+    没有后续 panel 收起流程，探测后必须就地折回面板，否则画布下部一直被遮。
+    """
+    monkeypatch.setattr(service, "ToolbarProber", _FakeProber)
+    _CALIBRATOR_INSTANCES.clear()
+    monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
+    store = FakeStore(_calibration(tools_open=None, slider=None, fold=None))
+    board = FakeBoard(open_=True)
+    params = ExecParams(auto_width=False)
+
+    mouse = _run(store, board, _paths(2), params)
+
+    saved = store.saved[-1]
+    assert saved["source"] == "probe"
+    assert saved["tools_open"]["undo"] == pytest.approx((UNDO["x"], UNDO["y"]))
+    assert _CALIBRATOR_INSTANCES == []  # 单细笔模式绝不触发标定
+    assert _slider_clicks(mouse) == []  # 没有换宽点击
+    assert board.open is False  # 探测展开的面板已就地折回
+    assert len(mouse.drags) == 2
+    assert store.status == "DONE"
+
+
+def test_probe_skipped_dirty_warning_carries_code(monkeypatch) -> None:
+    """§7.2：脏画布跳过探测的 warning 必须带结构化 code，供前端渲染引导卡。"""
+    prober_calls: list[object] = []
+
+    class RecordingProber(_FakeProber):
+        def __init__(self, **kwargs) -> None:
+            prober_calls.append(self)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(service, "ToolbarProber", RecordingProber)
+    store = FakeStore(_calibration(tools_open=None, slider=None, fold=None))
+    params = ExecParams(auto_width=False)
+
+    mouse = _run(store, _InkedBoard(open_=True), _paths(1), params)
+
+    assert prober_calls == []
+    assert "probe_skipped_dirty" in _warning_codes(store)
+    assert len(mouse.drags) == 1
+    assert store.status == "DONE"
+
+
+def test_probe_failure_warning_carries_code(monkeypatch) -> None:
+    """§7.2：探测失败的 warning 带 probe_failed 码；失败只降级不阻断绘制。"""
+
+    class FailingProber:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def run(self, **_kwargs) -> ToolBitmap:
+            raise ProbeError("E_NO_TOOLBAR", "画布下方未找到工具条")
+
+    monkeypatch.setattr(service, "ToolbarProber", FailingProber)
+    store = FakeStore(_calibration(tools_open=None, slider=None, fold=None))
+    params = ExecParams(auto_width=False)
+
+    mouse = _run(store, FakeBoard(open_=True), _paths(1), params)
+
+    assert store.saved == []  # 失败不落探测记录
+    assert "probe_failed" in _warning_codes(store)
     assert len(mouse.drags) == 1
     assert store.status == "DONE"
 
@@ -923,9 +1059,10 @@ def test_canvas_blank_gate_uses_pixels_not_fraction() -> None:
 
     svc = _service(FakeStore(_calibration()), FakeMouse(FakeBoard(open_=True)))
     rect = service.Rect(*CANVAS[:2], CANVAS[2] - CANVAS[0], CANVAS[3] - CANVAS[1])
+    calibration = _calibration()
     blank = np.full(SIZE, 255, dtype=np.uint8)
-    assert svc._canvas_is_blank(_ImageTarget(blank), rect) is True
+    assert svc._canvas_is_blank(_ImageTarget(blank), rect, calibration) is True
 
     residue = blank.copy()
     residue[250:253, 250:296] = 0  # 46×3 = 138 px，正是探测测试线的量级
-    assert svc._canvas_is_blank(_ImageTarget(residue), rect) is False
+    assert svc._canvas_is_blank(_ImageTarget(residue), rect, calibration) is False

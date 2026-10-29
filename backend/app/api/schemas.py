@@ -80,6 +80,24 @@ class PlanRequest(CamelModel):
     params: PlanParams = Field(default_factory=PlanParams)
 
 
+class ClearCanvasRequest(CamelModel):
+    """I19 清空画布。confirmDirtyProbe=「我确认画布上的墨迹可以丢弃」。"""
+
+    confirm_dirty_probe: bool = False
+
+
+class AutoCalibrationRequest(CamelModel):
+    """I20 一键自动校准。全新项目必须带 hwnd（前端窗口选择器）；已校准项目可缺省。
+
+    targets 限定单独识别范围（canvas/fold/slider/undo/eraser/brush），
+    缺省或含 "all" 为全量；未选中的控件沿用既有坐标作人工兜底。
+    """
+
+    hwnd: int | None = Field(default=None, gt=0)
+    confirm_dirty_probe: bool = False
+    targets: list[str] | None = Field(default=None, max_length=6)
+
+
 class MirrorStartRequest(CamelModel):
     serial: str = Field(min_length=1, max_length=64)
 
@@ -108,6 +126,8 @@ class ExecParamsModel(CamelModel):
     focus_guard: bool = True
     cursor_takeover_px: float = Field(default=6.0, ge=2.0, le=100.0)
     guard_poll_ms: float = Field(default=50.0, ge=10.0, le=500.0)
+    # 画布差分守护：mirror 目标上每条笔迹结束后比对画布，检出手指误触墨迹。
+    canvas_guard: bool = True
     # 自动变粗：绘制前自动识别工具条、标定笔宽并按目标行程逐段换笔。
     auto_width: bool = True
     # 换宽容差：目标行程差超过该值才换一次笔（越小越细腻越慢）。

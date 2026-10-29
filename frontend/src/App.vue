@@ -1,9 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, shallowRef } from 'vue'
-import { health } from '@/api/endpoints'
+import { getResumeState, health } from '@/api/endpoints'
+import { ApiError } from '@/api/client'
 import StepperBar from '@/components/StepperBar.vue'
+import { usePlanStore } from '@/stores/plan'
+import { useParamsStore } from '@/stores/params'
 import { useProjectStore } from '@/stores/project'
+import { useTaskStore } from '@/stores/task'
 import type { ViewKey } from '@/views/types'
+import { readLastProjectId, readLastView, writeLastProjectId, writeLastView } from '@/utils/session'
 import StudioView from '@/views/StudioView.vue'
 import CalibrateView from '@/views/CalibrateView.vue'
 import RunView from '@/views/RunView.vue'
@@ -22,7 +27,14 @@ const VIEWS: { key: ViewKey; label: string }[] = [
 const aiStore = useAiStore()
 
 const projectStore = useProjectStore()
-const current = shallowRef<ViewKey>('studio')
+const planStore = usePlanStore()
+const paramsStore = useParamsStore()
+const taskStore = useTaskStore()
+const VIEW_KEYS: ViewKey[] = ['studio', 'calibrate', 'run', 'presets', 'settings']
+const lastView = readLastView()
+const current = shallowRef<ViewKey>(
+  lastView && (VIEW_KEYS as string[]).includes(lastView) ? (lastView as ViewKey) : 'studio',
+)
 const backend = shallowRef<{ ok: boolean; version: string }>({ ok: false, version: '' })
 
 // 直接双击 dist/index.html 打开时 fetch('/api/…') 会解析到 file:// 而失败。
@@ -41,6 +53,7 @@ const currentComponent = computed(
 
 function onGoto(view: ViewKey) {
   current.value = view
+  writeLastView(view)
 }
 
 // 全局拦截：拖文件落到非投放区时阻止浏览器导航到 file://（表现为 404/白页）。
@@ -58,10 +71,32 @@ async function ping() {
   }
 }
 
+/** 按浏览器记住的项目 ID 恢复校准/规划/任务；项目已删除时清掉记忆即可。 */
+async function restoreSession() {
+  const projectId = readLastProjectId()
+  if (!projectId) return
+  try {
+    const state = await getResumeState(projectId)
+    // 恢复请求在途时用户已抢先导入新图：旧项目的恢复不得覆盖新项目。
+    if (projectStore.project) return
+    await projectStore.restore(state.project, state.calibration)
+    if (state.plan) planStore.restore(state.plan)
+    if (state.task) {
+      // 执行参数跟随任务落库值，保证续画时面板显示与实际执行一致。
+      paramsStore.replaceExec(state.task.exec)
+      await taskStore.restore(state.task)
+    }
+  } catch (e) {
+    // 只有「项目确实不存在」才清记忆；后端未就绪等瞬时失败保留记忆待下次重试。
+    if (e instanceof ApiError && e.code === 'E_NOT_FOUND') writeLastProjectId(null)
+  }
+}
+
 onMounted(() => {
   ping()
   aiStore.load()
   projectStore.refreshWindows()
+  restoreSession()
   window.addEventListener('dragover', blockFileNavigation)
   window.addEventListener('drop', blockFileNavigation)
 })
@@ -76,7 +111,7 @@ onUnmounted(() => {
   <div class="shell">
     <header class="topbar">
       <div class="brand">
-        <span class="brand-mark"></span>
+        <img class="brand-mark" src="/chagee-logo.png" alt="霸王茶姬" />
         <span class="brand-name">杯贴绘制工作台</span>
         <span class="badge" :class="backend.ok ? 'badge-gold' : ''">
           {{ backend.ok ? `服务正常 v${backend.version}` : '后端未连接' }}
@@ -112,7 +147,9 @@ onUnmounted(() => {
     <StepperBar @goto="onGoto" />
 
     <main class="content scroll">
-      <component :is="currentComponent" @goto="onGoto" />
+      <Transition name="fade" mode="out-in">
+        <component :is="currentComponent" :key="current" @goto="onGoto" />
+      </Transition>
     </main>
   </div>
 </template>
@@ -142,11 +179,11 @@ onUnmounted(() => {
 }
 
 .brand-mark {
-  width: 14px;
-  height: 14px;
-  border-radius: 4px;
-  background: linear-gradient(135deg, var(--gold) 0%, var(--gold-soft) 100%);
-  box-shadow: 0 0 12px rgba(216, 169, 78, 0.4);
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: block;
+  box-shadow: 0 0 14px rgba(226, 35, 26, 0.35);
 }
 
 .brand-name {
@@ -201,6 +238,25 @@ onUnmounted(() => {
 .content {
   flex: 1;
   padding: 18px 20px 28px;
+}
+
+/* 视图切换淡入淡出：短促克制，避免生硬跳变 */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.14s ease, transform 0.14s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+  transform: translateY(4px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fade-enter-active,
+  .fade-leave-active {
+    transition: none;
+  }
 }
 
 .file-hint {

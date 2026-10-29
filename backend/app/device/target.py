@@ -89,3 +89,15 @@ def resolve_target(
     """按校准记录的 device_kind 分发；未知种类按 PC 处理（历史数据兼容）。"""
     cls = MirrorTarget if calibration.device_kind == "mirror" else Win32Target
     return cls(calibration.hwnd, device, probe)
+
+
+def find_live_hwnd_by_title(device: DeviceService, title: str) -> int | None:
+    """按窗口标题找回唯一存活的同名窗口句柄。
+
+    小程序重启、窗口重建后句柄会变，但同名窗口只有一个时重绑几乎无歧义；
+    同名多个（开了好几个小程序）或一个都没有时返回 None，交回调用方报错。
+    """
+    if not title:
+        return None
+    matches = [w.hwnd for w in device.list_windows() if w.title == title]
+    return matches[0] if len(matches) == 1 else None

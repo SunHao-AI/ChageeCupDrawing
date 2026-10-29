@@ -72,6 +72,13 @@ class Store:
     def edit_dir(self, edit_id: str) -> Path:
         return self.edits_dir / edit_id
 
+    def snapshot_path(self, project_id: str, snapshot_id: str) -> Path:
+        """自动校准快照帧图片路径（随项目目录整体删除，无需单独清理）。"""
+        return self.project_dir(project_id) / f"snapshot_{snapshot_id}.jpg"
+
+    def new_snapshot_id(self) -> str:
+        return uuid.uuid4().hex
+
     def new_project_id(self) -> str:
         return uuid.uuid4().hex
 
@@ -175,6 +182,10 @@ class Store:
         tools_collapsed: dict | None = None,
         device_kind: str = "pc",
         device_serial: str | None = None,
+        blank_baseline: dict | None = None,
+        snapshot_id: str | None = None,
+        frame_w: int = 0,
+        frame_h: int = 0,
     ) -> CanvasProfile:
         profile = CanvasProfile(
             id=uuid.uuid4().hex,
@@ -186,6 +197,8 @@ class Store:
             rect_y=int(rect_y),
             rect_w=int(rect_w),
             rect_h=int(rect_h),
+            frame_w=int(frame_w),
+            frame_h=int(frame_h),
             dpi_scale=float(dpi_scale),
             source=source,
             confidence=float(confidence),
@@ -197,14 +210,17 @@ class Store:
             tools_collapsed=tools_collapsed,
             device_kind=device_kind,
             device_serial=device_serial,
+            blank_baseline=blank_baseline,
+            snapshot_id=snapshot_id,
         )
         with self._write() as conn:
             conn.execute(
                 "INSERT INTO canvas_profile (id, project_id, hwnd, window_title, capture_method,"
                 " rect_x, rect_y, rect_w, rect_h, dpi_scale, source, confidence,"
                 " slider_json, undo_json, fold_json, tools_open_json, tools_collapsed_json,"
-                " device_kind, device_serial, captured_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " device_kind, device_serial, blank_baseline_json, snapshot_id,"
+                " frame_w, frame_h, captured_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     profile.id,
                     profile.project_id,
@@ -225,6 +241,10 @@ class Store:
                     json.dumps(tools_collapsed) if tools_collapsed else None,
                     device_kind,
                     device_serial,
+                    json.dumps(blank_baseline) if blank_baseline else None,
+                    snapshot_id,
+                    profile.frame_w,
+                    profile.frame_h,
                     profile.captured_at,
                 ),
             )
@@ -326,6 +346,16 @@ class Store:
             row = conn.execute("SELECT * FROM draw_task WHERE id = ?", (task_id,)).fetchone()
         return _task(row) if row else None
 
+    def latest_task_for_project(self, project_id: str) -> TaskRecord | None:
+        """项目最近一次绘制任务（任何状态），供前端刷新后恢复续画上下文。"""
+        with self._open() as conn:
+            row = conn.execute(
+                "SELECT t.* FROM draw_task t JOIN plan p ON t.plan_id = p.id"
+                " WHERE p.project_id = ? ORDER BY t.rowid DESC LIMIT 1",
+                (project_id,),
+            ).fetchone()
+        return _task(row) if row else None
+
     def active_task(self) -> TaskRecord | None:
         with self._open() as conn:
             row = conn.execute(
@@ -333,6 +363,11 @@ class Store:
                 " ORDER BY rowid DESC LIMIT 1"
             ).fetchone()
         return _task(row) if row else None
+
+    def delete_task(self, task_id: str) -> None:
+        """删除任务及其事件（task_event 级联）；规划、校准与画板墨迹不受影响。"""
+        with self._write() as conn:
+            conn.execute("DELETE FROM draw_task WHERE id = ?", (task_id,))
 
     def update_task(self, task_id: str, **fields: object) -> None:
         if not fields:
@@ -557,6 +592,14 @@ class Store:
             rows = conn.execute("SELECT * FROM preset ORDER BY name").fetchall()
         return [_preset(row) for row in rows]
 
+    def delete_preset(self, preset_id: str) -> bool:
+        """删除自定义预设；内置预设不可删。返回是否实际删除。"""
+        with self._write() as conn:
+            cursor = conn.execute(
+                "DELETE FROM preset WHERE id = ? AND builtin = 0", (preset_id,)
+            )
+            return cursor.rowcount > 0
+
 
 def _iter_files(directory: Path) -> Iterator[Path]:
     if not directory.is_dir():
@@ -604,6 +647,7 @@ def _canvas(row: sqlite3.Row) -> CanvasProfile:
     tools_collapsed_json = (
         row["tools_collapsed_json"] if "tools_collapsed_json" in keys else None
     )
+    blank_baseline_json = row["blank_baseline_json"] if "blank_baseline_json" in keys else None
     return CanvasProfile(
         id=row["id"],
         project_id=row["project_id"],
@@ -614,6 +658,8 @@ def _canvas(row: sqlite3.Row) -> CanvasProfile:
         rect_y=row["rect_y"],
         rect_w=row["rect_w"],
         rect_h=row["rect_h"],
+        frame_w=(int(row["frame_w"]) if "frame_w" in keys and row["frame_w"] else 0),
+        frame_h=(int(row["frame_h"]) if "frame_h" in keys and row["frame_h"] else 0),
         dpi_scale=row["dpi_scale"],
         source=row["source"],
         confidence=row["confidence"],
@@ -625,6 +671,8 @@ def _canvas(row: sqlite3.Row) -> CanvasProfile:
         tools_collapsed=json.loads(tools_collapsed_json) if tools_collapsed_json else None,
         device_kind=(row["device_kind"] if "device_kind" in keys and row["device_kind"] else "pc"),
         device_serial=row["device_serial"] if "device_serial" in keys else None,
+        blank_baseline=json.loads(blank_baseline_json) if blank_baseline_json else None,
+        snapshot_id=(row["snapshot_id"] if "snapshot_id" in keys else None),
     )
 
 

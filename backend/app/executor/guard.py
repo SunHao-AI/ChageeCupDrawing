@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 VK_ESCAPE = 0x1B
 VK_LBUTTON = 0x01
+VK_SPACE = 0x20
 # 注入器 up 之后该时段内读到的左键按下位来自笔迹本身，不算用户接管。
 BUTTON_EXEMPT_S = 0.15
 
@@ -41,6 +42,8 @@ class GuardProbe(Protocol):
 
     def esc_pressed(self) -> bool: ...
 
+    def space_pressed(self) -> bool: ...
+
 
 class HandleLike(Protocol):
     """_RunHandle 的守护视角：阶段标志 + 静置光标位置。"""
@@ -52,7 +55,9 @@ class HandleLike(Protocol):
 
 class Win32GuardProbe:
     def clear_escape_state(self) -> None:
+        # 读一次消费「自上次读取以来被按下」的边定位；空格同属急停键，一并清。
         _user32.GetAsyncKeyState(VK_ESCAPE)
+        _user32.GetAsyncKeyState(VK_SPACE)
 
     def foreground_matches(self, hwnd: int) -> bool:
         from app.device.windows import foreground_matches
@@ -85,6 +90,9 @@ class Win32GuardProbe:
     def esc_pressed(self) -> bool:
         return bool(_user32.GetAsyncKeyState(VK_ESCAPE) & 0x8001)
 
+    def space_pressed(self) -> bool:
+        return bool(_user32.GetAsyncKeyState(VK_SPACE) & 0x8001)
+
 
 def _injector_holds_button(mouse: object, now: float) -> bool:
     """注入器正处于按下态，或刚抬起不久，此时的左键信号来自笔迹本身。"""
@@ -105,14 +113,18 @@ def evaluate_signals(
 ) -> str | None:
     """单次评估全部守护信号，命中返回停止原因，否则 None。
 
-    ESC 是 PC 侧急停键，全程有效（含倒计时），与目标类型无关；焦点/主权信号
-    中，窗口类走 target（投屏/ADB 目标可按能力降级），光标与按键走 probe
+    ESC / 空格是 PC 侧急停键，全程有效（含倒计时），与目标类型无关；焦点/主权
+    信号中，窗口类走 target（投屏/ADB 目标可按能力降级），光标与按键走 probe
     （PC 输入主权，只要注入仍发生在 PC 上就成立）。
     光标接管仅在两笔之间比较：此刻光标由注入器精确保有，笔画中途的偏差是
-    注入本身的中间点。
+    注入本身的中间点。注意每条笔迹开头都会 SetCursorPos 把光标拉回起点，
+    因此该信号只在「用户移动后恰好落在两笔之间被采到」时命中，属于锦上添花；
+    可靠的接管信号是物理左键与 ESC/空格。
     """
     if probe.esc_pressed():
         return "esc"
+    if probe.space_pressed():
+        return "pause"
     if not focus_guard or not handle.guard_active.is_set():
         return None
 

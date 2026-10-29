@@ -38,7 +38,7 @@ def lan_addresses() -> list[str]:
 def main() -> None:
     settings = Settings()
     host, port = settings.bind_host, settings.port
-    print(f"CupDraw 服务启动：http://{host if host != '0.0.0.0' else '127.0.0.1'}:{port}")
+    print(f"CupDraw 服务启动: http://{host if host != '0.0.0.0' else '127.0.0.1'}:{port}")
     if host == "0.0.0.0":
         print("局域网模式已开启，同一 Wi-Fi 下的手机/平板可访问：")
         for ip in lan_addresses() or ["<本机 IP>"]:

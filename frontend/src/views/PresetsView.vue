@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, shallowRef } from 'vue'
+import { computed, onMounted, shallowRef, watch } from 'vue'
 import ErrorBanner from '@/components/ErrorBanner.vue'
+import GuideCard from '@/components/GuideCard.vue'
 import { PLAN_GROUPS } from '@/params/registry'
 import type { PlanParams, Preset } from '@/api/types'
 import { usePresetStore } from '@/stores/preset'
@@ -43,6 +44,20 @@ const identical = computed(() => selected.value !== null && diffs.value.length =
 function apply(preset: Preset) {
   paramsStore.replacePlan({ ...preset.params })
   emit('goto', 'studio')
+}
+
+const removeAsk = shallowRef(false)
+// 切换选中项后确认卡必须消失，否则确认动作会指向错误的预设。
+watch(selectedId, () => (removeAsk.value = false))
+
+async function removePreset(preset: Preset) {
+  removeAsk.value = false
+  try {
+    await presetStore.remove(preset.presetId)
+    if (selectedId.value === preset.presetId) selectedId.value = null
+  } catch {
+    // 失败原因已进 presetStore.error，由列表上方 banner 展示。
+  }
 }
 
 function exportPreset(preset: Preset) {
@@ -107,9 +122,27 @@ onMounted(() => presetStore.load())
           <h3 class="card-title">{{ selected.name }} · 与当前参数对比</h3>
           <div class="actions">
             <button class="btn btn-sm" @click="exportPreset(selected)">导出 JSON</button>
+            <button
+              v-if="!selected.builtin"
+              class="btn btn-sm btn-danger"
+              @click="removeAsk = true"
+            >
+              删除
+            </button>
             <button class="btn btn-primary btn-sm" @click="apply(selected)">套用到工作台</button>
           </div>
         </div>
+
+        <GuideCard
+          v-if="removeAsk && selected"
+          tone="urgent"
+          badge="!"
+          title="确认删除该预设？"
+          action="确认删除"
+          @action="removePreset(selected)"
+        >
+          预设「{{ selected.name }}」将被永久删除（导出的 JSON 备份不受影响）。
+        </GuideCard>
 
         <div v-if="identical" class="banner banner-info">与当前工作台参数完全一致。</div>
         <table v-else class="diff">

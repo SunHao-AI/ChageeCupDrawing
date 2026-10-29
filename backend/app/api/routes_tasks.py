@@ -1,4 +1,4 @@
-"""I8 创建任务、I9 任务快照、I10 SSE 进度流、I11 停止、I12 续画。"""
+"""I8 创建任务、I9 任务快照、I10 SSE 进度流、I11 停止、I12 续画、I18 回退一笔。"""
 
 from __future__ import annotations
 
@@ -146,6 +146,27 @@ def stop_task(task_id: str, request: Request) -> dict[str, object]:
     except TaskError as exc:
         raise ApiError(exc.status, exc.code, exc.message) from exc
     return {"taskId": record.id, "status": record.status}
+
+
+@router.delete("/tasks/{task_id}", status_code=204)
+def delete_task(task_id: str, request: Request) -> None:
+    """删除任务记录，回到「尚未开始绘制」；规划与校准保留，画板墨迹需另行清空。"""
+    store = request.app.state.store
+    record = store.get_task(task_id)
+    if record is None:
+        raise ApiError(404, "E_NOT_FOUND", "任务不存在")
+    if record.status not in TERMINAL_STATUSES:
+        raise ApiError(409, "E_TASK_CONFLICT", "任务仍在进行，请先停止再删除")
+    store.delete_task(task_id)
+
+
+@router.post("/tasks/{task_id}/undo", status_code=200)
+def undo_task_stroke(task_id: str, request: Request) -> dict[str, object]:
+    """STOPPED 态回退一笔：点目标画布撤销按钮一次，同步返回墨量对比。"""
+    try:
+        return request.app.state.executor.undo_once(task_id)
+    except TaskError as exc:
+        raise ApiError(exc.status, exc.code, exc.message) from exc
 
 
 @router.post("/tasks/{task_id}/resume", status_code=202)

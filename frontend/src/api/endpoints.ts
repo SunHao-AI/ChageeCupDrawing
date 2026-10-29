@@ -4,6 +4,7 @@ import type {
   AiSettingsInfo,
   AiSettingsUpdate,
   AiTestResult,
+  AutoCalibrationResult,
   Calibration,
   DeviceList,
   EditApplyResult,
@@ -57,15 +58,52 @@ export const stopMirror = () => request<MirrorStatus>('/devices/mirror', { metho
 /** 手动校准参考截图的直接地址（作为 <img src>）。 */
 export const windowCaptureUrl = (hwnd: number) => `/api/windows/${hwnd}/capture`
 
-export function createProject(file: File, name?: string): Promise<Project> {
+export function createProject(
+  file: File,
+  name?: string,
+  copyCalibrationFrom?: string | null,
+): Promise<Project> {
   const form = new FormData()
   form.append('file', file)
   if (name) form.append('name', name)
+  if (copyCalibrationFrom) form.append('copyCalibrationFrom', copyCalibrationFrom)
   return postForm<Project>('/projects', form)
 }
 
 export const calibrate = (projectId: string, payload: CalibrationPayload) =>
   post<Calibration>(`/projects/${projectId}/calibration`, payload)
+
+/** I20 一键自动校准：同步执行（可能数十秒），步骤经 openCalibrationEvents 推送。 */
+export interface AutoCalibrationPayload {
+  hwnd?: number
+  confirmDirtyProbe?: boolean
+  /** 单独识别范围（canvas/fold/slider/undo/eraser/brush）；缺省或含 "all" 为全量。 */
+  targets?: string[]
+}
+
+export const autoCalibrate = (projectId: string, payload: AutoCalibrationPayload = {}) =>
+  post<AutoCalibrationResult>(`/projects/${projectId}/calibration/auto`, payload)
+
+export const stopAutoCalibrate = (projectId: string) =>
+  post<{ projectId: string; stopping: boolean }>(
+    `/projects/${projectId}/calibration/auto/stop`,
+    {},
+  )
+
+/** 校准快照地址（<img src>）：产出当前校准那一帧的 JPEG。 */
+export const calibrationSnapshotUrl = (projectId: string, snapshotId: string) =>
+  `/api/projects/${projectId}/calibration/snapshot?snapshot_id=${encodeURIComponent(snapshotId)}`
+
+/** 刷新/重开后恢复项目上下文：校准 + 最新规划 + 最新任务（可为空）。 */
+export interface ResumeState {
+  project: Project
+  calibration: Calibration | null
+  plan: (PlanSummary & { params: PlanParams }) | null
+  task: TaskSnapshot | null
+}
+
+export const getResumeState = (projectId: string) =>
+  get<ResumeState>(`/projects/${projectId}/resume-state`)
 
 export const createPlan = (projectId: string, params: PlanParams, signal?: AbortSignal) =>
   post<PlanSummary>(`/projects/${projectId}/plans`, { params }, signal)
@@ -81,6 +119,34 @@ export const getTask = (taskId: string) => get<TaskSnapshot>(`/tasks/${taskId}`)
 export const stopTask = (taskId: string) =>
   post<{ taskId: string; status: string }>(`/tasks/${taskId}/stop`)
 
+/** 删除任务记录，回到「尚未开始绘制」；规划与校准保留（画板墨迹需另行清空）。 */
+export const deleteTask = (taskId: string) =>
+  request<void>(`/tasks/${taskId}`, { method: 'DELETE' })
+
+/** STOPPED 态回退一笔：点目标画布撤销按钮一次，同步返回墨量对比。 */
+export interface UndoResult {
+  taskId: string
+  effective: boolean
+  inkBefore: number
+  inkAfter: number
+  message: string
+}
+
+export const undoTaskStroke = (taskId: string) =>
+  post<UndoResult>(`/tasks/${taskId}/undo`)
+
+/** I19 清空画布：连点目标画板撤销按钮直到画布空白（同步执行）。 */
+export interface ClearCanvasResult {
+  cleared: boolean
+  method: 'undo' | 'undo+eraser' | 'already_blank'
+  inkBefore: number
+  inkAfter: number
+  message: string
+}
+
+export const clearCanvas = (projectId: string, confirmDirtyProbe = false) =>
+  post<ClearCanvasResult>(`/projects/${projectId}/clear-canvas`, { confirmDirtyProbe })
+
 export const resumeTask = (
   taskId: string,
   payload: { countdownMs: number; allowDrift: number },
@@ -90,6 +156,9 @@ export const listPresets = () => get<Preset[]>('/presets')
 
 export const createPreset = (name: string, params: PlanParams) =>
   post<Preset>('/presets', { name, params })
+
+export const deletePreset = (presetId: string) =>
+  request<void>(`/presets/${presetId}`, { method: 'DELETE' })
 
 export const lineArtProviders = () => get<unknown[]>('/lineart/providers')
 

@@ -237,6 +237,46 @@ def test_upload_uses_filename_as_default_name(client: TestClient) -> None:
     assert body["name"] == "source"
 
 
+def test_upload_copies_calibration_from_source(client: TestClient) -> None:
+    """§5.1：copyCalibrationFrom 把来源项目最新校准整体复制到新项目。"""
+    source = _upload(client)
+    calibrated = _calibrate(client, source["projectId"])
+
+    response = client.post(
+        "/api/projects",
+        files={"file": ("second.png", _project_png(), "image/png")},
+        data={"copyCalibrationFrom": source["projectId"]},
+        headers=WRITE_HEADERS,
+    )
+    assert response.status_code == 201, response.text
+    fresh = response.json()
+    assert fresh["projectId"] != source["projectId"]
+
+    state = client.get(f"/api/projects/{fresh['projectId']}/resume-state").json()
+    copied = state["calibration"]
+    assert copied is not None
+    assert copied["rect"] == calibrated["rect"]
+    assert copied["source"] == "copied"
+
+
+def test_upload_copy_calibration_from_blank_source(client: TestClient) -> None:
+    """来源项目无校准 / 来源 ID 无效：静默跳过，新项目无校准（与现状一致）。"""
+    empty_source = _upload(client)
+
+    for source_id in (empty_source["projectId"], "no-such-project"):
+        response = client.post(
+            "/api/projects",
+            files={"file": ("second.png", _project_png(), "image/png")},
+            data={"copyCalibrationFrom": source_id},
+            headers=WRITE_HEADERS,
+        )
+        assert response.status_code == 201, response.text
+        state = client.get(
+            f"/api/projects/{response.json()['projectId']}/resume-state"
+        ).json()
+        assert state["calibration"] is None
+
+
 def test_upload_rejects_oversized_payload(client: TestClient) -> None:
     payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * (20 * 1024 * 1024)
     response = client.post(
@@ -515,6 +555,39 @@ def test_preset_rejects_blank_name(client: TestClient) -> None:
     assert response.json()["errorCode"] == "E_INVALID_ARGUMENT"
 
 
+def test_preset_delete_states(client: TestClient) -> None:
+    """自定义预设删除 204 且列表移除；内置拒删 409；未知 404。"""
+    created = client.post(
+        "/api/presets", json={"name": "可删", "params": {}}, headers=WRITE_HEADERS
+    ).json()
+    # 内置预设没有创建入口，直接经 store 种一条 builtin 行模拟出厂数据。
+    client.app.state.store.create_preset(name="出厂", params={})
+    with client.app.state.store._write() as conn:  # noqa: SLF001 - 测试造数据
+        conn.execute("UPDATE preset SET builtin = 1 WHERE name = '出厂'")
+        builtin_id = conn.execute(
+            "SELECT id FROM preset WHERE name = '出厂'"
+        ).fetchone()[0]
+
+    response = client.delete(
+        f"/api/presets/{created['presetId']}", headers=WRITE_HEADERS
+    )
+    assert response.status_code == 204
+    assert [p["presetId"] for p in client.get("/api/presets").json()] == [builtin_id]
+
+    protected = client.delete(f"/api/presets/{builtin_id}", headers=WRITE_HEADERS)
+    assert protected.status_code == 409
+    assert protected.json()["errorCode"] == "E_BUILTIN_PRESET"
+
+    missing = client.delete("/api/presets/nope", headers=WRITE_HEADERS)
+    assert missing.status_code == 404
+    assert missing.json()["errorCode"] == "E_NOT_FOUND"
+
+    again = client.delete(
+        f"/api/presets/{created['presetId']}", headers=WRITE_HEADERS
+    )
+    assert again.status_code == 404  # 删除幂等：二次删除报不存在
+
+
 # ---------- I14 / I15 线稿预留 ----------
 
 
@@ -577,4 +650,48 @@ def test_calibration_without_tools_inherits_previous_bitmaps(client: TestClient)
     profile = client.app.state.store.latest_calibration(project["projectId"])
     assert profile.tools_open == tools_open
     assert profile.tools_collapsed is None
+
+
+# ---------- 刷新恢复（resume-state） ----------
+
+
+def test_resume_state_empty_project(client: TestClient) -> None:
+    project = _upload(client)
+    response = client.get(f"/api/projects/{project['projectId']}/resume-state")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["project"]["projectId"] == project["projectId"]
+    assert body["calibration"] is None
+    assert body["plan"] is None
+    assert body["task"] is None
+
+
+def test_resume_state_full_context(client: TestClient) -> None:
+    """校准 + 最新规划 + 最新任务一次回传，前端据此恢复续画上下文。"""
+    project = _upload(client)
+    calibration = _calibrate(client, project["projectId"])
+    plan = _plan(client, project["projectId"])
+
+    store = client.app.state.store
+    task = store.create_task(plan_id=plan["planId"], exec_params={"autoWidth": True})
+    store.update_task(task.id, status="STOPPED", cursor_path=3, stop_reason="focus_lost")
+
+    response = client.get(f"/api/projects/{project['projectId']}/resume-state")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["calibration"]["rect"] == calibration["rect"]
+    assert body["plan"]["planId"] == plan["planId"]
+    assert body["plan"]["params"]
+    assert body["task"]["taskId"] == task.id
+    assert body["task"]["status"] == "STOPPED"
+    assert body["task"]["cursorPath"] == 3
+    # totalPaths 取该任务所属规划 metrics.pathCount（真实 planner 规划成功即为正数）。
+    assert body["task"]["totalPaths"] >= 1
+    assert body["task"]["stopReason"] == "focus_lost"
+    assert body["task"]["exec"] == {"autoWidth": True}
+
+
+def test_resume_state_project_missing(client: TestClient) -> None:
+    response = client.get("/api/projects/nope/resume-state")
+    assert response.status_code == 404
 

@@ -21,7 +21,16 @@ def _as_pil(image: Image.Image | np.ndarray) -> Image.Image:
     return Image.fromarray(arr[:, :, :3], mode="RGB")
 
 
-def detect_canvas_rect(image: Image.Image | np.ndarray) -> tuple[int, int, int, int] | None:
+def detect_canvas_rect(
+    image: Image.Image | np.ndarray, max_ratio: float = 0.78
+) -> tuple[int, int, int, int] | None:
+    """识别白色画布矩形。
+
+    ``max_ratio`` 是宽/高比上限，默认 0.78 与 v6 参考实现严格对齐（golden
+    parity）。工具栏探测器在面板展开态重建画布时放宽到 0.85：画布变矮近方
+    形（真机实测 ratio≈0.80），默认档直接拒检会让探测器拿旧收起态矩形继续
+    工作、工具行/胶囊全部错位。
+    """
     rgb = _as_pil(image).convert("RGB")
     ow, oh = rgb.size
     if ow < 150 or oh < 250:
@@ -74,7 +83,7 @@ def detect_canvas_rect(image: Image.Image | np.ndarray) -> tuple[int, int, int, 
             if touches_border or bw < sw * 0.42 or bh < sh * 0.34 or bw > sw * 0.92 or bh > sh * 0.82:
                 continue
             ratio = bw / max(1, bh)
-            if not 0.54 <= ratio <= 0.78:
+            if not 0.54 <= ratio <= max_ratio:
                 continue
             fill = count / max(1, bw * bh)
             if fill < 0.63:

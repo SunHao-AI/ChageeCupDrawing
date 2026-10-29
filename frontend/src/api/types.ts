@@ -40,6 +40,8 @@ export interface ExecParams {
   focusGuard: boolean
   cursorTakeoverPx: number
   guardPollMs: number
+  /** 画布差分守护：投屏目标上每条笔迹结束后比对画布，检出手指误触墨迹。 */
+  canvasGuard: boolean
   /** 自动变粗：绘制前自动探测工具条并标定笔宽，按容差逐段换笔。 */
   autoWidth: boolean
   /** 换宽粒度：目标笔宽变化超过该值才换一次笔。 */
@@ -109,9 +111,36 @@ export interface Calibration {
   /** 面板展开/折叠两态工具位图（探测产物，结构由后端 executor 保证，原样透传）。 */
   toolsOpen?: Record<string, unknown> | null
   toolsCollapsed?: Record<string, unknown> | null
+  /** 一键自动校准快照 ID：标注层据此锚定产出本份校准的那一帧截图。 */
+  snapshotId?: string | null
   /** 绘制目标类型与来源设备（mirror 时为手机序列号）。 */
   deviceKind?: DeviceKind
   deviceSerial?: string | null
+}
+
+/** 一键自动校准的步骤几何（截图坐标系）：rect 框或 point 圆心。 */
+export interface CalibGeometry {
+  kind: 'rect' | 'point'
+  x: number
+  y: number
+  w?: number
+  h?: number
+}
+
+/** RectEditor 只读标注：几何 + 展示文案（截图坐标系）。 */
+export interface CalibAnnotation extends CalibGeometry {
+  step: string
+  label: string
+  dashed?: boolean
+}
+
+export interface AutoCalibrationResult {
+  calibrationId: string | null
+  snapshotId: string | null
+  rect: Rect
+  collapsedCaptured: boolean
+  steps: string[]
+  message: string
 }
 
 export interface PlanMetrics {
@@ -196,6 +225,8 @@ export interface TaskStatePayload {
 
 export interface TaskWarningPayload {
   message: string
+  /** 结构化提示码（probe_skipped_dirty / probe_failed），老客户端可忽略。 */
+  code?: string
 }
 
 export interface TaskDonePayload {

@@ -52,9 +52,18 @@ class _BITMAPINFO(ctypes.Structure):
 
 
 class MaaCapture:
-    """通过 Maa Win32Controller 取窗口图像，返回 RGB 数组。"""
+    """通过 Maa Win32Controller 取窗口图像，返回 RGB 数组。
+
+    控制器按 hwnd 缓存复用：post_connection 内含一次各截图方式的测速
+    （失败路径如 DXGI 桌面复制在个别显示器/驱动下耗时且刷错误日志），
+    复用连接可把每次截图的固定开销从约 1s 压到约 30ms。
+    """
 
     name = "maa"
+
+    def __init__(self) -> None:
+        self._controller = None
+        self._controller_hwnd: int | None = None
 
     def capture(self, hwnd: int) -> CaptureResult:
         try:
@@ -63,20 +72,27 @@ class MaaCapture:
         except ImportError as exc:
             raise CaptureError("MaaFramework 不可用") from exc
 
-        try:
-            controller = Win32Controller(
-                ctypes.c_void_p(int(hwnd)),
-                screencap_method=MaaWin32ScreencapMethodEnum.Foreground,
-            )
-        except RuntimeError as exc:
-            raise CaptureError(f"创建 Win32 控制器失败：{exc}") from exc
+        hwnd_int = int(hwnd)
+        if self._controller is None or self._controller_hwnd != hwnd_int:
+            try:
+                controller = Win32Controller(
+                    ctypes.c_void_p(hwnd_int),
+                    screencap_method=MaaWin32ScreencapMethodEnum.Foreground,
+                )
+            except RuntimeError as exc:
+                raise CaptureError(f"创建 Win32 控制器失败：{exc}") from exc
 
-        if not controller.post_connection().wait().succeeded:
-            raise CaptureError("连接目标窗口失败")
+            if not controller.post_connection().wait().succeeded:
+                raise CaptureError("连接目标窗口失败")
+            self._controller = controller
+            self._controller_hwnd = hwnd_int
 
-        job = controller.post_screencap()
+        job = self._controller.post_screencap()
         image = job.get(wait=True)
         if image is None or getattr(image, "size", 0) == 0:
+            # 窗口可能重建/句柄失效：丢弃缓存，下次重建连接。
+            self._controller = None
+            self._controller_hwnd = None
             raise CaptureError("截图返回空图像")
 
         # Maa 返回 BGR 三通道，统一转成 RGB。

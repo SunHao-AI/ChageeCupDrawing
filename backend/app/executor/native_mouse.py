@@ -51,6 +51,7 @@ class NativeMouse:
     MOUSEEVENTF_VIRTUALDESK = 0x4000
     MOUSEEVENTF_ABSOLUTE = 0x8000
     VK_ESCAPE = 0x1B
+    VK_SPACE = 0x20
 
     class _POINT(ctypes.Structure):
         _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -130,9 +131,13 @@ class NativeMouse:
     def esc_pressed(self) -> bool:
         return bool(self.user32.GetAsyncKeyState(self.VK_ESCAPE) & 0x8001)
 
+    def space_pressed(self) -> bool:
+        return bool(self.user32.GetAsyncKeyState(self.VK_SPACE) & 0x8001)
+
     def clear_escape_state(self) -> None:
-        # 再读一次以清除「自上次调用后被按下」的低位置位。
+        # 再读一次以清除「自上次调用后被按下」的低位置位（ESC 与空格同为急停键）。
         self.user32.GetAsyncKeyState(self.VK_ESCAPE)
+        self.user32.GetAsyncKeyState(self.VK_SPACE)
 
     # ---------- 落笔 ----------
 

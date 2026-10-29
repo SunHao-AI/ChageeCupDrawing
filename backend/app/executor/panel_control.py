@@ -7,6 +7,11 @@
   2. 否则按滑杆轨道的墨迹占比：展开时轨道有深色段+圆点（占比 ≥3%），
      收起后该位置是浅色空白（≈0），阈值取 1%。
 
+「折叠」「展开」是外表不同、功能相反的两个独立按钮：折叠钮只在展开态显示，
+展开钮只在收起态显示，各自只在对应状态下可点。因此 fold/unfold 接收的是
+方向候选链（首选本方向按钮，次选对侧按钮——对侧按钮只在当前态恰好等于其
+生效态时才生效，天然安全），逐钮尝试直到状态翻转。
+
 安全约束：点击前校验目标点不在画布内（防止在画布上点出墨点），点击后用状态
 复检确认生效；失败由调用方降级处理（保持当前笔宽继续画），绝不盲连点。
 """
@@ -14,7 +19,7 @@
 from __future__ import annotations
 
 import time
-from typing import Callable, Protocol
+from typing import Callable, Iterable, Protocol
 
 from app.core.vision.canvas_detect import detect_canvas_rect
 from app.executor.ink_measure import ink_occupied_fraction
@@ -22,7 +27,8 @@ from app.executor.ink_measure import ink_occupied_fraction
 # 滑杆轨道深色占比阈值：展开时深色段+圆点 ≥3%，收起后≈0，取中间值。
 PANEL_OPEN_OCCUPIED = 0.01
 SETTLE_S = 0.45
-MAX_CLICKS = 2
+# 单个按钮候选的点击预算：点一下不翻转即判该钮在当前态无效，换下一个候选。
+CLICKS_PER_BUTTON = 2
 
 
 class PanelProbe(Protocol):
@@ -68,14 +74,31 @@ class PanelController:
         rect = (slider_rect["x"], slider_rect["y"], slider_rect["w"], slider_rect["h"])
         return ink_occupied_fraction(image, rect) >= PANEL_OPEN_OCCUPIED
 
-    def fold(self, slider_rect: dict, fold_point: dict) -> bool:
-        return self._set(slider_rect, fold_point, want_open=False)
+    def fold(self, slider_rect: dict, buttons: Iterable[dict | None]) -> bool:
+        """收起面板。首选展开态才显示的「折叠」钮，次选「展开」钮兜底。"""
+        return self._set(slider_rect, buttons, want_open=False)
 
-    def unfold(self, slider_rect: dict, fold_point: dict) -> bool:
-        return self._set(slider_rect, fold_point, want_open=True)
+    def unfold(self, slider_rect: dict, buttons: Iterable[dict | None]) -> bool:
+        """展开面板。首选收起态才显示的「展开」钮，次选「折叠」钮兜底。"""
+        return self._set(slider_rect, buttons, want_open=True)
 
-    def _set(self, slider_rect: dict, fold_point: dict, *, want_open: bool) -> bool:
-        for _ in range(MAX_CLICKS):
+    def _set(
+        self, slider_rect: dict, buttons: Iterable[dict | None], *, want_open: bool
+    ) -> bool:
+        candidates = [p for p in buttons if p is not None]
+        if not candidates:
+            return False
+        for button in candidates:
+            if self._set_with(slider_rect, button, want_open=want_open):
+                return True
+        if self._stopped():
+            return False
+        state = self.is_open(slider_rect)
+        return state is not None and state == want_open
+
+    def _set_with(self, slider_rect: dict, button: dict, *, want_open: bool) -> bool:
+        """对一个按钮候选尝试到预算耗尽；翻转成功返回 True。"""
+        for _ in range(CLICKS_PER_BUTTON):
             if self._stopped():
                 return False
             state = self.is_open(slider_rect)
@@ -91,17 +114,14 @@ class PanelController:
             found = detect_canvas_rect(image)
             if found is not None:
                 l, t, r, b = found
-                if l <= fold_point["x"] <= r and t <= fold_point["y"] <= b:
-                    # 按钮位置被（漂移后的）画布覆盖：点下去就是一个墨点，拒绝。
+                if l <= button["x"] <= r and t <= button["y"] <= b:
+                    # 按钮位置被（漂移后的）画布覆盖：点下去就是一个墨点，换候选。
                     return False
             self._ensure_foreground()
-            sx, sy = self._to_screen(fold_point["x"], fold_point["y"])
+            sx, sy = self._to_screen(button["x"], button["y"])
             getattr(self._mouse, "click")(sx, sy)
             self._sleep(SETTLE_S)
-        if self._stopped():
-            return False
-        state = self.is_open(slider_rect)
-        return state is not None and state == want_open
+        return False
 
     def _ensure_foreground(self) -> None:
         # 已请求停止时绝不 activate：那会把用户刚切走/最小化的窗口抢回前台，

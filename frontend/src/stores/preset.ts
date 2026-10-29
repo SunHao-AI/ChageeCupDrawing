@@ -34,5 +34,16 @@ export const usePresetStore = defineStore('preset', () => {
     }
   }
 
-  return { items, error, busy, load, save }
+  async function remove(presetId: string) {
+    error.value = null
+    try {
+      await api.deletePreset(presetId)
+      items.value = items.value.filter((p) => p.presetId !== presetId)
+    } catch (e) {
+      error.value = errorMessage(e)
+      throw e
+    }
+  }
+
+  return { items, error, busy, load, save, remove }
 })

@@ -29,8 +29,12 @@ const snapshot = computed(() => taskStore.snapshot)
 /** 守护/急停触发的暂停：语义是「等用户切回目标后手动续画」，区别于普通停止。 */
 const GUARD_STOP_HINTS: Record<string, string> = {
   focus_lost: '目标窗口失去焦点或已最小化，已立即抬笔。请切回小程序窗口，再从断点续画。',
-  mouse_takeover: '检测到鼠标被你接管，已立即抬笔。回到小程序窗口后从断点续画即可。',
+  mouse_takeover: '检测到鼠标被你接管，已立即抬笔。若误触在画布上留下了墨迹，可逐笔回退后再续画。',
   esc: '已按 ESC 急停，笔已抬起。可从断点续画。',
+  pause: '已按空格暂停，笔已抬起。可从断点续画。',
+  canvas_touched:
+    '检测到画布上出现预期外墨迹（可能误触）。请对照投屏画面逐笔回退，清干净后从断点续画。',
+  screen_changed: '画布整体变化（弹窗覆盖或被清空），请检查目标画面后再续画。',
 }
 const guardStopHint = computed(() =>
   snapshot.value?.status === 'STOPPED' && snapshot.value.stopReason
@@ -91,6 +95,66 @@ async function onResume() {
   await taskStore.resume(countdownMs.value, allowDrift.value)
 }
 
+// 「清空画布，从头绘制」组合动作（clear-and-guide-design §4.5）：
+// confirm=旧墨全部丢弃的确认；confirmDirty=无撤销坐标时授权脏画布工具条探测。
+const clearAsk = shallowRef<'none' | 'confirm' | 'confirmDirty'>('none')
+const canClear = computed(
+  () => projectStore.calibrated && taskStore.canStart && !taskStore.busy && !taskStore.clearing,
+)
+
+async function doClear(confirmDirtyProbe: boolean) {
+  const projectId = projectStore.project?.projectId
+  if (!projectId) return
+  clearAsk.value = 'none'
+  const result = await taskStore.clearCanvas(projectId, confirmDirtyProbe)
+  if (result.code === 'E_CLEAR_UNAVAILABLE' && !confirmDirtyProbe) {
+    clearAsk.value = 'confirmDirty'
+    return
+  }
+  // 清空成功且画布确实干净了才接着从头开画；already_blank 也算成功。
+  if (result.ok && planStore.summary) {
+    await taskStore.start(planStore.summary.planId, countdownMs.value, allowDrift.value)
+  }
+}
+
+// 引导卡分流（clear-and-guide-design §7.2）：按 warning 的 code 升级成带按钮的引导卡，
+// 其余 warning 保持纯文字 banner。
+const dirtySkipWarning = computed(
+  () => taskStore.warnings.find((w) => w.code === 'probe_skipped_dirty') ?? null,
+)
+const probeFailWarning = computed(
+  () => taskStore.warnings.find((w) => w.code === 'probe_failed') ?? null,
+)
+const plainWarnings = computed(
+  () =>
+    taskStore.warnings.filter(
+      (w) => w.code !== 'probe_skipped_dirty' && w.code !== 'probe_failed',
+    ),
+)
+
+/** 去校准页并预选要框选的控件（pendingCalibMark 由校准页 onMounted 一次性消费）。 */
+function gotoCalibrateWith(mark: 'slider' | 'undo' | 'fold') {
+  projectStore.requestCalibMark(mark)
+  emit('goto', 'calibrate')
+}
+
+// 「删除任务」：只删任务进度记录，回到未开始绘制的初始态（规划/校准保留，
+// 画板上的墨迹不会被清掉，需要时配合「清空画布，从头绘制」）。
+const deleteAsk = shallowRef(false)
+
+async function onDeleteTask() {
+  deleteAsk.value = false
+  await taskStore.remove()
+}
+
+/** 绘制中的暂停手势说明（注入模型下移动鼠标不可靠，别把它当暂停手段）。 */
+const pauseGestureHint = computed(
+  () =>
+    running.value || snapshot.value?.status === 'ARMING'
+      ? '随时暂停：按 ESC 或空格立即抬笔；在画布外按住鼠标左键也会判定接管自动暂停。刷新网页不会中断绘制（绘制在后台执行），请用「停止」或急停键。'
+      : '',
+)
+
 /** 窄屏抽屉交互：参数调整完（滑杆松手/开关切换触发 change）自动收起。 */
 function onParamChanged() {
   if (window.innerWidth < 1024) paramsOpen.value = false
@@ -132,7 +196,7 @@ onUnmounted(() => {
         v-if="paramsStore.exec.autoWidth && !projectStore.calibration?.slider && !projectStore.calibration?.toolsOpen"
         class="banner banner-warn auto-width-tip"
       >
-        程序会先自动探测工具栏控件；个别控件识别失败时，再到「校准」页手动补标粗细滑杆轨道（建议同时标记撤销按钮与「∨」折叠按钮，分别用于标定后自动清空画布、绘制时自动折叠工具面板）。
+        程序会先自动探测工具栏控件；个别控件识别失败时，先到画板底部点「画笔」进入绘画面板，再在「校准」页手动补标「大小」滑杆轨道（建议同时标记撤销「↩」与工具行最左的开合钮「∨/∧」，分别用于标定后自动清空画布、绘制时自动折叠/展开工具面板）。
       </div>
 
       <div class="divider"></div>
@@ -140,7 +204,7 @@ onUnmounted(() => {
       <div class="field">
         <div class="field-label"><span>倒计时</span><span class="field-value num">{{ countdownMs }} ms</span></div>
         <input type="range" :min="TASK_CONTROLS.countdownMs.min" :max="TASK_CONTROLS.countdownMs.max" :step="TASK_CONTROLS.countdownMs.step" v-model.number="countdownMs" :disabled="running" />
-        <div class="hint">倒计时内请切换到目标窗口，ESC 随时急停</div>
+        <div class="hint">倒计时内请切换到目标窗口，ESC / 空格随时急停</div>
       </div>
       <div class="field">
         <div class="field-label"><span>允许漂移</span><span class="field-value num">{{ allowDrift.toFixed(2) }}</span></div>
@@ -164,7 +228,11 @@ onUnmounted(() => {
         v-if="snapshot?.status === 'ARMING'"
         tone="urgent"
         badge="!"
-        title="倒计时中：立刻切换到目标窗口"
+        :title="
+          taskStore.countdown !== null && taskStore.countdown > 0
+            ? `倒计时 ${taskStore.countdown} 秒：立刻切换到目标窗口`
+            : '即将落笔：保持目标窗口在前台'
+        "
       >
         把画板窗口点到前台并保持画布可见。倒计时末段若目标不在前台会暂停等待，切回后自动继续。
       </GuideCard>
@@ -175,7 +243,7 @@ onUnmounted(() => {
         action="开始绘制"
         @action="onStart"
       >
-        ① 点开始 → ② 自动把小程序带到前台并倒计时（若被系统拦下再手动切一下）→ ③ 自动校验后自动落笔；按 ESC 可随时急停。
+        ① 点开始 → ② 自动把小程序带到前台并倒计时（若被系统拦下再手动切一下）→ ③ 自动校验后自动落笔；按 ESC 或空格可随时急停。
       </GuideCard>
 
       <div class="progress-block">
@@ -187,10 +255,74 @@ onUnmounted(() => {
           第 {{ snapshot?.cursorPath ?? 0 }} / {{ snapshot?.totalPaths ?? planStore.summary?.metrics.pathCount ?? 0 }} 笔
           <span v-if="progress"> · 已用 {{ elapsed }}</span>
         </div>
+        <p v-if="pauseGestureHint" class="banner banner-info">{{ pauseGestureHint }}</p>
       </div>
 
       <ErrorBanner v-if="taskStore.error" kind="error">{{ taskStore.error }}</ErrorBanner>
-      <ErrorBanner v-for="(warn, i) in taskStore.warnings" :key="i" kind="warn">{{ warn.message }}</ErrorBanner>
+      <GuideCard
+        v-if="dirtySkipWarning"
+        badge="!"
+        title="画布上有旧墨迹，本次跳过了工具条自动学习"
+      >
+        {{ dirtySkipWarning.message }}
+        <div class="warn-actions">
+          <button class="btn btn-primary btn-sm" :disabled="!canClear" @click="clearAsk = 'confirm'">
+            清空画布，从头绘制
+          </button>
+          <button class="btn btn-sm" @click="emit('goto', 'calibrate')">去校准页</button>
+        </div>
+      </GuideCard>
+      <GuideCard
+        v-if="probeFailWarning"
+        badge="!"
+        title="工具条自动学习未完成"
+        action="去校准页补标"
+        @action="gotoCalibrateWith('slider')"
+      >
+        {{ probeFailWarning.message }}补标后，笔宽自适应与绘制后自动清空都会恢复工作。
+      </GuideCard>
+      <ErrorBanner v-for="(warn, i) in plainWarnings" :key="i" kind="warn">{{ warn.message }}</ErrorBanner>
+      <ErrorBanner v-if="taskStore.undoFeedback" kind="warn">
+        {{ taskStore.undoFeedback }}
+        <button
+          v-if="taskStore.undoFeedbackCode === 'E_UNDO_UNAVAILABLE'"
+          class="btn btn-sm banner-action"
+          @click="gotoCalibrateWith('undo')"
+        >
+          去校准页标撤销
+        </button>
+      </ErrorBanner>
+      <ErrorBanner v-if="taskStore.clearFeedback" kind="warn">{{ taskStore.clearFeedback }}</ErrorBanner>
+      <GuideCard
+        v-if="clearAsk === 'confirm'"
+        tone="urgent"
+        badge="!"
+        title="确认清空画布？"
+        action="确认清空并从头绘制"
+        @action="doClear(false)"
+      >
+        画板上的墨迹将被全部丢弃（程序会连点画板自己的撤销按钮直到画布干净），然后从第 1 笔重新开始绘制。
+      </GuideCard>
+      <GuideCard
+        v-else-if="clearAsk === 'confirmDirty'"
+        tone="urgent"
+        badge="!"
+        title="需要先学习工具条控件位置"
+        action="授权并继续清空"
+        @action="doClear(true)"
+      >
+        还没学到撤销按钮的位置。确认后程序将在画布有墨的状态下点击画布下方的工具条区域进行学习；画布上的墨迹将被全部丢弃。
+      </GuideCard>
+      <GuideCard
+        v-if="deleteAsk"
+        tone="urgent"
+        badge="!"
+        title="确认删除当前任务？"
+        action="确认删除任务"
+        @action="onDeleteTask"
+      >
+        任务进度记录将被删除，本页回到「尚未开始绘制」；规划与校准保留，可随时重新开始。注意：画板上已画出的墨迹不会被清掉，需要一并清空请改用「清空画布，从头绘制」。
+      </GuideCard>
       <GuideCard
         v-if="guardStopHint"
         tone="urgent"
@@ -215,7 +347,32 @@ onUnmounted(() => {
           开始绘制
         </button>
         <button class="btn btn-danger" :disabled="!taskStore.canStop" @click="taskStore.stop()">停止</button>
+        <button
+          v-if="snapshot?.status === 'STOPPED'"
+          class="btn"
+          :disabled="taskStore.busy || taskStore.undoing"
+          @click="taskStore.undo()"
+        >
+          {{ taskStore.undoing ? '回退中…' : '回退一笔' }}
+        </button>
         <button class="btn" :disabled="!taskStore.canResume || taskStore.busy" @click="onResume">从断点续画</button>
+        <button
+          class="btn"
+          :disabled="!canClear"
+          :title="snapshot?.status === 'STOPPED' ? '清空画板上的旧墨迹，然后从第 1 笔重新绘制' : undefined"
+          @click="clearAsk = 'confirm'"
+        >
+          {{ taskStore.clearing ? '清空中…' : '清空画布，从头绘制' }}
+        </button>
+        <button
+          v-if="snapshot"
+          class="btn btn-danger"
+          :disabled="taskStore.isActive || taskStore.busy"
+          title="删除任务进度记录，回到未开始绘制的初始状态（规划与校准保留，画板墨迹不受影响）"
+          @click="deleteAsk = true"
+        >
+          删除任务
+        </button>
       </div>
 
       <p v-if="!projectStore.calibrated" class="banner banner-info">尚未校准画布，先去校准。</p>
@@ -375,5 +532,19 @@ onUnmounted(() => {
 
 .controls .btn-danger:not(:disabled) {
   background: rgba(217, 108, 95, 0.14);
+}
+
+/* 引导卡内的多动作行（清空 / 去校准页并存时） */
+.warn-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+/* 反馈 banner 内联的引导按钮 */
+.banner-action {
+  margin-left: 8px;
+  vertical-align: baseline;
 }
 </style>

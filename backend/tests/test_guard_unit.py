@@ -30,6 +30,7 @@ class StubProbe:
     def __init__(self, **flags) -> None:
         self.flags = {
             "esc": False,
+            "space": False,
             "lbtn": False,
             "cursor": (100, 100),
             **flags,
@@ -40,6 +41,9 @@ class StubProbe:
 
     def esc_pressed(self) -> bool:
         return self.flags["esc"]
+
+    def space_pressed(self) -> bool:
+        return self.flags["space"]
 
     def left_button_pressed(self) -> bool:
         return self.flags["lbtn"]
@@ -110,6 +114,33 @@ def test_esc_wins_and_works_in_arming() -> None:
     assert _eval(handle, probe) == "esc"
 
 
+def test_space_pauses_even_in_arming() -> None:
+    handle = StubHandle(guard_active=False)
+    probe = StubProbe(space=True, fg=False)
+    assert _eval(handle, probe) == "pause"
+
+
+def test_esc_takes_priority_over_space() -> None:
+    handle = StubHandle(guard_active=False)
+    assert _eval(handle, StubProbe(esc=True, space=True)) == "esc"
+
+
+def test_win32_probe_implements_every_protocol_method() -> None:
+    """真实探针必须实现 GuardProbe 的全部信号方法。
+
+    契约测试全程用假探针，真实类漏一个方法（如 space_pressed）要到真机
+    AttributeError 才暴露——这里在属性层面直接封堵。
+    """
+    from app.executor.guard import Win32GuardProbe
+
+    probe = Win32GuardProbe()
+    for name in (
+        "clear_escape_state", "foreground_matches", "activate", "window_usable",
+        "cursor_pos", "left_button_pressed", "esc_pressed", "space_pressed",
+    ):
+        assert callable(getattr(probe, name, None)), f"Win32GuardProbe 缺少 {name}"
+
+
 def test_focus_signals_only_after_drawing_started() -> None:
     handle = StubHandle(guard_active=False)
     probe = StubProbe(fg=False, usable=False, lbtn=True, settled=None)
@@ -122,6 +153,7 @@ def test_focus_guard_off_skips_everything_but_esc() -> None:
     handle = StubHandle(guard_active=True, settled=(0, 0))
     probe = StubProbe(fg=False, lbtn=True, cursor=(999, 999))
     assert _eval(handle, probe, focus_guard=False) is None
+    assert _eval(handle, StubProbe(space=True), focus_guard=False) == "pause"
 
 
 def test_foreground_lost_maps_to_focus_lost() -> None:

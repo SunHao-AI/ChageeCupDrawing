@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS canvas_profile (
     rect_y INTEGER NOT NULL,
     rect_w INTEGER NOT NULL,
     rect_h INTEGER NOT NULL,
+    frame_w INTEGER NOT NULL DEFAULT 0,
+    frame_h INTEGER NOT NULL DEFAULT 0,
     dpi_scale REAL NOT NULL DEFAULT 1.0,
     source TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 0.0,
@@ -35,6 +37,8 @@ CREATE TABLE IF NOT EXISTS canvas_profile (
     fold_json TEXT,
     tools_open_json TEXT,
     tools_collapsed_json TEXT,
+    blank_baseline_json TEXT,
+    snapshot_id TEXT,
     captured_at TEXT NOT NULL
 );
 
@@ -121,6 +125,14 @@ _COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         # 多设备目标（B2）：pc / mirror / adb 与来源设备序列号。
         ("device_kind", "TEXT NOT NULL DEFAULT 'pc'"),
         ("device_serial", "TEXT"),
+        # 空白画布基线掩码（canvas_blankness L2）。
+        ("blank_baseline_json", "TEXT"),
+        # 自动校准快照 ID（标注层锚帧用）。
+        ("snapshot_id", "TEXT"),
+        # 产出本份校准那一刻的截图帧尺寸：标注层坐标系据此对齐，
+        # 不再回退实时截图 naturalSize（两帧不一致会让 RectEditor 缩放失真）。
+        ("frame_w", "INTEGER NOT NULL DEFAULT 0"),
+        ("frame_h", "INTEGER NOT NULL DEFAULT 0"),
     ],
 }
 

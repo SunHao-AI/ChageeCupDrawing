@@ -26,6 +26,7 @@ const fileInput = useTemplateRef<HTMLInputElement>('fileInput')
 const saveError = shallowRef<string | null>(null)
 const savedOk = shallowRef(false)
 const aiAvailable = shallowRef(false)
+const clearAsk = shallowRef(false)
 
 /** 条件字段：strategy 切换时隐藏不相关项，但值保留在 params 里。 */
 function visible(meta: (typeof PLAN_GROUPS)[number]['fields'][number]): boolean {
@@ -84,6 +85,8 @@ function onDragLeave() {
 async function onDrop(event: DragEvent) {
   event.preventDefault()
   dropping.value = false
+  // 校准/导入进行中不接受拖拽换图：在途校准的落地结果会串到新项目上。
+  if (projectStore.busy) return
   const file = event.dataTransfer?.files?.[0]
   if (!file) return
   try {
@@ -93,6 +96,11 @@ async function onDrop(event: DragEvent) {
   } catch {
     /* 错误已写入 projectStore.error */
   }
+}
+
+async function onClearWork() {
+  clearAsk.value = false
+  await projectStore.clearAll()
 }
 
 async function savePreset() {
@@ -134,9 +142,20 @@ onMounted(() => {
     <aside class="card panel scroll">
       <div class="panel-head">
         <h3 class="card-title">原图</h3>
-        <button class="btn btn-sm" :disabled="projectStore.busy" @click="pickFile">
-          {{ projectStore.project ? '更换图片' : '导入图片' }}
-        </button>
+        <div class="head-actions">
+          <button class="btn btn-sm" :disabled="projectStore.busy" @click="pickFile">
+            {{ projectStore.project ? '更换图片' : '导入图片' }}
+          </button>
+          <button
+            v-if="projectStore.project"
+            class="btn btn-sm btn-danger"
+            :disabled="projectStore.busy"
+            title="清除任务与当前图片，回到重新上传图片的初始状态（校准会被记住，重传后免校准）"
+            @click="clearAsk = true"
+          >
+            清除
+          </button>
+        </div>
       </div>
 
       <div
@@ -153,12 +172,28 @@ onMounted(() => {
           </div>
         </div>
         <div v-else class="source-empty">
+          <svg class="empty-icon" width="44" height="44" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+            <path d="M6 13h16c-.4 5.4-3.5 9-8 9s-7.6-3.6-8-9Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+            <path d="M22.5 15c3.4-.6 4.4 4.2 1 5.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            <path d="M7 26h14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            <path d="M14 6c1.4 1.2 1.4 2.8 0 4M18 5c1.4 1.2 1.4 2.8 0 4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" opacity="0.7" />
+          </svg>
           <p>拖拽图片到此处，或点击上方「导入图片」</p>
           <p class="sub">支持 PNG / JPEG，≤20 MB</p>
         </div>
       </div>
 
       <ErrorBanner v-if="projectStore.error" kind="error">{{ projectStore.error }}</ErrorBanner>
+      <GuideCard
+        v-if="clearAsk"
+        tone="urgent"
+        badge="!"
+        title="确认清除当前作品？"
+        action="确认清除"
+        @action="onClearWork"
+      >
+        任务进度、规划预览与当前图片都会被清除，回到「重新上传图片」的初始状态。校准结果会被记住：重新上传后无需再校准。注意：小程序画板上已画出的墨迹不会被清掉，需要时先到绘制页「清空画布」。
+      </GuideCard>
       <GuideCard
         v-if="projectStore.project && !projectStore.calibrated"
         badge="2"
@@ -280,6 +315,11 @@ onMounted(() => {
   margin: 0;
 }
 
+.head-actions {
+  display: flex;
+  gap: 6px;
+}
+
 .source-zone {
   border-radius: var(--radius-sm);
   transition: box-shadow 0.15s, outline-color 0.15s;
@@ -314,6 +354,24 @@ onMounted(() => {
   text-align: center;
   color: var(--text-faint);
   font-size: 12px;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.source-zone.dropping .source-empty {
+  border-color: var(--gold-soft);
+  background: var(--gold-dim);
+  color: var(--gold);
+}
+
+.empty-icon {
+  display: block;
+  margin: 0 auto 10px;
+  color: var(--text-faint);
+  transition: color 0.15s;
+}
+
+.source-zone.dropping .empty-icon {
+  color: var(--gold);
 }
 
 .source-empty .sub {
