@@ -225,6 +225,13 @@ export function withPlanDefaults(partial: Partial<PlanParams> | undefined): Plan
   return { ...defaultPlanParams(), ...(partial ?? {}) }
 }
 
+// 仅 ExecParams 声明的字段：后端落库的 exec 会带回 widthTable/widthTiers 等内部字段，
+// 透传回 API 会被 ExecParamsModel(extra=forbid) 判成「请求参数不合法」。
+const EXEC_KEYS = Object.keys(defaultExecParams()) as (keyof ExecParams)[]
+
 export function withExecDefaults(partial: Partial<ExecParams> | undefined): ExecParams {
-  return { ...defaultExecParams(), ...(partial ?? {}) }
+  const merged = { ...defaultExecParams(), ...(partial ?? {}) } as Record<string, unknown>
+  const result = {} as Record<string, unknown>
+  for (const key of EXEC_KEYS) result[key] = merged[key]
+  return result as unknown as ExecParams
 }
