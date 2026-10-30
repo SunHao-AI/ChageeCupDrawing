@@ -23,3 +23,9 @@ Thumbs.db
 
 # SDD 过程产物（评审 patch、任务报告；账本结论已沉淀到提交信息与 open-items）
 .superpowers/
+
+# 调试临时产物（脚本、日志、截图）
+/.tmp/
+/.benchmarks/
+/.screenshots/
+**/_tmp_*
