@@ -58,7 +58,18 @@ export interface CalibrationEventHandlers {
   /** 某步骤识别成功的几何（用于快照上的实时标注）。 */
   onGeometry?: (payload: CalibrationGeometryPayload) => void
   onDone?: (payload: Record<string, unknown>) => void
-  onFailed?: (payload: { code: string; message: string }) => void
+  /**
+   * 终态失败。``saved`` 为真表示成功项已落库（部分成功）：``savedSteps`` 是
+   * 已入库步骤，``failedSteps`` 是本轮未学到的步骤，前端据此预选「单独识别」
+   * 让用户只补失败项。
+   */
+  onFailed?: (payload: {
+    code: string
+    message: string
+    saved?: boolean
+    savedSteps?: string[]
+    failedSteps?: string[]
+  }) => void
   onError?: (error: Event) => void
 }
 

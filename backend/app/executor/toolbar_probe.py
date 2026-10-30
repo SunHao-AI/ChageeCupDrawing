@@ -47,12 +47,17 @@ from app.executor.ink_measure import ink_occupied_fraction, measure_ink_width
 
 
 class ProbeError(Exception):
-    """探测失败；code 供上层映射为稳定错误码。"""
+    """探测失败；code 供上层映射为稳定错误码。
+
+    ``partial`` 携带失败前已学到的控件位图（含人工兜底项），供上层落库成功项、
+    让用户「勾选失败项再次校准」时无需从头再来。
+    """
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.partial: "ToolBitmap | None" = None
 
 
 class SliderProbe(Protocol):
@@ -225,6 +230,14 @@ class ToolbarProber:
     # 杆轨道绝缘。
     UNDO_REACTIVE_MIN_PX = 40
     INK_THRESHOLD = 160
+    # 刻度带「干净」判据：带内暗像素面积低于半条测试线即视为无残留。撤销/橡皮
+    # /画笔三处判据都按整条带读墨，带里只要躺着历次失败留下的残留线，撤销的
+    # 「跌到基线 40%」与橡皮的「线整条消失」就同时结构性失明（残留占大头，新
+    # 线只占零头）——故盲扫前必须保证带内无残留，否则注定白扫还再叠一笔残留。
+    BAND_DIRTY_MIN_PX = BAND_LINE_LEN // 2
+    # 补描「真出了新墨」判据下限：同位重描只掉抗锯齿零头（真机实测残留线上
+    # 重描 46px 只新增 2px），必须远低于一条完整新线、又高于重描零头。
+    BAND_LINE_MIN_NEW_PX = max(4, BAND_LINE_LEN // 4)
     # 滑杆轨道的几何特征：连续暗段最小宽度、允许的行带高度。
     SLIDER_MIN_RUN = 60
     SLIDER_MAX_HEIGHT = 30
@@ -297,6 +310,9 @@ class ToolbarProber:
         self._manual_fold: tuple[float, float] | None = None
         # 工具格盲扫当前在找哪个（橡皮/画笔），仅供进度文案。
         self._tool_scan_label = "工具"
+        # 探测中每个步骤事件后刷新的「截至此刻已知控件」快照：失败时随
+        # ProbeError.partial 交给上层落库成功项（见 run() 的 except）。
+        self._learned: ToolBitmap | None = None
         self._on_step: Callable[[dict], None] = lambda _event: None
         # 调试：设置环境变量 CUP_DRAW_CALIB_DEBUG_DIR 后，每次点击/画线都会
         # 把操作后的窗口截图落盘到该目录，文件名带序号与当前步骤，供复盘。
@@ -377,12 +393,63 @@ class ToolbarProber:
         rescan_collapsed: bool = False,
         undo_prescan: bool = True,
     ) -> ToolBitmap:
+        self._learned = None
+        try:
+            return self._run_flow(
+                canvas=canvas,
+                band=band,
+                open_bitmap=open_bitmap,
+                on_step=on_step,
+                should_stop=should_stop,
+                rescan_collapsed=rescan_collapsed,
+                undo_prescan=undo_prescan,
+            )
+        except ProbeError as exc:
+            # E_STOPPED 是用户主动中止，成果不落库；其余失败携带「截至此刻学到
+            # 的控件位图」，让上层把成功项落库——用户勾掉失败项再校准时无需从头
+            # 重扫（成功项本就依赖的锚点也在其中）。
+            if exc.code != "E_STOPPED":
+                exc.partial = self._learned
+            raise
+
+    def _run_flow(
+        self,
+        *,
+        canvas: tuple[int, int, int, int],
+        band: tuple[int, int, int, int],
+        open_bitmap: "ToolBitmap | None",
+        on_step: Callable[[dict], None],
+        should_stop: Callable[[], bool],
+        rescan_collapsed: bool,
+        undo_prescan: bool,
+    ) -> ToolBitmap:
         self._canvas = tuple(int(v) for v in canvas)
         self._band = tuple[int, int, int, int]((int(v) for v in band))
         self._on_step = on_step
 
         manual = open_bitmap
-        step = self._step
+        step_raw = self._step
+
+        def snapshot() -> None:
+            """把截至此刻已知的控件记入 ``_learned``（失败时随 ProbeError 携带）。"""
+            self._learned = ToolBitmap(
+                brush=brush,
+                eraser=eraser,
+                slider=dict(slider) if slider is not None else None,
+                undo=undo,
+                fold=fold,
+                brush_selected_lum=selected_lum,
+                brush_idle_lum=idle_lum,
+            )
+
+        def step(
+            name: str,
+            state: str,
+            geometry: dict | None = None,
+            evidence: str = "",
+        ) -> None:
+            step_raw(name, state, geometry, evidence)
+            snapshot()
 
         fold = self._clean_point(manual.fold if manual else None)
         self._manual_fold = fold
@@ -401,6 +468,9 @@ class ToolbarProber:
         selected_lum = manual.brush_selected_lum if manual else None
         idle_lum = manual.brush_idle_lum if manual else None
         slider_manual = slider is not None
+        # 人工兜底项即「已知控件」：在任何步骤事件之前就登记，E_PROBE_BAND_DIRTY
+        # 这类首步前的失败同样携带它们。
+        snapshot()
 
         def check_stop() -> None:
             if should_stop():
@@ -426,6 +496,19 @@ class ToolbarProber:
         # 折叠钮扫描按锚点定带、滑杆检测启用宽松档。真机窄高窗口里「画布下缘
         # 数 4 行」够不着任何控件，这条预扫描是锚点的主来源；初始态画板筛不出
         # 候选（标签全在画布左缘以右），预扫描空转即退，点击面与旧实现一致。
+        # 脏带前置门：撤销判据是「带内墨量跌到基线 40% 以下」，而测试线落笔位置
+        # 固定，历次失败留下的残留线与本次新线完全重合——残留占基线大头时，即便
+        # 撤销 100% 命中也永远跌不到阈值（真机实测 98px 基线里 94px 是残留，
+        # 理论最低比值 0.96），盲扫 19 个候选全部空转，还再叠一笔残留，形成
+        # 「越失败越残留、越残留越失败」的死循环。这里在烧点击之前直接短路，
+        # 让用户先清空画布；人工/上次校准已给定撤销坐标时不拦（那条路径不靠
+        # 墨量跌落找撤销，清理也只需回到 _band_baseline_px 的深度）。
+        if undo is None and self._band_baseline_px >= self.BAND_DIRTY_MIN_PX:
+            raise ProbeError(
+                "E_PROBE_BAND_DIRTY",
+                "刻度带内仍有历次探测残留笔迹，撤销/橡皮判据会失效。"
+                "请先在画板清空画布（或用校准页「清空画布」）后重试",
+            )
         undo_prescan_hit = False
         # 结构确认已进入绘画面板（即便开合钮/撤销都没学到）：撤销预扫描误点
         # 画笔标签或 brush_entry 结构判据通过时置真，滑杆缺失时据此降级而非
@@ -652,7 +735,17 @@ class ToolbarProber:
             self._clear_probe_ink(undo, lambda: None)
             self._ink_cleared = True
         except Exception:  # 清理路径：任何失败都不得掩盖原始异常
-            pass
+            # 清不掉也要上报：残留墨会让下一轮盲扫拿着脏基线空转（越失败越
+            # 残留的自毒化循环），用户必须在重试前手动清空画布。上报本身
+            # 失败同样吞掉，不得掩盖原始异常。
+            try:
+                if self._band_ink_pixels() > self._band_baseline_px:
+                    self._step(
+                        STEP_CLEANUP, STATE_FAILED, None,
+                        "探测笔迹未能清理，请手动清空画板后重试自动校准",
+                    )
+            except Exception:
+                pass
 
     def _restore_brush(
         self, brush: tuple[float, float], fold: tuple[float, float] | None
@@ -1753,8 +1846,17 @@ class ToolbarProber:
         就返回空手，回退原折叠钮/入口流程。
 
         胶囊带（`_strip_candidates`）并入同一扫描面：展开态胶囊浮在画布**内**
-        左下角，主候选网格（画布下方）覆盖不到，胶囊带是它唯一可达通道；
-        胶囊带行 y 更小，按行升序自然排在最前。
+        左下角，主候选网格（画布下方）覆盖不到，胶囊带是它唯一可达通道。
+
+        行序**下缘优先**（底缘锚定）：用户确认底部控件簇（撤销胶囊行→工具行→
+        滑杆）整体贴窗口底缘排布，这是与窗口高度/DPI 无关的结构不变量；而
+        「画布下缘 + 固定行数」在真机折叠态差一行就永远够不到撤销行（实测撤销
+        距画布下缘 233px = 第 9 行）。行内容量排序不可用：画布底缘阴影行与画布
+        内笔画行的容量（真机 976/752/406）常压过撤销行（375）。底缘优先天然
+        适配窗口调整：折叠态头两行即工具行/撤销行；展开态胶囊浮入画布内
+        （strip 行 y 更小），排在滑杆/工具/折叠三行之后，仍在预算内。头行
+        误点面：工具行 ∨ 钮可逆，画笔标签=进绘画面板（brush_entry 等效，
+        docstring 既有约束），滑杆行点击=改笔宽（后续本就要压滑杆）。
         """
         by_row: dict[int, list[tuple[int, int]]] = {}
         # 撤销胶囊左缘探出画布左缘、但可点中心落在画布左缘之右（真机实测胶囊
@@ -1762,20 +1864,27 @@ class ToolbarProber:
         # 放宽到「左缘 + 一个网格步长」刚好覆盖胶囊中心，又不越过右侧
         # 「文字/贴纸」标签（那些在更右、更低的工具行，与撤销行不同带）。
         left_limit = float(self._canvas[0]) + self.CANDIDATE_STEP
-        pooled = list(self._strip_candidates)
+        grid: list[tuple[int, int]] = []
         for point in self._candidates:
             if point[0] >= left_limit:
                 continue
             if self._candidate_ink.get(point, 0) < self.CONTENT_ROW_MIN_PX:
                 continue
-            pooled.append(point)
-        for point in pooled:
+            grid.append(point)
+        for point in grid:
             by_row.setdefault(point[1], []).append(point)
-        rows = sorted(by_row)[: self.UNDO_SCAN_MAX_ROWS]
+        rows = sorted(by_row, reverse=True)[: self.UNDO_SCAN_MAX_ROWS]
         ordered: list[tuple[int, int]] = []
         for y in rows:
             ordered.extend(by_row[y])
-        return ordered
+        # 胶囊带候选**不受行预算截断**，整体置顶：展开态胶囊浮在画布内左下角
+        # （真机实测距画布底缘仅 ~50px），而窗口底缘方向常有滑杆行/折叠钮行/
+        # 工具行/底部空白行共 8 行以上，「底缘优先取 N 行」会把胶囊行整个挤掉
+        # ——真机撤销扫描因此永远扫不到胶囊（试遍预算空手），这是撤销学不到的
+        # 主因。胶囊带点来自 _strip_candidates（已按横向跨度门滤掉画布左缘阴影
+        # 列、x 同守左缘 + 一步长安全区），量级只有个位数，全量并入无成本。
+        strip_only = [p for p in self._strip_candidates if p[1] not in by_row]
+        return strip_only + ordered
 
     def _row_grouped(
         self, pooled: list[tuple[int, int]], limit_rows: int
@@ -1832,18 +1941,21 @@ class ToolbarProber:
         return self._find_slider_strict(image)
 
     def _locate_slider(self, image) -> dict | None:
-        """显式找滑杆：strict 失败且有撤销锚点时按宽松档兜底。
+        """显式找滑杆：有撤销锚点优先宽松档，否则退回 strict。
 
-        真机轨道浅灰（230~240），strict 档恒检不到；锚点成立 ⇔ 工具区确实在
-        下方，此时宽松档误把短横杠/阴影带当轨道的代价只是一次笔宽调节失败，
-        远小于整链报「未找到滑杆」丢掉全部探测成果。
+        真机滑杆是「黑色已填充段 + 白色圆点 + 浅灰未填充段（226）」的整轨：
+        strict 档（绝对阈值 160）只看得到黑色段，右缘恒等于**当前圆点位置**——
+        圆点停在 50% 时检出宽度只有半轨，frac→x 映射整体压缩，绘制期换宽全部
+        打在左半段、笔宽纹丝不动（真机实锤）。宽松档（相对背景 delta>16）能
+        同时覆盖灰色段，给出完整轨道，故锚点成立（工具区确认在下方）时优先；
+        误报代价只是一次笔宽调节失败，且长度 [22%,86%] + 行高门 + 列覆盖率门
+        都在兜着。无锚点仍用 strict，保守面不变。
         """
-        strict = self._find_slider_strict(image)
-        if strict is not None:
-            return strict
-        if self._slider_anchor is None:
-            return None
-        return self._find_slider_relaxed(image)
+        if self._slider_anchor is not None:
+            relaxed = self._find_slider_relaxed(image)
+            if relaxed is not None:
+                return relaxed
+        return self._find_slider_strict(image)
 
     def _find_slider_strict(self, image) -> dict | None:
         """工具条区域水平暗段行投影：连续暗 run > 60px、行带高 2~30px 即滑杆轨道。"""
@@ -1870,11 +1982,13 @@ class ToolbarProber:
             if not (self.SLIDER_MIN_HEIGHT <= len(group) <= self.SLIDER_MAX_HEIGHT):
                 continue
             rows = dark[group[0] : group[-1] + 1]
-            cols = np.flatnonzero(rows.any(axis=0))
-            if cols.size == 0:
+            pad = 6
+            ext = dark[max(0, group[0] - pad) : group[-1] + 1 + pad]
+            span = self._track_x_span(rows, image.shape[1], ext.sum(axis=0))
+            if span is None:
                 continue
-            x0, x1 = int(cols[0]), int(cols[-1]) + 1
-            rect = {"x": x0, "y": int(top + group[0]), "w": x1 - x0, "h": len(group)}
+            rect = {"x": span[0], "y": int(top + group[0]),
+                    "w": span[1] - span[0], "h": len(group)}
             if best is None or rect["w"] > best["w"]:
                 best = rect
         return best
@@ -1924,16 +2038,76 @@ class ToolbarProber:
             if not (self.SLIDER_MIN_HEIGHT <= len(group) <= self.SLIDER_MAX_HEIGHT):
                 continue
             rows = np.vstack(masks[group[0] : group[-1] + 1])
-            cols = np.flatnonzero(rows.any(axis=0))
-            if cols.size == 0:
+            pad = 6
+            ext = np.vstack(masks[max(0, group[0] - pad) : group[-1] + 1 + pad])
+            span = self._track_x_span(rows, width, ext.sum(axis=0))
+            if span is None:
                 continue
-            x0, x1 = int(cols[0]), int(cols[-1]) + 1
-            rect = {"x": x0, "y": int(top + group[0]), "w": x1 - x0, "h": len(group)}
+            rect = {"x": span[0], "y": int(top + group[0]),
+                    "w": span[1] - span[0], "h": len(group)}
             if not (min_run < rect["w"] < max_run):
                 continue
             if best is None or rect["w"] > best["w"]:
                 best = rect
         return best
+
+    def _track_x_span(
+        self,
+        rows_dark: np.ndarray,
+        image_width: int,
+        col_tall: np.ndarray | None = None,
+    ) -> tuple[int, int] | None:
+        """行暗带内轨道的真实 x 跨度（不含两侧的杂散列）。
+
+        行投影「首暗列..末暗列」会把轨道旁的文字标签并入（真机「大小」标签距
+        轨道起点仅 30px，轨道 x 被拉到标签上：滑杆 frac→x 映射整体左移 ~75px，
+        标定首档点到标签上成了空操作，宽度表非单调、绘制期换宽不生效）。三重
+        过滤：①列覆盖率 ≥50%（多数行暗）；②``col_tall``——同判据下向上下各扩
+        若干行的暗像素数 ≤ 带高+6，剔除文字笔画（字形比轨道粗，纵向延伸远超
+        带高）；③取最长段为锚，仅跨越「间隙 ≤10% 窗宽且邻段 ≥12px」的缺口，
+        即滑块圆点的白缺口（真机 ~40-56px）。
+        """
+        if rows_dark.size == 0:
+            return None
+        band_h = rows_dark.shape[0]
+        on = rows_dark.mean(axis=0) >= 0.5
+        if col_tall is not None:
+            on &= col_tall <= band_h + 6
+        if not on.any():
+            return None
+        idx = np.flatnonzero(on)
+        runs: list[list[int]] = []
+        start = prev = int(idx[0])
+        for x in idx[1:]:
+            if x - prev > 1:
+                runs.append([start, prev])
+                start = x
+            prev = x
+        runs.append([start, prev])
+        anchor = max(range(len(runs)), key=lambda i: runs[i][1] - runs[i][0])
+        gap_max = max(60, int(image_width * 0.10))
+        while True:
+            if anchor + 1 < len(runs):
+                nxt = runs[anchor + 1]
+                if (nxt[0] - runs[anchor][1] <= gap_max
+                        and nxt[1] - nxt[0] >= 12):
+                    runs[anchor][1] = nxt[1]
+                    runs.pop(anchor + 1)
+                    continue
+            break
+        while anchor > 0:
+            prv = runs[anchor - 1]
+            if (runs[anchor][0] - prv[1] <= gap_max
+                    and prv[1] - prv[0] >= 12):
+                runs[anchor - 1][1] = runs[anchor][1]
+                runs.pop(anchor)
+                anchor -= 1
+            else:
+                break
+        x0, x1 = runs[anchor]
+        if x1 - x0 + 1 < self.SLIDER_MIN_RUN:
+            return None
+        return x0, x1 + 1
 
     @staticmethod
     def _longest_run(row: np.ndarray) -> int:
@@ -2123,10 +2297,13 @@ class ToolbarProber:
             # 重构感知：点击可能引发面板开合/页面跳转（典型：收起态点中画笔格
             # 展开面板，撤销胶囊上移进画布内左下角）——旧帧候选网格整体失效，
             # 按新帧重检画布、重算候选与胶囊带、清空已试集合后重建扫描序。
-            # 仅默认扫描序重建：显式 ordered 是预扫描安全区，重建会让扫描面
-            # 逸出安全区、碰到「文字/贴纸」等不可逆标签。必须排在反应复验
-            # 之前：开合钮点击同样让行带重构，若先复验会把开合钮误认成撤销。
-            if default_order and self._below_canvas_changed(
+            # 两条扫描序都重建，但扫描面各自守恒：默认序回完整扫描序；显式
+            # ordered 是预扫描安全区，重建后仍按新帧重取安全区（胶囊带随新画布
+            # 重锚——真机实测展开态胶囊落在旧带与新主网格的双重盲区，不重锚就
+            # 永远扫不到），左缘 + 一步长的安全约束不变，不会逸出「文字/贴纸」
+            # 等不可逆标签。必须排在反应复验之前：开合钮点击同样让行带重构，
+            # 若先复验会把开合钮误认成撤销。
+            if self._below_canvas_changed(
                 ref, after, self.RELAYOUT_MIN_PX, self.RELAYOUT_MIN_RATIO
             ):
                 rebuilds += 1
@@ -2146,7 +2323,12 @@ class ToolbarProber:
                 # 新帧里胶囊已平移，旧撤销坐标对镜像半区剔除不再有效，
                 # 待本轮重新学到后再生效。
                 self._undo_point = None
-                ordered = self._undo_scan_order()
+                ordered = (
+                    self._undo_scan_order() if default_order
+                    else self._prescan_candidates()
+                )
+                if not ordered:
+                    return None
                 total = len(ordered)
                 i = 0
                 ref = after
@@ -2387,12 +2569,17 @@ class ToolbarProber:
     # ---------- 刻度带 ----------
 
     def _draw_band_line(self) -> bool:
-        """在刻度带固定位置画一条测试线；返回该笔是否新增了墨。
+        """在刻度带固定位置画一条测试线；返回该笔是否**真的**新增了墨。
 
         落笔位置必须固定：橡皮判定依赖「重描后整条线消失」。撤销预算按「实际
         发出的笔数」计：真实应用的撤销历史对每笔（含重叠重描、橡皮空划）都留
         一条记录，只数「像素有变化」的笔会低估预算，撤不干净 → E_PROBE_UNCLEANED
         把整个探测成果丢掉。越撤风险由 _clear_probe_ink 的「回到基线即停」兜底。
+
+        新增墨量要用下限而不是「> 0」：真机带内叠有历史残留线时，同位重描只在
+        残留线上补出抗锯齿零头（实测 46px 的线只新增 2px），`> 0` 会把这种
+        「其实没落笔」当成画笔态可用，既漏掉工具不可用的真信号，又让撤销判据
+        拿着一条并不存在的新线去等跌落。笔数照常累加，预算仍与撤销历史一一对应。
         """
         bx = self._band[0] + 8
         by = self._band[1] + self._band[3] // 2
@@ -2401,7 +2588,7 @@ class ToolbarProber:
         self._stroke((bx, by), (bx + self.BAND_LINE_LEN, by))
         self._sleep(0.12)
         self._probe_strokes += 1
-        return self._band_ink_pixels() > before
+        return self._band_ink_pixels() - before >= self.BAND_LINE_MIN_NEW_PX
 
     def _band_ink_pixels(self, image=None) -> int:
         gray = self._grab() if image is None else image

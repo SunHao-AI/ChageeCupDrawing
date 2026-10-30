@@ -54,12 +54,12 @@ toolsCollapsed:  { 同上（折叠态各点位；折叠态无滑杆时 slider=No
 1. 密度信号沿用「1px 栅格化 + `boxFilter` 大窗口线密度」（[pen_order.py](../backend/app/executor/pen_order.py) 已有，暗部=线密）。
 2. 全笔画密度取**百分位排名** r ∈ [0,1]（分位而非 min-max，抗离群）。
 3. **r 即目标滑杆行程**：密→粗端、疏→细端。恒等映射天然把笔画均匀铺满滑杆全域，滑杆非线性无需补偿；实测宽度表（[pen_calibration.py](../backend/app/executor/pen_calibration.py) 的 `WidthTable`）只保留「滑杆有效性判定」（spread ≥ `MIN_SPREAD_RATIO`），spread 不足照旧回退单细笔。
-4. **先粗后细**保留：绘制序列按目标行程从大到小推进（粗笔铺底接近手绘观感）。
+4. **先细后粗**（2026-10-30 用户裁决改向）：绘制序列按目标行程从小到大推进——起笔最细档，暗部（最粗）最后画、压在最上层；也保证笔宽标定后首笔不复用残留的粗档。断点兼容：`exec_params.widthOrder=2` 标记新笔序，旧断点（无标记且多档表）续画时重置游标重画。
 
 ## 4. 容差合批（换笔次数唯一旋钮）
 
 - 行程 [0,1] 按容差 `tol` 分桶：`bucket = floor(r / tol)`，默认 **tol=0.05** → ≤20 桶；空桶跳过。
-- 桶内最近邻贪心排序（`nearest_order_paths`），跨桶保持粗→细。
+- 桶内最近邻贪心排序（`nearest_order_paths`），跨桶保持细→粗。
 - **仅在进入新桶时点一次滑杆**，点位取**桶下缘**（`bucket*tol`）：沿用「实际宽度绝不粗于计划」约定，桶内偏细有界 ≤ tol。
 - 成本上界 ≈ 20 × 1.4s ≈ 28s（对比逐段 +68 分钟）。
 - 参数变更：删除 `widthTiers`，新增 `widthTolerance`（0.02–0.20，默认 0.05，前端滑杆「换宽粒度」，越小越细腻越慢）；**`autoWidth` 默认值改为 `True`**。`from_dict` 忽略旧 `widthTiers` 字段。

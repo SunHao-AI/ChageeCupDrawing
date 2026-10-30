@@ -230,7 +230,7 @@ def auto_calibrate(
             targets=body.targets,
         )
     except TaskError as exc:
-        raise ApiError(exc.status, exc.code, exc.message) from exc
+        raise ApiError(exc.status, exc.code, exc.message, exc.detail) from exc
 
 
 @router.post("/projects/{project_id}/calibration/auto/stop", status_code=202)

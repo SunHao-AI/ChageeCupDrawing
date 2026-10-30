@@ -122,6 +122,9 @@ class FakeProbe:
     def left_button_pressed(self) -> bool:
         return False
 
+    def left_button_held(self) -> bool:
+        return False
+
     def esc_pressed(self) -> bool:
         return self.esc_flag
 
@@ -1263,8 +1266,10 @@ def test_create_task_accepts_frontend_exec_payload(
         assert exec_params["widthTolerance"] == 0.05
         assert exec_params["autoWidth"] is True
         assert "widthTiers" not in exec_params
-        # widthTable 由执行器回写，其余键必须与前端 payload 完全一致。
-        assert {k: v for k, v in exec_params.items() if k != "widthTable"} == exec_payload
+        # widthTable 由执行器回写、widthOrder 是后端笔序版本（前端恢复时按
+        # EXEC_KEYS 剥离），其余键必须与前端 payload 完全一致。
+        internal = {"widthTable", "widthOrder"}
+        assert {k: v for k, v in exec_params.items() if k not in internal} == exec_payload
         width_table = exec_params.get("widthTable")
         assert width_table is None or isinstance(width_table, list)
 

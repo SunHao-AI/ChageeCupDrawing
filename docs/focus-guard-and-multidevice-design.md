@@ -127,8 +127,8 @@ graph LR
 | --- | --- | --- | --- |
 | 前台丢失 | `GetForegroundWindow() != target_hwnd` | `focus_lost` | 无歧义信号。微信内嵌子窗口的处理见下段 |
 | 窗口最小化/不可见 | `IsIconic(hwnd)` 或 `!IsWindowVisible(hwnd)` | `focus_lost` | 与窗口丢失（现有 `E_WINDOW_LOST`）区分：最小化可恢复，报告为暂停而非失败 |
-| 光标接管 | 笔迹间间隙时 `GetCursorPos` 偏离注入器最后落点超过 `cursorTakeoverPx`（默认 6 px） | `mouse_takeover` | 判定时机只在两条笔迹之间（此刻光标位置由注入器精确已知）；笔画中途不比——注入的中间点本身在高速移动 |
-| 物理点击 | 非注入窗口期内 `GetAsyncKeyState(VK_LBUTTON) & 0x8001` 置位 | `mouse_takeover` | 注入器自己 down/up 的时段记入守卫线程的「豁免窗口」，窗口期内的按下位不计。用户滚轮、右键不拦（不影响画布） |
+| 光标接管 | 笔迹间间隙时 `GetCursorPos` 偏离注入器最后落点超过 `cursorTakeoverPx`（默认 6 px）**且连续 2 个间隙采样仍超阈值** | `mouse_takeover` | 判定时机只在两条笔迹之间（此刻光标位置由注入器精确已知）；笔画中途不比——注入的中间点本身在高速移动。单次超阈值不停：笔画进行中的一次性光标跳变（触控板轻碰、远控、系统跳光标）会被下一笔的注入定位拉回，下个间隙自然清零；真接管（持续拖动）才连续命中（真机误停复盘，见 open-items 1A.1） |
+| 物理点击 | 非注入窗口期内 `GetAsyncKeyState(VK_LBUTTON)` 置位 | `mouse_takeover` | 「按下又抬起」的完整一次点击（边位）即刻停笔；「当前按住」高位须连续 2 轮确认，且注入器抬笔 ≤1s 内读到悬挂按下位时先补发一次 LEFTUP 自愈（SendInput 丢 up 会让系统按键状态悬挂）。注入器自己 down/up 的时段记入「豁免窗口」不计。用户滚轮、右键不拦（不影响画布） |
 | ESC | 现有逻辑原样并入 | `esc` | 已验证 |
 
 一个 Windows 特有的歧义必须处理：微信小程序运行在微信主窗口的内嵌渲染子窗口中，用户在小程序内正常使用时前台句柄可能仍是顶层微信窗口，但部分操作（如右键菜单、系统弹窗、切换聊天）会让前台短暂跳到其他句柄。因此前台判定不比较裸句柄，而是比较「前台窗口的根属主」：沿 `GetAncestor(GA_ROOTOWNER)` 上溯后与目标顶层窗口比对，避免正常使用时误停。`[Expert judgment]`（判定函数需在真实微信窗口上回归验证，`[To be confirmed]`）
@@ -275,7 +275,7 @@ AdbTarget 不经投屏，用 MaaFramework `AdbController` 截图 + MaaTouch 触�
 | I16 | `POST /api/devices/mirror` | 新增 | 启动 scrcpy 子进程：请求 `{ serial, adbPath?, port? }`，成功 `201 { hwnd, title, pid }`；scrcpy 缺失返回 `503 E_MIRROR_UNAVAILABLE` |
 | I17 | `DELETE /api/devices/mirror` | 新增 | 结束子进程，`204`；无进程时 `404 E_NOT_FOUND` |
 | I8 | `POST /api/plans/{planId}/tasks` | 契约扩展 | `ExecParams` 新增 §3.6 三字段 |
-| I10 | SSE 事件 | 扩展 | `task.done` 的 `stopReason` 新增值；`task.warning` 新增 `countdown_frozen` |
+| I10 | SSE 事件 | 扩展 | `task.done` 的 `stopReason` 新增值；`task.warning` 新增 `countdown_frozen`；守护停笔时 `task.done` 附 `stopEvidence`（trigger/偏移量/按键读数），并伴随一条 `code=stop_evidence` 的 warning 说明判据 |
 
 守护不需要新接口：暂停走既有 `/stop` 同款状态机，恢复走既有 `/resume`。前端拿到 `stopReason ∈ {focus_lost, mouse_takeover, screen_changed}` 时把状态标签渲染成「已暂停」而非「已停止」，并展示对应引导：切回目标窗口 → 点续画。
 

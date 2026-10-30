@@ -4,8 +4,9 @@
 仅在换笔时短暂展开。开合状态从截图直接判定：
 
   1. 折叠后画布可能扩大盖住滑杆区域——滑杆中心落在当前检测出的画布内 ⇒ 折叠；
-  2. 否则按滑杆轨道的墨迹占比：展开时轨道有深色段+圆点（占比 ≥3%），
-     收起后该位置是浅色空白（≈0），阈值取 1%。
+  2. 否则按滑杆轨道占比：展开时轨道有色段+圆点（相对白底的深色像素占比 ≥1%），
+     收起后该位置是浅色空白（≈0）。真机轨道是浅灰（~226），深色判定必须走
+     「与该带白底（p90）的相对差」而非绝对灰度阈值。
 
 「折叠」「展开」是外表不同、功能相反的两个独立按钮：折叠钮只在展开态显示，
 展开钮只在收起态显示，各自只在对应状态下可点。因此 fold/unfold 接收的是
@@ -21,11 +22,17 @@ from __future__ import annotations
 import time
 from typing import Callable, Iterable, Protocol
 
-from app.core.vision.canvas_detect import detect_canvas_rect
-from app.executor.ink_measure import ink_occupied_fraction
+import numpy as np
 
-# 滑杆轨道深色占比阈值：展开时深色段+圆点 ≥3%，收起后≈0，取中间值。
+from app.core.vision.canvas_detect import detect_canvas_rect
+
+# 滑杆轨道深色占比阈值：展开时轨道段+圆点占比远超 1%，收起后被画布覆盖或
+# 该位置为纯白空白（≈0）。深色判定不用绝对灰度阈值（<160）：真机轨道是浅灰
+# ~226，绝对阈值永远判 0，面板态恒被误读为「收起」→ unfold 死循环。改用
+# 「与该带白底（p90）的相对差」（与滑杆宽松档 SLIDER_RELAX_DELTA 同思路），
+# 跨 DPI/配色稳健。
 PANEL_OPEN_OCCUPIED = 0.01
+TRACK_RELAX_DELTA = 16
 SETTLE_S = 0.45
 # 单个按钮候选的点击预算：点一下不翻转即判该钮在当前态无效，换下一个候选。
 CLICKS_PER_BUTTON = 2
@@ -72,7 +79,7 @@ class PanelController:
                 # 画布已盖住滑杆：只能是折叠态，此时区域内的墨迹是绘制笔画。
                 return False
         rect = (slider_rect["x"], slider_rect["y"], slider_rect["w"], slider_rect["h"])
-        return ink_occupied_fraction(image, rect) >= PANEL_OPEN_OCCUPIED
+        return _track_ratio(image, rect) >= PANEL_OPEN_OCCUPIED
 
     def fold(self, slider_rect: dict, buttons: Iterable[dict | None]) -> bool:
         """收起面板。首选展开态才显示的「折叠」钮，次选「展开」钮兜底。"""
@@ -130,3 +137,22 @@ class PanelController:
             return
         self._probe.activate()
         self._sleep(0.15)
+
+
+def _track_ratio(image, rect: tuple[int, int, int, int]) -> float:
+    """轨道区域内「比白底明显深」的像素占比。
+
+    背景取该带 p90 灰度（轨道即便横贯半带，白底仍是上分位主体），比「行中位」
+    稳健——带高仅 12px、轨道覆盖 ~56% 时中位数会落在轨道自己身上，delta 恒 0。
+    真机实测：展开态轨道 226 vs p90 白底 ~253 → 占比 0.56；收起态全白 → ~0。
+    """
+    gray = image[..., 0] if image.ndim == 3 else image
+    x, y, w, h = (int(v) for v in rect)
+    x2 = min(gray.shape[1], max(0, x) + max(1, w))
+    y2 = min(gray.shape[0], max(0, y) + max(1, h))
+    x, y = max(0, x), max(0, y)
+    if x2 <= x or y2 <= y:
+        return 0.0
+    crop = gray[y:y2, x:x2]
+    background = float(np.percentile(crop, 90))
+    return float((background - crop.astype(np.int16) > TRACK_RELAX_DELTA).mean())

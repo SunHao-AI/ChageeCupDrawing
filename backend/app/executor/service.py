@@ -31,7 +31,7 @@ from app.device.target import (
     resolve_target,
 )
 from app.executor import canvas_blankness
-from app.executor.guard import GuardProbe, Win32GuardProbe, evaluate_signals
+from app.executor.guard import GuardProbe, GuardState, Win32GuardProbe, evaluate_signals
 from app.executor.ink_measure import detect_stray_ink, ink_pixels
 from app.executor.native_mouse import NativeMouse, path_length
 from app.executor.panel_control import PanelController
@@ -68,6 +68,9 @@ ARM_STABLE_S = 0.5
 # 标定扫描档数：只用于判断滑杆是否真的能调宽（宽度 spread），
 # 不再对应绘制档数/桶数（桶数由 width_tolerance 推导）。
 CALIBRATION_PROBE_TIERS = 5
+
+# 分桶笔序版本：2 = 先细后粗。写进 exec_params 供续画判定断点是否仍可比对。
+WIDTH_ORDER_VERSION = 2
 
 # 探测刻度带工作区：画布顶部条带，只用于工具栏探测自己的落笔与观测。
 # 标定基线已改由 PenCalibrator 用其真实 band 计算，不再复用这里的推导。
@@ -106,11 +109,14 @@ GUARD_ERROR_LIMIT = 20
 class TaskError(Exception):
     """携带 HTTP 状态与业务错误码的执行器失败。"""
 
-    def __init__(self, status: int, code: str, message: str) -> None:
+    def __init__(
+        self, status: int, code: str, message: str, detail: object | None = None
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
+        self.detail = detail
 
 
 @dataclass(frozen=True)
@@ -174,6 +180,8 @@ class ExecParams:
             "autoWidth": self.auto_width,
             "widthTolerance": self.width_tolerance,
             "widthTable": [list(t) for t in self.width_table] if self.width_table else None,
+            # 笔序版本：2 = 先细后粗；缺失或 1 = 旧版先粗后细（断点续画须重置游标）。
+            "widthOrder": WIDTH_ORDER_VERSION,
         }
 
 
@@ -190,6 +198,9 @@ class _RunHandle:
     reason: str | None = None
     # 两条笔迹之间注入器精确已知的光标位置（屏幕坐标）。
     settled_cursor: tuple[int, int] | None = None
+    # 守护判定证据（触发源/偏移量/按键读数）：随 task.done 的 stopEvidence
+    # 上报，用于事后区分「真接管」与「误判」。
+    stop_evidence: dict | None = None
 
     def request_stop(self, reason: str) -> None:
         if self.reason is None:
@@ -338,13 +349,13 @@ class ExecutorService:
         params = ExecParams.from_dict(record.exec_params)
         cursor = record.cursor_path
         if cursor > 0 and self._legacy_tier_order(record.exec_params):
-            # 升级前（widthTiers 档位序）创建的断点：笔序与当前容差分桶不同，
-            # 从旧游标续画会漏画/错宽；本次从第 1 笔重画，避免静默错序。
-            # 同时把 exec_params 迁移成当前格式（as_dict 不再输出 widthTiers），
-            # 否则下次续画会重复触发这段重置与 warning。
+            # 旧笔序（widthTiers 档位序 / 先粗后细分桶）创建的断点：桶间顺序与
+            # 当前算法不同，从旧游标续画会漏画/错宽；本次从第 1 笔重画，避免
+            # 静默错序。同时把 exec_params 迁移成当前格式（as_dict 输出
+            # widthOrder 版本），否则下次续画会重复触发这段重置与 warning。
             self._emit(task_id, "task.warning", {
-                "message": "该任务由旧版按档位顺序创建，断点笔序与当前算法不同；"
-                           "已从第 1 笔重新开始（请确认画布已清空）"
+                "message": "该任务由旧版笔序创建（先粗后细或按档位排序），断点笔序"
+                           "与当前算法不同；已从第 1 笔重新开始（请确认画布已清空）"
             })
             self._store.update_task(
                 task_id, cursor_path=0, exec_params=params.as_dict()
@@ -894,6 +905,7 @@ class ExecutorService:
                 })
 
         completed: list[str] = []
+        failed_steps: list[str] = []
 
         def emit_step(event: dict) -> None:
             state = event.get("state")
@@ -907,6 +919,8 @@ class ExecutorService:
                     "step": event.get("step"),
                     "geometry": geometry,
                 })
+            elif state == STATE_FAILED:
+                failed_steps.append(str(event.get("step")))
 
         try:
             result = self._auto_calibrate_impl(
@@ -916,7 +930,18 @@ class ExecutorService:
                 emit_step=emit_step,
             )
         except TaskError as exc:
-            publish("calibration.failed", {"code": exc.code, "message": exc.message})
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            # 失败项 = 步骤事件报过 failed 的 ∪ 本轮选中却没学到的（脏带门禁等
+            # 早退路径在任何步骤事件前短路，只有后者）。与 POST 错误体同集合，
+            # SSE/POST 谁先到前端结果都一致。
+            detail_failed = detail.get("failedSteps") or []
+            publish("calibration.failed", {
+                "code": exc.code,
+                "message": exc.message,
+                "saved": bool(detail.get("saved")),
+                "savedSteps": detail.get("savedSteps") or [],
+                "failedSteps": list(dict.fromkeys([*detail_failed, *failed_steps])),
+            })
             raise
         except Exception as exc:
             publish("calibration.failed", {
@@ -1037,7 +1062,49 @@ class ExecutorService:
                     rescan_collapsed=want_all or STEP_FOLD in probe_targets,
                 )
             except ProbeError as exc:
-                raise TaskError(409, exc.code, exc.message) from exc
+                # 部分成功也要落库：本轮识别的画布 + 已学到的控件（含未选中项的
+                # 既有坐标）合并入库，失败项沿用既有坐标不丢旧值。用户勾掉失败
+                # 项再校准即只补失败项，无需从头重扫；detail 告知前端「已有成果
+                # 入库」+ 本轮选中却未学到的步骤，前端据此回读校准并预选失败项。
+                detail: dict[str, object] = {"saved": False, "savedSteps": []}
+                if exc.partial is not None:
+                    learned = {
+                        STEP_UNDO: exc.partial.undo,
+                        STEP_FOLD: exc.partial.fold,
+                        STEP_SLIDER: exc.partial.slider,
+                        STEP_ERASER: exc.partial.eraser,
+                        STEP_BRUSH: exc.partial.brush,
+                    }
+                    merged = self._merge_partial_bitmap(previous, exc.partial, dx, dy)
+                    base = previous or self._auto_base_profile(
+                        project_id, target, canvas, shot.method
+                    )
+                    self._persist_probed_calibration(
+                        project_id, base, merged, 0.0, 0.0,
+                        rect=canvas,
+                        window_title=self._device.title(base.hwnd),
+                        capture_method=shot.method,
+                        snapshot_id=snapshot_id_out,
+                        frame_w=image_w,
+                        frame_h=image_h,
+                    )
+                    detail = {
+                        "saved": True,
+                        "savedSteps": [STEP_CANVAS] + [
+                            step for step, value in (
+                                (STEP_UNDO, merged.undo),
+                                (STEP_FOLD, merged.fold),
+                                (STEP_SLIDER, merged.slider),
+                                (STEP_ERASER, merged.eraser),
+                                (STEP_BRUSH, merged.brush),
+                            )
+                            if value is not None
+                        ],
+                        "failedSteps": [
+                            name for name in probe_targets if learned[name] is None
+                        ],
+                    }
+                raise TaskError(409, exc.code, exc.message, detail) from exc
 
         # 5) 落库：坐标与本次识别的 rect 同帧（dx=dy=0），无需回移。
         base = previous or self._auto_base_profile(
@@ -1134,6 +1201,48 @@ class ExecutorService:
             fold=pixel(STEP_FOLD, previous.fold),
             brush_selected_lum=open_raw.get("brush_selected_lum") if keep_brush else None,
             brush_idle_lum=open_raw.get("brush_idle_lum") if keep_brush else None,
+        )
+
+    def _merge_partial_bitmap(
+        self,
+        previous: CanvasProfile | None,
+        partial: ToolBitmap,
+        dx: float,
+        dy: float,
+    ) -> ToolBitmap:
+        """探测失败部分成果与既有坐标合并（当前帧坐标系）。
+
+        ``partial`` 已含未选中项的既有坐标（人工兜底路径随帧平移）；本轮探了却
+        没学到的字段为 None，回落到既有坐标（平移到当前帧），失败项不丢旧值。
+        画笔坐标回落到旧值时，选中亮度指纹同样取旧值（指纹与画笔位置绑定）。
+        """
+        open_raw = (previous.tools_open or {}) if previous is not None else {}
+
+        def pick(name: str, value, legacy=None):
+            if value is not None:
+                return value
+            if previous is None:
+                return None
+            return self._shift_point(open_raw.get(name) or legacy, dx, dy)
+
+        brush = pick("brush", partial.brush)
+        eraser = pick("eraser", partial.eraser)
+        slider = partial.slider
+        if slider is None and previous is not None:
+            slider = self._shift_rect(open_raw.get("slider") or previous.slider, dx, dy)
+        selected_lum = partial.brush_selected_lum
+        idle_lum = partial.brush_idle_lum
+        if partial.brush is None and brush is not None and previous is not None:
+            selected_lum = open_raw.get("brush_selected_lum")
+            idle_lum = open_raw.get("brush_idle_lum")
+        return ToolBitmap(
+            brush=brush,
+            eraser=eraser,
+            slider=slider,
+            undo=pick("undo", partial.undo, previous.undo if previous else None),
+            fold=pick("fold", partial.fold, previous.fold if previous else None),
+            brush_selected_lum=selected_lum,
+            brush_idle_lum=idle_lum,
         )
 
     def _auto_base_profile(
@@ -1757,15 +1866,31 @@ class ExecutorService:
                     })
                 else:
                     if self._canvas_size_drifted(collapsed_rect, new_rect):
-                        raise TaskError(
-                            409,
-                            "E_CANVAS_DRIFT",
-                            "工具面板开合改变了画布矩形（开局 x,y,w,h="
-                            f"{new_rect.x},{new_rect.y},{new_rect.w},{new_rect.h} / 收起 "
-                            f"{collapsed_rect.x},{collapsed_rect.y},"
-                            f"{collapsed_rect.w},{collapsed_rect.h}），"
-                            "本任务已停止以免笔迹错位；请在面板收起状态重新校准",
+                        # 小幅纯高度变化（左/上/宽不动、增幅 ≤10%）＝ 折叠让
+                        # 画布下缘按预期扩大（真机 770→799，29px），映射基准
+                        # 就是收起态当前帧本身，继续落笔安全。大幅扩大（如盖住
+                        # 滑杆的 30%+）仍按 C1 停止：那种布局下工具坐标全被画布
+                        # 吞掉，落笔必错位。
+                        grew = collapsed_rect.h - new_rect.h
+                        expected = (
+                            _is_panel_state_change(new_rect, collapsed_rect)
+                            and 0 < grew <= 0.10 * new_rect.h
                         )
+                        if expected:
+                            self._emit(task_id, "task.warning", {
+                                "message": "面板收起后画布按预期扩大（高度 "
+                                f"{new_rect.h}→{collapsed_rect.h}），已按收起态画面继续"
+                            })
+                        else:
+                            raise TaskError(
+                                409,
+                                "E_CANVAS_DRIFT",
+                                "工具面板开合改变了画布矩形（开局 x,y,w,h="
+                                f"{new_rect.x},{new_rect.y},{new_rect.w},{new_rect.h} / 收起 "
+                                f"{collapsed_rect.x},{collapsed_rect.y},"
+                                f"{collapsed_rect.w},{collapsed_rect.h}），"
+                                "本任务已停止以免笔迹错位；请在面板收起状态重新校准",
+                            )
                     mapping_rect = collapsed_rect
 
         # 首笔前强制画笔校验：绝不在橡皮态下笔。旧校准无法判定，降级放行并提示。
@@ -1978,11 +2103,35 @@ class ExecutorService:
     ) -> None:
         reason = handle.reason or "user"
         self._transition(task_id, "STOPPED", stop_reason=reason, finished_at=utc_now())
-        self._emit(task_id, "task.done", {
+        payload: dict = {
             "status": "STOPPED", "stopReason": reason,
             "donePaths": done, "totalPaths": total,
             "elapsedMs": int((time.monotonic() - started) * 1000),
-        })
+        }
+        # 守护停笔附带判定证据（trigger/偏移量/按键读数），前端原样展示，
+        # 用户与开发者都能据此判断「真接管」还是「误判」。
+        if handle.stop_evidence:
+            payload["stopEvidence"] = handle.stop_evidence
+            self._emit(task_id, "task.warning", {
+                "message": f"停笔判据：{self._evidence_text(reason, handle.stop_evidence)}",
+                "code": "stop_evidence",
+            })
+        self._emit(task_id, "task.done", payload)
+
+    @staticmethod
+    def _evidence_text(reason: str, ev: dict) -> str:
+        trigger = ev.get("trigger", "unknown")
+        if trigger == "cursor":
+            return (
+                f"光标连续 {ev.get('hits')} 次偏离注入落点 "
+                f"{ev.get('cursorOffsetPx')}px（阈值 {ev.get('cursorThresholdPx')}px）"
+            )
+        if trigger in ("button_click", "button_hold"):
+            return (
+                f"检测到物理左键{'按下' if trigger == 'button_click' else '长按'}"
+                f"（距上次抬笔 {ev.get('msSinceLastUp')}ms）"
+            )
+        return f"{reason}（{ev}）"
 
     def _finish_failed(
         self, task_id: str, code: str, message: str, done: int, total: int, started: float
@@ -2074,11 +2223,11 @@ class ExecutorService:
         paths: list[list[tuple[float, float]]],
         params: ExecParams,
     ) -> list[tuple[int, float, list[tuple[float, float]]]]:
-        """无宽度表或仅 1 档时平铺为单桶；否则按容差 + 局部密度分桶（先粗后细）。
+        """无宽度表或仅 1 档时平铺为单桶；否则按容差 + 局部密度分桶（先细后粗）。
 
-        返回 [(桶号, 桶下缘行程, 笔迹)]，桶号越大越粗。续画会基于同一份
-        width_table 与容差重算，结果必须逐位一致（有锁定测试）。纯函数，
-        不在此发消息，分档提示由调用点在拿到结果后发出。
+        返回 [(桶号, 桶下缘行程, 笔迹)]，桶号越大越粗、绘制顺序从最小桶（最细）
+        开始。续画会基于同一份 width_table 与容差重算，结果必须逐位一致（有锁定
+        测试）。纯函数，不在此发消息，分档提示由调用点在拿到结果后发出。
         """
         if params.width_table is None or len(params.width_table) < 2:
             return [(0, 0.0, p) for p in paths]
@@ -2091,18 +2240,21 @@ class ExecutorService:
 
     @staticmethod
     def _legacy_tier_order(raw: dict) -> bool:
-        """判断是否为旧版按档位排序创建的记录（widthTiers 语义）。
+        """判断断点笔序是否与当前算法不同（续画会漏画/错宽）。
 
-        旧版把 width_table 的每一档再按密度重排；新版按容差重新分桶，顺序可能
-        不同。只有多档宽度表才涉及重排，单档/无表仍是原始笔序，可安全续画。
+        两种历史形态：
+        1. 最早期按 `widthTiers` 档数重排（无 `widthTolerance`）；
+        2. 「先粗后细」笔序期（无 `widthOrder` 标记）：现已改为先细后粗，桶间
+           顺序完全颠倒，旧游标续画会把没画的细档区当作已画跳过。
+        只有多档宽度表才涉及重排，单档/无表仍是原始笔序，可安全续画。
         """
         table = raw.get("widthTable")
-        return (
-            "widthTiers" in raw
-            and "widthTolerance" not in raw
-            and bool(table)
-            and len(table) >= 2
-        )
+        multi_tier = bool(table) and len(table) >= 2
+        if not multi_tier:
+            return False
+        if "widthTiers" in raw and "widthTolerance" not in raw:
+            return True
+        return int(raw.get("widthOrder") or 1) < WIDTH_ORDER_VERSION
 
     @staticmethod
     def _shift_rect(rect: dict | None, dx: float, dy: float) -> dict | None:
@@ -2273,10 +2425,13 @@ class ExecutorService:
         self._emit(task_id, "task.warning", {"message": "检测到非画笔工具，已自动切回画笔"})
 
     def _brush_selected(self, tools: ToolBitmap, target: DrawingTarget) -> bool:
-        """画笔格中心亮度 >= (选中+未选中)/2 即视为选中。
+        """画笔格中心亮度与指纹做**最近邻**匹配判选中。
 
         取样盒与 ToolbarProber._cell_lum 一致（±4px 均值），否则探测得到的
-        指纹在绘制期不可比。截图失败时按「已选中」放行，避免误伤绘制。
+        指纹在绘制期不可比。不能假设「选中更亮/更暗」的方向：取样盒罩住
+        图标字形时选中态灰底胶囊反而更暗（真机实测选中 134 / 未选中 205），
+        方向写死的 `lum >= 中点` 会把选中态永远判成未选中、E_NOT_BRUSH 死锁。
+        最近邻对两向皆成立。截图失败时按「已选中」放行，避免误伤绘制。
         """
         if tools.brush_selected_lum is None or tools.brush_idle_lum is None:
             return True
@@ -2291,7 +2446,9 @@ class ExecutorService:
         if crop.size == 0:
             return True
         lum = float(crop.mean())
-        return lum >= (tools.brush_selected_lum + tools.brush_idle_lum) / 2.0
+        return abs(lum - tools.brush_selected_lum) <= abs(
+            lum - tools.brush_idle_lum
+        )
 
     def _ensure_brush_before_draw(
         self,
@@ -2690,6 +2847,7 @@ class ExecutorService:
 
         def poll() -> None:
             consecutive_errors = 0
+            guard_state = GuardState()
             while not handle.guard_event.is_set():
                 try:
                     # 守护未激活时也要每轮读一次左键：GetAsyncKeyState 的「自上次
@@ -2699,7 +2857,7 @@ class ExecutorService:
                         self._probe.left_button_pressed()
                     reason = evaluate_signals(
                         handle, self._probe, mouse, target,
-                        params.cursor_takeover_px, params.focus_guard,
+                        params.cursor_takeover_px, params.focus_guard, guard_state,
                     )
                     consecutive_errors = 0
                 except Exception:
@@ -2716,6 +2874,7 @@ class ExecutorService:
                     time.sleep(poll_s)
                     continue
                 if reason is not None:
+                    handle.stop_evidence = dict(guard_state.evidence)
                     handle.request_stop(reason)
                     return
                 time.sleep(poll_s)

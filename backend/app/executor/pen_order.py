@@ -1,14 +1,15 @@
-"""逐段笔序：按局部笔迹密度给每段笔画分配连续目标笔宽，并生成「先粗后细」的绘制顺序。
+"""逐段笔序：按局部笔迹密度给每段笔画分配连续目标笔宽，并生成「先细后粗」的绘制顺序。
 
-先画粗笔快速铺暗部底，再逐段变细，视觉更接近手绘。目标笔宽来自绘制前笔宽标定；
-未启用自动变粗时原样返回，保证既有任务的路径顺序逐位不变。
+起笔用最细档（符合「自动变粗」直觉、也保证标定后第一笔不是残留的粗档），
+随笔画进度逐档变粗；暗部（高密度）最粗、最后画，恰好压在最上层。目标笔宽
+来自绘制前笔宽标定；未启用自动变粗时原样返回，保证既有任务的路径顺序逐位不变。
 
 密度信号把笔迹本身栅格化成 1px 线后取大窗口均值（局部线密度）。不能用填充
 掩膜做膨胀密度：掩膜是整块暗区，膨胀后区内处处饱和为 1，所有笔迹落进同一桶，
 分桶完全失效。栅格化信号天然反映「线挤在一起=暗部」的手绘逻辑。
 
 密度百分位排名 → 目标滑杆行程 [0,1]，按容差分桶；桶内顺序用与规划同款的最近邻
-贪心（geometry.nearest_order_paths）；跨桶不重排——桶间保持「宽→窄」。
+贪心（geometry.nearest_order_paths）；跨桶不重排——桶间保持「细→粗」。
 """
 
 from __future__ import annotations
@@ -67,7 +68,7 @@ def target_fractions(paths: list[Path]) -> list[float]:
 
 
 def width_buckets(paths: list[Path], tol: float) -> list[tuple[int, float, list[Path]]]:
-    """→ [(桶号, 桶下缘行程, 桶内笔迹)]，按桶号降序（宽→窄）。桶号=floor(f/tol)。
+    """→ [(桶号, 桶下缘行程, 桶内笔迹)]，按桶号升序（细→粗）。桶号=floor(f/tol)。
 
     tol 夹在 [0.02, 0.20]，NaN 回退默认 0.05。桶上限由 tol 推导：
     cap = ceil(1/tol) - 1，保证桶下缘 bucket*tol ≤ 1（tol=0.05 → 19 档、
@@ -85,6 +86,6 @@ def width_buckets(paths: list[Path], tol: float) -> list[tuple[int, float, list[
         # 行程掉进下一档；加 1e-9 修正到 floor(f/tol) 的真值。
         groups.setdefault(min(cap, int(frac / tol + 1e-9)), []).append(path)
     out: list[tuple[int, float, list[Path]]] = []
-    for bucket_id in sorted(groups, reverse=True):      # 宽→窄
+    for bucket_id in sorted(groups):                     # 细→粗
         out.append((bucket_id, bucket_id * tol, nearest_order_paths(groups[bucket_id])))
     return out

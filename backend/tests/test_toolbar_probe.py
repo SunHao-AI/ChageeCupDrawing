@@ -261,6 +261,47 @@ class NoSliderBoard(ToolbarBoard):
         return img
 
 
+def test_locate_slider_excludes_label_and_spans_whole_track() -> None:
+    """真机回归：轨道左邻「大小」标签、右段浅灰、圆点白缺口，三者都不得破坏定位。
+
+    旧实现按「首暗列..末暗列」取 x 跨度，把 30px 外的文字标签并入轨道（x 左移
+    ~75px，标定首档点到标签上成空操作、宽度表非单调、绘制期换宽不生效）；
+    strict 档又只看得到黑色已填充段（右缘=圆点位置，半轨），映射整体压缩。
+    期望：有撤销锚点时走宽松档，给出**不含标签的完整轨道**（黑色段+灰色段，
+    跨越圆点缺口）。
+    """
+    image = np.full((1357, 720, 3), 255, np.uint8)
+    # 轨道：黑色已填充段 99..594，圆点白缺口 595..640，浅灰未填充段 641..699
+    image[1199:1207, 99:595] = 0
+    image[1199:1207, 641:700] = 226
+    # 「大小」文字标签：高 26px 的竖笔画（比轨道高，纵向延伸远超带高）
+    for x0 in (36, 64):
+        image[1190:1216, x0 : x0 + 3] = 0
+
+    class _ImageBoard:
+        def __init__(self) -> None:
+            self.image_data = image
+            self.clicks: list[tuple[float, float]] = []
+            self.open = True
+
+        def image(self) -> np.ndarray:
+            return self.image_data
+
+        def click(self, x: float, y: float) -> None:
+            self.clicks.append((x, y))
+
+    prober, _mouse = _prober(_ImageBoard())  # type: ignore[arg-type]
+    prober._canvas = (96, 202, 531, 770)
+    prober._slider_anchor = 924.0
+
+    rect = prober._locate_slider(image)
+    assert rect is not None
+    assert rect["x"] >= 90, f"轨道左缘被文字标签污染: {rect}"
+    assert rect["x"] <= 105
+    # 完整轨道：右缘须越过圆点到灰色段末端（strict 档只会给到圆点 ~595）
+    assert rect["x"] + rect["w"] >= 690, f"未覆盖浅灰未填充段: {rect}"
+
+
 class FarFoldBoard(ToolbarBoard):
     """折叠钮落在候选序第 10 行（预算外），预算内不应被扫到。"""
 
@@ -856,9 +897,12 @@ def test_undo_capsule_inside_canvas_found_via_strip():
     result = _run(board, steps=steps)
     assert result.undo is not None
     assert _inside(CapsuleBoard.UNDO_HALF, result.undo)
-    # 命中点 (42,344) 在画布内——证明走了胶囊带豁免而非被拒/绕过。
-    assert _inside(CANVAS, (42.0, 344.0))
-    assert (42.0, 344.0) in board.clicks
+    # 命中点在画布内——证明走了胶囊带豁免而非被拒/绕过。底缘优先行序下胶囊带
+    # 两行按 y 降序进入，(42,372) 先行命中（旧 y 升序下是 (42,344)）；两态均
+    # 为胶囊带登记的画布内点，豁免语义不变。
+    hit = (float(result.undo[0]), float(result.undo[1]))
+    assert _inside(CANVAS, hit)
+    assert hit in board.clicks
     # 除胶囊带登记点外，其余点击仍在画布外。
     assert all(
         not _inside(CANVAS, point) or point in {(42.0, 344.0), (42.0, 372.0)}

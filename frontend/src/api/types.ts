@@ -232,6 +232,8 @@ export interface TaskWarningPayload {
 export interface TaskDonePayload {
   status: TaskStatus
   stopReason?: string
+  /** 守护停笔的判定证据（trigger/偏移/按键读数），用于区分真接管与误判。 */
+  stopEvidence?: Record<string, unknown>
   errorCode?: string
   message?: string
   donePaths: number

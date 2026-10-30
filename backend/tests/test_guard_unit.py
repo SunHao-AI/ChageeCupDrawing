@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from app.executor.guard import BUTTON_EXEMPT_S, evaluate_signals
+from app.executor.guard import BUTTON_EXEMPT_S, CONFIRM_HITS, GuardState, evaluate_signals
 
 pytest.importorskip("ctypes", reason="守护模块依赖 ctypes")
 
@@ -32,6 +32,7 @@ class StubProbe:
             "esc": False,
             "space": False,
             "lbtn": False,
+            "held": False,
             "cursor": (100, 100),
             **flags,
         }
@@ -47,6 +48,9 @@ class StubProbe:
 
     def left_button_pressed(self) -> bool:
         return self.flags["lbtn"]
+
+    def left_button_held(self) -> bool:
+        return self.flags["held"]
 
     def cursor_pos(self) -> tuple[int, int]:
         return self.flags["cursor"]
@@ -92,6 +96,7 @@ class StubMouse:
     def __init__(self, active: bool = False, last_up: float | None = None) -> None:
         self._active = active
         self._last_up = last_up
+        self.releases = 0
 
     def button_active(self) -> bool:
         return self._active
@@ -99,12 +104,15 @@ class StubMouse:
     def last_button_mono(self) -> float:
         return self._last_up if self._last_up is not None else 0.0
 
+    def up(self) -> None:
+        self.releases += 1
 
-def _eval(handle, probe, mouse=None, takeover_px=6.0, focus_guard=True, target=None):
+
+def _eval(handle, probe, mouse=None, takeover_px=6.0, focus_guard=True, target=None, state=None):
     return evaluate_signals(
         handle, probe, mouse or StubMouse(),
         target if target is not None else _target(probe),
-        takeover_px, focus_guard,
+        takeover_px, focus_guard, state if state is not None else GuardState(),
     )
 
 
@@ -136,7 +144,8 @@ def test_win32_probe_implements_every_protocol_method() -> None:
     probe = Win32GuardProbe()
     for name in (
         "clear_escape_state", "foreground_matches", "activate", "window_usable",
-        "cursor_pos", "left_button_pressed", "esc_pressed", "space_pressed",
+        "cursor_pos", "left_button_pressed", "left_button_held",
+        "esc_pressed", "space_pressed",
     ):
         assert callable(getattr(probe, name, None)), f"Win32GuardProbe 缺少 {name}"
 
@@ -175,7 +184,37 @@ def test_user_click_while_idle_is_takeover() -> None:
     handle = StubHandle(True)
     probe = StubProbe(lbtn=True)
     stale_up = 0.0
+    # 完整的一次「按下又抬起」（边位还在、高位已掉）：即刻停笔。
     assert _eval(handle, probe, StubMouse(last_up=stale_up)) == "mouse_takeover"
+
+
+def test_phantom_button_self_heals_before_stop() -> None:
+    """注入器早已抬笔、系统却仍报按住（LEFTUP 丢失）：先补发 LEFTUP 而不是停笔。"""
+    import time
+
+    handle = StubHandle(True)
+    probe = StubProbe(lbtn=True, held=True)
+    mouse = StubMouse(last_up=time.monotonic() - 0.5)
+    state = GuardState()
+    assert _eval(handle, probe, mouse, state=state) is None
+    assert mouse.releases == 1
+    # 补发后系统不再报按住 → 自愈成功。
+    probe.flags.update({"lbtn": False, "held": False})
+    assert _eval(handle, probe, mouse, state=state) is None
+
+
+def test_real_button_hold_stops_after_confirm() -> None:
+    """真长按（补发 LEFTUP 无效）：连续 CONFIRM_HITS 轮后停笔。"""
+    import time
+
+    handle = StubHandle(True)
+    probe = StubProbe(lbtn=True, held=True)
+    mouse = StubMouse(last_up=time.monotonic() - 5.0)  # 远超悬挂归因窗
+    state = GuardState()
+    for _ in range(CONFIRM_HITS - 1):
+        assert _eval(handle, probe, mouse, state=state) is None
+    assert _eval(handle, probe, mouse, state=state) == "mouse_takeover"
+    assert state.evidence["trigger"] == "button_hold"
 
 
 def test_cursor_deviation_checked_only_between_strokes() -> None:
@@ -184,7 +223,21 @@ def test_cursor_deviation_checked_only_between_strokes() -> None:
     assert _eval(mid_stroke, probe) is None  # 笔画中途不比
 
     settled = StubHandle(True, settled=(10, 10))
-    assert _eval(settled, probe) == "mouse_takeover"
+    state = GuardState()
+    # 单次间隙采样超阈值不再即停：一次性跳变（远控/跳光标）会被下一笔注入
+    # 拉回，须连续 CONFIRM_HITS 个间隙仍超阈值才判接管。
+    for _ in range(CONFIRM_HITS - 1):
+        assert _eval(settled, probe, state=state) is None
+    assert _eval(settled, probe, state=state) == "mouse_takeover"
+    assert state.evidence["trigger"] == "cursor"
+    assert state.evidence["cursorOffsetPx"] > 6.0
+
+    # 偏移回落后计数清零（跳变被注入拉回的情形）。
+    settled2 = StubHandle(True, settled=(100, 100))
+    state2 = GuardState()
+    assert _eval(settled2, probe, state=state2) is None
+    probe.flags["cursor"] = (10, 10)
+    assert _eval(settled2, probe, state=state2) is None
 
     within = StubProbe(cursor=(14, 14))
     assert _eval(settled, within) is None  # 阈值内不误报

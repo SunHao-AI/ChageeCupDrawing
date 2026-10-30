@@ -340,6 +340,52 @@ def test_single_target_without_calibration_requires_canvas(tmp_path, monkeypatch
     assert (exc.value.status, exc.value.code) == (422, "E_CANVAS_MISSING")
 
 
+# ---------- 部分成功落库（失败项可再校准） ----------
+
+
+def test_partial_probe_failure_persists_success(tmp_path, monkeypatch):
+    """探测中途失败：已学到的撤销 + 画布照常落库，failedSteps 报未学到项。"""
+    board = ToolbarBoard()
+    store, svc = _make(tmp_path, board, monkeypatch)
+
+    class FlakyProber(toolbar_probe.ToolbarProber):
+        """探测成果齐备（清理笔迹完成、进入收起态重扫前）时中断探测。"""
+
+        def _step(self, name, state, geometry=None, evidence=""):
+            super()._step(name, state, geometry, evidence)
+            if name == toolbar_probe.STEP_CLEANUP and state == toolbar_probe.STATE_DONE:
+                raise toolbar_probe.ProbeError("E_PROBE_CAPTURE", "模拟探测中断")
+
+    monkeypatch.setattr(
+        service, "ToolbarProber",
+        lambda **kwargs: FlakyProber(sleep=lambda _s: None, **kwargs),
+    )
+
+    with pytest.raises(TaskError) as exc:
+        svc.auto_calibrate("p1", hwnd=HWND)
+    err = exc.value
+    assert (err.status, err.code) == (409, "E_PROBE_CAPTURE")
+    detail = err.detail
+    assert detail["saved"] is True
+    assert "canvas" in detail["savedSteps"]
+    assert "undo" in detail["savedSteps"]
+    # 中断发生在清理完成后：五控件全部学到，失败项为空。
+    assert detail["failedSteps"] == []
+
+    after = store.latest_calibration("p1")
+    assert after is not None
+    assert after.rect_x == CANVAS[0]  # 画布识别结果已入库
+    assert after.tools_open and after.tools_open.get("undo") is not None
+    assert _near(ToolbarBoard.UNDO, after.tools_open["undo"])
+
+    events, _ = svc.calibration_events("p1", 0)
+    failed = [e for e in events if e["type"] == "calibration.failed"]
+    assert failed[-1]["payload"]["saved"] is True
+    assert "undo" in failed[-1]["payload"]["savedSteps"]
+    # SSE 与 POST 错误体的 failedSteps 同集合（前端两通道先到先得须同结果）。
+    assert failed[-1]["payload"]["failedSteps"] == detail["failedSteps"]
+
+
 # ---------- 并发与中止 ----------
 
 

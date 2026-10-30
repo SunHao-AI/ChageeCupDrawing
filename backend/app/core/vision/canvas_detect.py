@@ -101,5 +101,40 @@ def detect_canvas_rect(
     l, t, r, b = best
     inv = 1.0 / scale
     l, t, r, b = (int(round(v * inv)) for v in (l, t, r, b))
+    l, t, r, b = _trim_at_full_width_seam(_as_pil(image).convert("L"), (l, t, r, b))
     inset = max(3, int(round(min(ow, oh) * 0.006)))
     return l + inset, t + inset, r - inset, b - inset
+
+
+def _trim_at_full_width_seam(
+    gray: Image.Image, rect: tuple[int, int, int, int]
+) -> tuple[int, int, int, int]:
+    """在候选矩形内切断「全宽非白分隔带」，把底缘收回第一道带之上。
+
+    画板画布卡片底缘有一条全宽阴影分隔带（真机灰度 249）。面板展开态下画布
+    白区与面板/底部白条仅隔着这条带，白判据（各通道 ≥250）漏孔 → 连通域把
+    画布与下方白色并成一个高矩形，画布底缘被抬到面板之下，工具条定带全部
+    错位。必须在**全分辨率**灰度上找缝：带只有几像素高、灰度只比白判据低
+    1~6 级，缩小图的双线性插值会把它洗成白行（真机实测 420 宽档漏检）。
+
+    分隔带不会出现在画布内部：画布内容（用户笔画/探测线）只占局部宽度，
+    够不到「整行 85% 非白」；跳过顶部 20% 留白防画布内深色横幅误切。
+    """
+    l, t, r, b = rect
+    height = b - t
+    if height < 4:
+        return rect
+    arr = np.asarray(gray, dtype=np.uint8)
+    x0, x1 = min(arr.shape[1], l), max(l + 1, min(arr.shape[1], r))
+    if x1 - x0 < 8:
+        return rect
+    # 上界 20% 防画布内深色横幅误切；下界放到候选底缘：卡片缝贴底缘仅 2~13px
+    # （收起态相对候选高度 ~98.4%），更早的截断切不到 → 收起态被多吸 ~29px，
+    # 与校准值假性漂移 3.6% → E_CANVAS_DRIFT 误报。候选底缘行本身是连通域内
+    # 白像素（mask 判据比 <250 更严），不会自切。
+    limit = b
+    for y in range(t + max(1, int(height * 0.20)), limit):
+        row = arr[y, x0:x1]
+        if float((row < 250).mean()) >= 0.85:
+            return (l, t, r, y)
+    return rect

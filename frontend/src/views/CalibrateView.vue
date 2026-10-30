@@ -197,6 +197,8 @@ let closeEvents: (() => void) | null = null
 let streamEpoch = 0
 // 「延迟关流」只许关闭创建它的那一路流：重跑后旧定时器不得误杀新流。
 let closeTimer: ReturnType<typeof setTimeout> | null = null
+// 部分成功落库只应用一次（POST 错误体与 SSE failed 携同一事实）。
+let partialHandled = false
 
 function scheduleStreamClose(delayMs: number) {
   if (closeTimer !== null) clearTimeout(closeTimer)
@@ -259,9 +261,32 @@ function startEventStream() {
       }
     },
     onFailed: (payload) => {
-      if (epoch === streamEpoch) autoNote.value = payload.message
+      if (epoch !== streamEpoch) return
+      if (payload.saved) {
+        applyPartialSaved(payload.message, payload.failedSteps)
+      } else {
+        autoNote.value = payload.message
+      }
     },
   })
+}
+
+/**
+ * 部分成功落库：成功项（含画布）已入库，把本轮失败项预选进「单独识别」，
+ * 用户直接再点一次就只补失败项；回读校准让标注层立即显示已保存成果。
+ */
+function applyPartialSaved(message: string, failedSteps?: string[]) {
+  // POST 错误体与 SSE calibration.failed 携同一事实，先到先得、只应用一次。
+  if (partialHandled) return
+  partialHandled = true
+  const failed = (failedSteps ?? []).filter((id) =>
+    TARGET_CHOICES.some((choice) => choice.id === id),
+  )
+  if (failed.length) pickTargets.value = new Set(failed)
+  autoNote.value =
+    `${message} —— 成功项已保存，已勾选失败项，再次点击「一键自动校准」只补失败项`
+  void refreshCalibration()
+  captureNonce.value += 1
 }
 
 function stopEventStream() {
@@ -394,6 +419,7 @@ async function onRunAuto() {
   autoSteps.value = []
   liveGeometry.value = {}
   autoNote.value = null
+  partialHandled = false
   projectStore.error = null
   startEventStream()
   try {
@@ -410,8 +436,17 @@ async function onRunAuto() {
     if (result.rect) manualRect.value = { ...result.rect }
     captureNonce.value += 1
   } catch (e) {
-    autoNote.value = e instanceof ApiError ? e.message : String(e)
-    if (e instanceof ApiError && e.code === 'E_CANVAS_DIRTY') dirtyAck.value = true
+    if (e instanceof ApiError) {
+      const detail = e.detail as { saved?: boolean; failedSteps?: string[] } | undefined
+      if (detail?.saved) {
+        applyPartialSaved(e.message, detail.failedSteps)
+      } else {
+        autoNote.value = e.message
+      }
+      if (e.code === 'E_CANVAS_DIRTY') dirtyAck.value = true
+    } else {
+      autoNote.value = String(e)
+    }
   } finally {
     autoRunning.value = false
     // 终态事件由服务端保留窗口内补发，稍后再关流，保证尾步可见。

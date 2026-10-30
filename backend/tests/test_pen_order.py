@@ -1,4 +1,4 @@
-"""逐段目标行程与容差分桶单测：密度百分位 + 桶下缘点位 + 桶间宽→窄。"""
+"""逐段目标行程与容差分桶单测：密度百分位 + 桶下缘点位 + 桶间细→粗。"""
 
 from __future__ import annotations
 
@@ -30,7 +30,8 @@ def test_target_fractions_monotonic_by_density():
 def test_width_buckets_ordering_and_coverage():
     paths = [[(i, 5), (i + 1, 6)] for i in range(0, 100, 10)]
     buckets = width_buckets(paths, 0.05)
-    assert [b[0] for b in buckets] == sorted([b[0] for b in buckets], reverse=True)
+    # 先细后粗：桶号升序（起笔最细档，逐档变粗）
+    assert [b[0] for b in buckets] == sorted([b[0] for b in buckets])
     assert sum(len(b[2]) for b in buckets) == len(paths)
     for bucket_id, edge, _ in buckets:
         assert abs(edge - bucket_id * 0.05) < 1e-9  # 点位取桶下缘
@@ -102,7 +103,7 @@ def test_empty_buckets_skipped(monkeypatch):
     monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: [0.0, 0.5, 1.0])
     buckets = width_buckets(paths, 0.2)
     ids = [b[0] for b in buckets]
-    assert ids == [4, 2, 0]  # 宽→窄，空洞（3、1）不产生空桶
+    assert ids == [0, 2, 4]  # 细→粗，空洞（1、3）不产生空桶
     assert len(buckets) < 5  # cap+1
 
 

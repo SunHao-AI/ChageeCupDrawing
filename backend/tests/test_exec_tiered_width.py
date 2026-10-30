@@ -342,9 +342,10 @@ def test_slider_click_uses_current_frame_canvas(monkeypatch) -> None:
         if SLIDER_LOW["y"] <= y <= SLIDER_LOW["y"] + SLIDER_LOW["h"]
     ]
     assert len(clicks) == 2  # 两次跨桶各一次，档位已推进
+    # 先细后粗：桶 18（下缘 0.90）先画，桶 19（下缘 0.95）最后画
     assert [round(x, 3) for x, _ in clicks] == [
-        SLIDER_LOW["x"] + SLIDER_LOW["w"] * 0.95,
         SLIDER_LOW["x"] + SLIDER_LOW["w"] * 0.90,
+        SLIDER_LOW["x"] + SLIDER_LOW["w"] * 0.95,
     ]
     assert all(y == SLIDER_LOW["y"] + SLIDER_LOW["h"] / 2.0 for _, y in clicks)
     assert any("已切换第 20 档笔宽" in m for m in store.warnings())
@@ -383,6 +384,36 @@ def test_fold_changes_canvas_rect_stops_before_drawing(monkeypatch) -> None:
     assert "收起" in excinfo.value.message
     assert mouse.drags == []  # 未落下任何笔迹
     assert board.open is False  # 面板已收起，等用户重新校准
+
+
+def test_fold_expected_canvas_growth_within_margin_continues(monkeypatch) -> None:
+    """真机回归：折叠使画布高度 770→799（纯高度变化 ~7%）是预期行为，不得误停。
+
+    旧版把这条合法变化当 E_CANVAS_DRIFT，标定都画完了、0 笔中止。豁免判据：
+    左/上/宽不动 + 高度增幅 ≤10%（覆盖真机面板开合的 22~30px），映射基准改用
+    收起态当前帧，继续落笔。
+    """
+    expanded = (0, 0, 400, 430)
+    folded = (0, 0, 400, 461)  # +31px：>3% 容差、≤10% 豁免上限
+
+    board = _TrackBoard(open_=True)
+
+    def detect(_image):
+        return expanded if board.open else folded
+
+    monkeypatch.setattr(service, "detect_canvas_rect", detect)
+    monkeypatch.setattr(panel_control, "detect_canvas_rect", detect)
+    calibration = _calibration(tools_open=_tools(slider=SLIDER_LOW))
+    calibration.rect_x, calibration.rect_y = 0, 0
+    calibration.rect_w, calibration.rect_h = 400, 430
+    store = FakeStore(calibration)
+    params = ExecParams(auto_width=True, width_table=TABLE_3, width_tolerance=0.05)
+    mouse = FakeMouse(board)
+
+    _run(store, board, _paths(1), params, mouse=mouse)
+
+    assert mouse.drags, "豁免后应正常落笔"
+    assert any("面板收起后画布按预期扩大" in m for m in store.warnings())
 
 
 def test_fold_failure_after_width_switch_rechecks_mapping(monkeypatch) -> None:
@@ -462,6 +493,7 @@ def test_calibration_stop_reports_cursor_and_total(monkeypatch) -> None:
 
 def test_buckets_switch_only_when_crossing(monkeypatch) -> None:
     # 0.95 → 桶 19（第 20 档）；0.93 与 0.90 同落桶 18（第 19 档）：只换一次宽。
+    # 先细后粗：桶 18 先画（点位 0.90），桶 19 最后画（点位 0.95）。
     monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
     store = FakeStore(_calibration(tools_open=_tools(brush=None)))
     board = FakeBoard(open_=True)
@@ -472,8 +504,8 @@ def test_buckets_switch_only_when_crossing(monkeypatch) -> None:
     clicks = _slider_clicks(mouse)
     assert len(clicks) == 2  # 点击次数恰等于跨桶次数
     assert [round(x, 3) for x, _ in clicks] == [
-        TRACK["x"] + TRACK["w"] * 0.95,
         TRACK["x"] + TRACK["w"] * 0.90,
+        TRACK["x"] + TRACK["w"] * 0.95,
     ]
     assert all(y == TRACK["y"] + TRACK["h"] / 2.0 for _, y in clicks)
     assert len(mouse.drags) == 3
@@ -732,7 +764,8 @@ def test_probed_bitmap_persisted_in_saved_rect_frame(monkeypatch) -> None:
     mouse2 = _run(store2, FakeBoard(open_=True), _paths(3), params)
     clicks = _slider_clicks(mouse2)
     assert clicks
-    assert clicks[0][0] == pytest.approx(TRACK["x"] + TRACK["w"] * 0.95)
+    # 先细后粗：首个换宽点击是桶 18 下缘 0.90
+    assert clicks[0][0] == pytest.approx(TRACK["x"] + TRACK["w"] * 0.90)
     assert clicks[0][1] == pytest.approx(TRACK["y"] + TRACK["h"] / 2.0)
 
 
@@ -759,7 +792,7 @@ def test_legacy_tier_resume_migrates_once(monkeypatch) -> None:
     monkeypatch.setattr(svc, "_spawn", lambda *args, **kwargs: None)
 
     def legacy_warnings() -> list[str]:
-        return [m for m in store.warnings() if "旧版按档位顺序" in m]
+        return [m for m in store.warnings() if "旧版笔序" in m]
 
     svc.resume(task_id="t1", countdown_ms=0, allow_drift=0.02)
 
@@ -775,6 +808,55 @@ def test_legacy_tier_resume_migrates_once(monkeypatch) -> None:
     assert len(legacy_warnings()) == 1  # 迁移后不再重复重置
 
 
+def test_coarse_first_breakpoint_resume_resets_cursor(monkeypatch) -> None:
+    """先粗后细笔序期（无 widthOrder 标记）的断点续画：桶间顺序已颠倒，须重置游标。
+
+    真机场景：任务在「先粗后细」版本画到一半被停，升级到先细后粗后直接续画会
+    把未画的细档区当已画跳过。重置一次并迁移 widthOrder，第二次续画正常进行。
+    """
+    store = FakeStore(_calibration(tools_open=_tools()))
+    board = FakeBoard(open_=True)
+    mouse = FakeMouse(board)
+    svc = _service(store, mouse)
+    store.task = SimpleNamespace(
+        id="t1",
+        plan_id="plan1",
+        status="STOPPED",
+        cursor_path=43,
+        exec_params={
+            "autoWidth": True,
+            "widthTolerance": 0.05,
+            "widthTable": [[0.12, 6.0], [0.31, 8.0], [0.5, 14.0], [0.88, 23.0]],
+        },
+    )
+    monkeypatch.setattr(svc, "_load_paths", lambda _plan: _paths(3))
+    monkeypatch.setattr(svc, "_target", lambda _plan: FakeTarget(board))
+    monkeypatch.setattr(svc, "_claim", lambda _target: (_RunHandle(), mouse))
+    spawn_cursors: list[int] = []
+    monkeypatch.setattr(
+        svc, "_spawn",
+        lambda *args, **kwargs: spawn_cursors.append(kwargs.get("cursor", args[-1])),
+    )
+
+    svc.resume(task_id="t1", countdown_ms=0, allow_drift=0.02)
+
+    assert any("旧版笔序" in m for m in store.warnings())
+    assert store.task.cursor_path == 0
+    assert spawn_cursors == [0]
+    assert store.task.exec_params["widthOrder"] == 2
+
+    # 单档宽度表不涉及重排，旧断点仍可安全续画（不重置）。
+    store.task.status = "STOPPED"
+    store.task.cursor_path = 5
+    store.task.exec_params = {
+        "autoWidth": True,
+        "widthTolerance": 0.05,
+        "widthTable": [[0.0, 6.0]],
+    }
+    svc.resume(task_id="t1", countdown_ms=0, allow_drift=0.02)
+    assert spawn_cursors == [0, 5]
+
+
 def test_resume_recomputes_identical_sequence(monkeypatch) -> None:
     monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
     store = FakeStore(_calibration(tools_open=_tools()))
@@ -785,7 +867,7 @@ def test_resume_recomputes_identical_sequence(monkeypatch) -> None:
     flat = svc._build_draw_sequence(paths, params)
     assert flat == svc._build_draw_sequence(paths, params)  # 续画重算逐位一致
     buckets = [bucket for bucket, _edge, _path in flat]
-    assert buckets == sorted(buckets, reverse=True)
+    assert buckets == sorted(buckets)  # 先细后粗：桶号升序
     assert all(
         abs(edge - bucket * params.width_tolerance) < 1e-9
         for bucket, edge, _path in flat
