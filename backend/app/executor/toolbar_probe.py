@@ -2232,6 +2232,50 @@ class ToolbarProber:
             b = b[..., 0]
         return int((np.abs(b.astype(np.int16) - a.astype(np.int16)) > 32).sum())
 
+    # 胶囊半区结构判据：图标列的相对暗度下限（图标笔画 100+，悬停光晕 <32）。
+    UNDO_ICON_DELTA = 32
+    # 撤销/重做两图标允许的最大间距：胶囊内实测 ≤45px，放宽到 3 个网格步长；
+    # 工具行上「撤销胶囊→画笔格」这类远距组合不算图标对，走单图标规则。
+    UNDO_PAIR_MAX_GAP = 3 * CANDIDATE_STEP
+
+    def _undo_side_structure_ok(self, image, point: tuple[int, int]) -> bool:
+        """反应复验认定撤销前的结构门禁：点须落在该行撤销图标所在的一侧。
+
+        胶囊分隔线与重做图标同样「每次点击都有反馈」（按压/悬停态 + 明暗
+        互换），行带二次反应判据对它们无判别力——真机误学 (126,1176) 分隔
+        线后清理数百点墨量不动。撤销钮恒在胶囊左半（与胶囊带登记、镜像半区
+        剔除同源的结构先验）：图标对存在时点必须在两图标之间分界之左；只有
+        单图标簇时点必须落在该簇邻域。行带读不出图标结构（全亮禁用态等）
+        不收紧，维持旧行为。
+        """
+        gray = image[..., 0] if image.ndim == 3 else image
+        height = gray.shape[0]
+        half = self.CANDIDATE_STEP // 2
+        top = max(0, int(point[1]) - half)
+        bottom = min(height, int(point[1]) + half + 1)
+        if top >= bottom:
+            return True
+        band = gray[top:bottom, :]
+        background = int(np.median(band))
+        col_hits = ((background - band.astype(np.int16)) > self.UNDO_ICON_DELTA).sum(axis=0)
+        columns = np.flatnonzero(col_hits >= 3)
+        if columns.size == 0:
+            return True
+        clusters: list[list[int]] = [[int(columns[0]), int(columns[0])]]
+        for x in columns[1:]:
+            if int(x) - clusters[-1][1] <= 2:
+                clusters[-1][1] = int(x)
+            else:
+                clusters.append([int(x), int(x)])
+        undo_cluster = clusters[0]
+        if len(clusters) >= 2 and clusters[1][0] - undo_cluster[1] <= self.UNDO_PAIR_MAX_GAP:
+            return float(point[0]) < (undo_cluster[1] + clusters[1][0]) / 2.0
+        return (
+            undo_cluster[0] - self.CANDIDATE_STEP
+            <= float(point[0])
+            <= undo_cluster[1] + self.CANDIDATE_STEP
+        )
+
     # ---------- 3) 撤销按钮 ----------
 
     def _probe_undo(
@@ -2383,6 +2427,9 @@ class ToolbarProber:
             # 只认「行带二次反应」，不认二次点击后的墨量跌落（对橡皮类无
             # 判别力）。触发前再挡掉底部大重构（预扫描不走上方重构检测，
             # 误点展开钮的行带重构近 2000px，不设限会被误认成撤销钮）。
+            # 认定前还要过胶囊半区结构门禁（_undo_side_structure_ok）：
+            # 分隔线/重做每次点击同样有按压反馈，二次反应判据对它们无判别
+            # 力（真机误学 (126,1176) 分隔线，清理数百点墨量不动）。
             if (
                 point[0] < float(self._canvas[0]) + 2 * self.CANDIDATE_STEP
                 and occupied >= baseline * 0.98
@@ -2414,7 +2461,7 @@ class ToolbarProber:
                     self._rowband_changed_px(after, after2, point[1])
                     >= self.UNDO_REACTIVE_MIN_PX
                     or occupied2 < baseline * self.UNDO_DROP_RATIO
-                ):
+                ) and self._undo_side_structure_ok(before_frame, point):
                     self._probe_undos += 2
                     found = (float(point[0]), float(point[1]))
                     self._undo_row = found[1]

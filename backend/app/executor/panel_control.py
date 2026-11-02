@@ -6,7 +6,8 @@
   1. 折叠后画布可能扩大盖住滑杆区域——滑杆中心落在当前检测出的画布内 ⇒ 折叠；
   2. 否则按滑杆轨道占比：展开时轨道有色段+圆点（相对白底的深色像素占比 ≥1%），
      收起后该位置是浅色空白（≈0）。真机轨道是浅灰（~226），深色判定必须走
-     「与该带白底（p90）的相对差」而非绝对灰度阈值。
+     「与轨道带外邻带白底的相对差」而非绝对灰度阈值——背景参照不能取带内
+     分位数，校准学到的轨道带常与轨道等厚，带内 p90 会落在轨道自己身上。
 
 「折叠」「展开」是外表不同、功能相反的两个独立按钮：折叠钮只在展开态显示，
 展开钮只在收起态显示，各自只在对应状态下可点。因此 fold/unfold 接收的是
@@ -29,10 +30,12 @@ from app.core.vision.canvas_detect import detect_canvas_rect
 # 滑杆轨道深色占比阈值：展开时轨道段+圆点占比远超 1%，收起后被画布覆盖或
 # 该位置为纯白空白（≈0）。深色判定不用绝对灰度阈值（<160）：真机轨道是浅灰
 # ~226，绝对阈值永远判 0，面板态恒被误读为「收起」→ unfold 死循环。改用
-# 「与该带白底（p90）的相对差」（与滑杆宽松档 SLIDER_RELAX_DELTA 同思路），
+# 「与轨道带外邻带白底的相对差」（与滑杆宽松档 SLIDER_RELAX_DELTA 同思路），
 # 跨 DPI/配色稳健。
 PANEL_OPEN_OCCUPIED = 0.01
 TRACK_RELAX_DELTA = 16
+# 背景参照邻带高度（轨道带上下各取若干行，同 x 范围）。
+TRACK_REF_ROWS = 12
 SETTLE_S = 0.45
 # 单个按钮候选的点击预算：点一下不翻转即判该钮在当前态无效，换下一个候选。
 CLICKS_PER_BUTTON = 2
@@ -142,9 +145,12 @@ class PanelController:
 def _track_ratio(image, rect: tuple[int, int, int, int]) -> float:
     """轨道区域内「比白底明显深」的像素占比。
 
-    背景取该带 p90 灰度（轨道即便横贯半带，白底仍是上分位主体），比「行中位」
-    稳健——带高仅 12px、轨道覆盖 ~56% 时中位数会落在轨道自己身上，delta 恒 0。
-    真机实测：展开态轨道 226 vs p90 白底 ~253 → 占比 0.56；收起态全白 → ~0。
+    背景参照取轨道带上下邻带（同 x 范围）的中位——不能用带内分位数：校准
+    学到的轨道带常与轨道等厚（真机 y=1199 h=8，全带都是浅灰轨道 226），带内
+    p90/中位数都落在轨道自己身上，delta 恒 0，展开态被恒判「收起」→ unfold
+    永远失败 → E_WIDTH_UNKNOWN。轨道带外的邻带展开态是抽屉白底、收起态是
+    页面白底，两侧都参照不到轨道自身；单侧被「大小」标签等杂质污染时另一侧
+    仍可对冲。邻带完全不可用（贴顶）才回退带内 p90。
     """
     gray = image[..., 0] if image.ndim == 3 else image
     x, y, w, h = (int(v) for v in rect)
@@ -154,5 +160,11 @@ def _track_ratio(image, rect: tuple[int, int, int, int]) -> float:
     if x2 <= x or y2 <= y:
         return 0.0
     crop = gray[y:y2, x:x2]
-    background = float(np.percentile(crop, 90))
+    above = gray[max(0, y - TRACK_REF_ROWS):y, x:x2] if y > 0 else None
+    below = gray[y2 + 1:y2 + 1 + TRACK_REF_ROWS, x:x2]
+    samples = [band.ravel() for band in (above, below) if band is not None and band.size]
+    if samples:
+        background = float(np.median(np.concatenate(samples)))
+    else:
+        background = float(np.percentile(crop, 90))
     return float((background - crop.astype(np.int16) > TRACK_RELAX_DELTA).mean())

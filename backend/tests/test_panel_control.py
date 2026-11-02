@@ -93,6 +93,29 @@ def test_is_open_false_when_canvas_covers_slider() -> None:
     assert _controller(board).is_open(TRACK) is False
 
 
+def test_is_open_true_when_track_fills_whole_band() -> None:
+    # 校准学到的轨道带常与轨道等厚（真机 y=1199 h=8 全是浅灰 226）：带内 p90
+    # 会落在轨道自己身上、delta 恒 0，展开态被恒判「收起」→ unfold 永远失败
+    # → E_WIDTH_UNKNOWN。背景参照必须取轨道带外的邻带白底。
+    class EqualThicknessBoard(ToggleBoard):
+        def capture_image(self) -> np.ndarray:
+            # 抽屉白底（真机轨道 226 vs 白底 ~253），轨道铺满整个轨道带。
+            grid = np.full(SIZE, 255, dtype=np.uint8)
+            l, t, r, b = CANVAS_OPEN if self.open else CANVAS_FOLDED
+            grid[t:b, l:r] = 255
+            if self.open:
+                grid[TRACK["y"]:TRACK["y"] + TRACK["h"], TRACK["x"]:TRACK["x"] + TRACK["w"]] = 226
+            else:
+                # 折叠后画布下扩盖住轨道带：轨道位置改画画布白。
+                grid[TRACK["y"]:TRACK["y"] + TRACK["h"], TRACK["x"]:TRACK["x"] + TRACK["w"]] = 255
+            return grid
+
+    board = EqualThicknessBoard(open_=True)
+    assert _controller(board).is_open(TRACK) is True
+    board.open = False
+    assert _controller(board).is_open(TRACK) is False
+
+
 def test_is_open_none_when_capture_fails() -> None:
     class DeadProbe:
         def capture_image(self):

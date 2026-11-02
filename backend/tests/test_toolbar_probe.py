@@ -1523,3 +1523,31 @@ def test_undo_scan_rejects_redo_revival_click():
     assert board.redo_hits == 2  # 两次点击都被守卫烧进已试集合
     assert redo_point in prober._undo_tried
     assert (redo_point[0] + prober.CANDIDATE_STEP, redo_point[1]) in prober._undo_tried
+
+
+def test_undo_side_structure_rejects_capsule_separator():
+    """F4：反应复验的点击必须落在胶囊左半（撤销图标侧），分隔线/重做侧不认。
+
+    真机误学 (126,1176)=胶囊分隔线/重做左缘：每次点击都有按压反馈，行带二次
+    反应判据无判别力；清理数百点墨量不动。撤销钮恒在胶囊左半（结构先验）。
+    """
+    prober, _ = _prober(ToolbarBoard())
+    prober._canvas = CANVAS
+    prober._band = BAND
+    # 真机胶囊几何等比复刻（y=1176 行带）：撤销图标 x=51..85、分隔线 x=114..115、
+    # 重做图标 x=130..163。
+    image = np.full((1357, 720), 250, dtype=np.uint8)
+    image[1165:1188, 51:86] = 90
+    image[1170:1182, 114:116] = 215
+    image[1165:1188, 130:164] = 90
+    assert prober._undo_side_structure_ok(image, (70, 1176))  # 撤销图标中心
+    assert not prober._undo_side_structure_ok(image, (126, 1176))  # 真机误学位
+    assert not prober._undo_side_structure_ok(image, (140, 1176))  # 重做图标
+    # 单图标簇（重做禁用不可读）：点须落在该簇邻域。
+    single = np.full((1357, 720), 250, dtype=np.uint8)
+    single[1165:1188, 51:86] = 90
+    assert prober._undo_side_structure_ok(single, (70, 1176))
+    assert not prober._undo_side_structure_ok(single, (126, 1176))
+    # 行带无图标（全亮禁用态）：结构读不出，维持旧行为不收紧。
+    blank = np.full((1357, 720), 250, dtype=np.uint8)
+    assert prober._undo_side_structure_ok(blank, (126, 1176))
