@@ -1448,3 +1448,78 @@ def test_probe_stops_mid_scan():
         _run(board, should_stop=should_stop)
     assert exc.value.code == "E_STOPPED"
     assert board.clicks  # 已经开始了候选扫描
+
+
+def test_capsule_strip_registers_only_undo_half():
+    """F1：胶囊带只登记撤销半区，重做图标永不进候选面/豁免面。
+
+    真机误学 (98,920)=重做 的通道正是 strip 登记 + 画布内豁免：重做图标块
+    落在网格点上被登记后，点它会复活已撤销笔迹（墨量涨回），脏带下反应复验
+    又对它二次通过（图标每次点击都明暗互换），清理点它则把用户旧稿整叠复活。
+    """
+    board = ToolbarBoard()
+    prober, _ = _prober(board)
+    # 画布左缘挪到 x=96（真机形态）：strip_left=124，x=70/98 两个网格点都进
+    # 候选循环；胶囊左缘=58，撤销图标 x=58..82、重做图标 x=86..110。
+    prober._canvas = (96, 60, 300, 360)
+    prober._band = BAND
+    image = np.full((700, 600), 255, dtype=np.uint8)
+    image[390:411, 58:83] = 120  # 撤销图标（strip 行 y=400）
+    image[390:411, 86:111] = 120  # 重做图标
+    prober._candidates = prober._make_candidates(image)
+    assert (70, 400) in prober._strip_points  # 撤销半区照常登记+豁免
+    assert (98, 400) not in prober._strip_points  # 重做被半区门剔除
+    prober._click(70.0, 400.0)  # 撤销点可点（豁免）
+    with pytest.raises(ProbeError) as exc:
+        prober._click(98.0, 400.0)  # 重做点画布内点击被硬约束拒绝
+    assert exc.value.code == "E_PROBE_CLICK_IN_CANVAS"
+
+
+class RedoRevivalBoard(ToolbarBoard):
+    """带「重做」按钮的合成板：点击把已撤销的历史笔迹补回刻度带（真机复活）。"""
+
+    REDO = (220, 495, 40, 40)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.redo_hits = 0
+        self.popped: list[tuple[int, int, int, int, np.ndarray]] = []
+
+    def handle_click(self, x: float, y: float) -> None:
+        if self._hit(self._tool_rect(self.REDO), x, y):
+            self.redo_hits += 1
+            if self.popped:
+                ys0, ys1, xs0, xs1, _prev = self.popped.pop()
+                self.canvas_pixels[ys0:ys1, xs0:xs1] = 0
+            return
+        super().handle_click(x, y)
+
+
+def test_undo_scan_rejects_redo_revival_click():
+    """F2：点击后带内墨量上涨=重做复活，当场证伪，不得流进反应复验被误认。
+
+    真机链路：撤销栈被历次失败撤空 → 盲扫点到重做 → 用户旧稿整叠复活，且
+    重做图标每次点击同样明暗互换，「行带二次反应」判据对它无判别力 → 误学
+    成撤销位（98,920），清理点它再把复活稿补得更牢。
+    """
+    board = RedoRevivalBoard()
+    prober, _ = _prober(board)
+    prober._canvas = CANVAS
+    prober._band = BAND
+    prober._candidates = prober._make_candidates(board.image())
+    # 刻度带已有探测测试线（在撤销历史里），重做栈里躺着已撤销的历史墨。
+    region = board.canvas_pixels[88:91, 60:106]
+    prev = region.copy()
+    region[:] = 0
+    board.strokes.append((88, 91, 60, 106, prev))
+    board.popped.append((80, 86, 120, 150, None))
+    prober._probe_strokes = 1
+    redo_point = (238, 510)
+    found = prober._probe_undo(
+        fold=None, slider=None, eraser=None, brush=None,
+        check_stop=lambda: None, ordered=[redo_point, redo_point],
+    )
+    assert found is None  # 复活点击绝不当撤销返回
+    assert board.redo_hits == 2  # 两次点击都被守卫烧进已试集合
+    assert redo_point in prober._undo_tried
+    assert (redo_point[0] + prober.CANDIDATE_STEP, redo_point[1]) in prober._undo_tried

@@ -37,6 +37,8 @@ export interface ExecParams {
   noCoalesce: boolean
   shortStrokeProtect: boolean
   shortStrokeThresholdPx: number
+  /** 落笔最小行程：短于此的笔画沿方向拉伸后再画（画布对超短笔不出墨）。 */
+  minStrokeTravelPx: number
   focusGuard: boolean
   cursorTakeoverPx: number
   guardPollMs: number

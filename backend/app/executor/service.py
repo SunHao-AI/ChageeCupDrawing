@@ -10,6 +10,8 @@ canvas_touched/screen_changed（后两者为画布差分守护，见 docs/undo-r
 from __future__ import annotations
 
 import json
+import math
+import os
 import sys
 import threading
 import time
@@ -32,7 +34,7 @@ from app.device.target import (
 )
 from app.executor import canvas_blankness
 from app.executor.guard import GuardProbe, GuardState, Win32GuardProbe, evaluate_signals
-from app.executor.ink_measure import detect_stray_ink, ink_pixels
+from app.executor.ink_measure import INK_THRESHOLD, detect_stray_ink, ink_pixels
 from app.executor.native_mouse import NativeMouse, path_length
 from app.executor.panel_control import PanelController
 from app.executor.pen_calibration import CalibrationError, PenCalibrator
@@ -69,8 +71,9 @@ ARM_STABLE_S = 0.5
 # 不再对应绘制档数/桶数（桶数由 width_tolerance 推导）。
 CALIBRATION_PROBE_TIERS = 5
 
-# 分桶笔序版本：2 = 先细后粗。写进 exec_params 供续画判定断点是否仍可比对。
-WIDTH_ORDER_VERSION = 2
+# 分桶笔序版本：2 = 先细后粗；3 = 密度值归一化映射 + 短线限宽（旧版百分位排名
+# 把一半笔画摊进粗档，真机糊黑）。写进 exec_params 供续画判定断点是否仍可比对。
+WIDTH_ORDER_VERSION = 3
 
 # 探测刻度带工作区：画布顶部条带，只用于工具栏探测自己的落笔与观测。
 # 标定基线已改由 PenCalibrator 用其真实 band 计算，不再复用这里的推导。
@@ -128,6 +131,9 @@ class ExecParams:
     no_coalesce: bool = True
     short_stroke_protect: bool = True
     short_stroke_threshold_px: float = 1.2
+    # 落笔最小行程（屏幕 px）：短于此的笔画沿方向拉伸后再画。真机画布对
+    # 行程 <8px 的笔画完全不出墨（AB 实测，与笔宽/delay 无关）。
+    min_stroke_travel_px: float = 10.0
     focus_guard: bool = True
     cursor_takeover_px: float = 6.0
     guard_poll_ms: float = 50.0
@@ -150,6 +156,7 @@ class ExecParams:
             no_coalesce=bool(data.get("noCoalesce", True)),
             short_stroke_protect=bool(data.get("shortStrokeProtect", True)),
             short_stroke_threshold_px=float(data.get("shortStrokeThresholdPx", 1.2)),
+            min_stroke_travel_px=float(data.get("minStrokeTravelPx", 10.0)),
             focus_guard=bool(data.get("focusGuard", True)),
             cursor_takeover_px=float(data.get("cursorTakeoverPx", 6.0)),
             guard_poll_ms=float(data.get("guardPollMs", 50.0)),
@@ -173,6 +180,7 @@ class ExecParams:
             "noCoalesce": self.no_coalesce,
             "shortStrokeProtect": self.short_stroke_protect,
             "shortStrokeThresholdPx": self.short_stroke_threshold_px,
+            "minStrokeTravelPx": self.min_stroke_travel_px,
             "focusGuard": self.focus_guard,
             "cursorTakeoverPx": self.cursor_takeover_px,
             "guardPollMs": self.guard_poll_ms,
@@ -180,7 +188,8 @@ class ExecParams:
             "autoWidth": self.auto_width,
             "widthTolerance": self.width_tolerance,
             "widthTable": [list(t) for t in self.width_table] if self.width_table else None,
-            # 笔序版本：2 = 先细后粗；缺失或 1 = 旧版先粗后细（断点续画须重置游标）。
+            # 笔序版本：3 = 值归一化 + 短线限宽；≤2 = 旧版（先粗后细 / 百分位
+            # 排名摊满行程），断点续画须重置游标。
             "widthOrder": WIDTH_ORDER_VERSION,
         }
 
@@ -216,6 +225,31 @@ class _CalibrationRun:
     events: list[dict] = field(default_factory=list)
     done: bool = False
     finished_at: float = 0.0
+
+
+def _extend_short_stroke(
+    screen_path: list[tuple[float, float]], min_len_px: float
+) -> list[tuple[float, float]]:
+    """短于 min_len_px 的笔画沿自身方向拉伸到该行程（屏幕像素）。
+
+    真机画布对行程 <8px 的笔画完全不出墨——AB 实测与笔宽、点距、delay、
+    NOCOALESCE 全无关（1/2/3/5px 全 Δ墨=0，8px 起出墨）。而填充笔序中位行程
+    仅 ~2px，八成的笔会白画。拉伸取「起点不动、末点沿首段方向延伸」：在
+    致密填充里沿方向延长仍是覆盖既有区域，不损伤画面。零方向（单点/重合）
+    向下延伸——画板对零位移 click 同样不落墨。
+    """
+    if path_length(screen_path) >= min_len_px:
+        return screen_path
+    x0, y0 = screen_path[0]
+    if len(screen_path) < 2:
+        return [(x0, y0), (x0, y0 + min_len_px)]
+    x1, y1 = screen_path[-1]
+    dx, dy = x1 - x0, y1 - y0
+    dist = math.hypot(dx, dy)
+    if dist < 1e-3:
+        return [(x0, y0), (x0, y0 + min_len_px)]
+    scale = min_len_px / dist
+    return [(x0, y0), (x0 + dx * scale, y0 + dy * scale)]
 
 
 def step_to_warning(event: dict, prefix: str = "") -> dict:
@@ -941,6 +975,8 @@ class ExecutorService:
                 "saved": bool(detail.get("saved")),
                 "savedSteps": detail.get("savedSteps") or [],
                 "failedSteps": list(dict.fromkeys([*detail_failed, *failed_steps])),
+                "residualPx": detail.get("residualPx"),
+                "residualRegion": detail.get("residualRegion"),
             })
             raise
         except Exception as exc:
@@ -1076,13 +1112,26 @@ class ExecutorService:
                         STEP_BRUSH: exc.partial.brush,
                     }
                     merged = self._merge_partial_bitmap(previous, exc.partial, dx, dy)
+                    # 窗口尺寸变化后旧帧回落坐标可能已出帧：入库前逐控件裁剪，
+                    # 出帧即 None（B1）。savedSteps 只列本轮真正学到且帧内有效的
+                    # 字段（B2），与 failedSteps 互斥；半残坐标不再伪装成能力。
+                    merged = self._clamp_bitmap_to_frame(merged, image_w, image_h)
+                    learned_valid = {
+                        name: value is not None
+                        and self._in_frame(value, image_w, image_h)
+                        for name, value in learned.items()
+                    }
                     base = previous or self._auto_base_profile(
                         project_id, target, canvas, shot.method
                     )
+                    # B3：句柄/标题以本轮实际探测窗口为准——base 可能是旧记录，
+                    # 画板页重进后句柄必变，存错句柄会让后续流程按死句柄找窗口。
+                    live_hwnd = int(getattr(target, "hwnd", base.hwnd)) or base.hwnd
                     self._persist_probed_calibration(
                         project_id, base, merged, 0.0, 0.0,
                         rect=canvas,
-                        window_title=self._device.title(base.hwnd),
+                        hwnd=live_hwnd,
+                        window_title=self._device.title(live_hwnd),
                         capture_method=shot.method,
                         snapshot_id=snapshot_id_out,
                         frame_w=image_w,
@@ -1091,30 +1140,37 @@ class ExecutorService:
                     detail = {
                         "saved": True,
                         "savedSteps": [STEP_CANVAS] + [
-                            step for step, value in (
-                                (STEP_UNDO, merged.undo),
-                                (STEP_FOLD, merged.fold),
-                                (STEP_SLIDER, merged.slider),
-                                (STEP_ERASER, merged.eraser),
-                                (STEP_BRUSH, merged.brush),
+                            step for step in (
+                                STEP_UNDO, STEP_FOLD, STEP_SLIDER, STEP_ERASER, STEP_BRUSH,
                             )
-                            if value is not None
+                            if learned_valid[step]
                         ],
                         "failedSteps": [
-                            name for name in probe_targets if learned[name] is None
+                            name for name in probe_targets
+                            if not learned_valid[name]
                         ],
                     }
+                # B6：清理不彻底时把残留墨量/位置如实上报，前端引导用户手擦，
+                # 不再让残留线静默进入后续绘制成品。
+                if exc.detail:
+                    detail["residualPx"] = exc.detail.get("residualPx")
+                    detail["residualRegion"] = exc.detail.get("region")
                 raise TaskError(409, exc.code, exc.message, detail) from exc
 
         # 5) 落库：坐标与本次识别的 rect 同帧（dx=dy=0），无需回移。
         base = previous or self._auto_base_profile(
             project_id, target, canvas, shot.method
         )
+        # B3：句柄/标题以本轮实际探测窗口为准（成功与部分成功路径同一原则）。
+        live_hwnd = int(getattr(target, "hwnd", base.hwnd)) or base.hwnd
         if tools is not None:
             self._persist_probed_calibration(
-                project_id, base, tools, 0.0, 0.0,
+                project_id, base,
+                self._clamp_bitmap_to_frame(tools, image_w, image_h),
+                0.0, 0.0,
                 rect=canvas,
-                window_title=self._device.title(base.hwnd),
+                hwnd=live_hwnd,
+                window_title=self._device.title(live_hwnd),
                 capture_method=shot.method,
                 snapshot_id=snapshot_id_out,
                 frame_w=image_w,
@@ -1122,10 +1178,15 @@ class ExecutorService:
             )
         else:
             # 仅重识别画布：既有工具坐标随画布平移到新帧，基线随换帧作废。
+            # 平移后仍出帧的控件（窗口缩小时必然发生）置 None（B1）。
+            shifted_open = self._clamp_dict_to_frame(
+                self._shifted_bitmap(base.tools_open, dx, dy), image_w, image_h)
+            shifted_collapsed = self._clamp_dict_to_frame(
+                self._shifted_bitmap(base.tools_collapsed, dx, dy), image_w, image_h)
             self._store.save_calibration(
                 project_id=project_id,
-                hwnd=base.hwnd,
-                window_title=self._device.title(base.hwnd),
+                hwnd=live_hwnd,
+                window_title=self._device.title(live_hwnd),
                 capture_method=shot.method,
                 rect_x=canvas.x,
                 rect_y=canvas.y,
@@ -1134,11 +1195,14 @@ class ExecutorService:
                 dpi_scale=self._device.dpi_scale(base.hwnd),
                 source=base.source,
                 confidence=base.confidence,
-                slider=self._shift_rect(base.slider, dx, dy),
-                undo=self._shift_point(base.undo, dx, dy),
-                fold=self._shift_point(base.fold, dx, dy),
-                tools_open=self._shifted_bitmap(base.tools_open, dx, dy),
-                tools_collapsed=self._shifted_bitmap(base.tools_collapsed, dx, dy),
+                slider=self._clamp_point_dict(
+                    self._shift_rect(base.slider, dx, dy), image_w, image_h),
+                undo=self._clamp_point_dict(
+                    self._shift_point(base.undo, dx, dy), image_w, image_h),
+                fold=self._clamp_point_dict(
+                    self._shift_point(base.fold, dx, dy), image_w, image_h),
+                tools_open=shifted_open,
+                tools_collapsed=shifted_collapsed,
                 device_kind=base.device_kind,
                 device_serial=base.device_serial,
                 blank_baseline=None,
@@ -1202,6 +1266,61 @@ class ExecutorService:
             brush_selected_lum=open_raw.get("brush_selected_lum") if keep_brush else None,
             brush_idle_lum=open_raw.get("brush_idle_lum") if keep_brush else None,
         )
+
+    @staticmethod
+    def _in_frame(value: object, frame_w: int, frame_h: int) -> bool:
+        """控件坐标（点或轨道 dict/tuple）是否落在截图帧内；None 视为有效。"""
+        if value is None:
+            return True
+        if isinstance(value, dict):
+            x = float(value["x"])
+            y = float(value["y"])
+            w = float(value.get("w") or 0.0)
+            h = float(value.get("h") or 0.0)
+        else:
+            parts = [float(v) for v in value]
+            if len(parts) == 2:
+                x, y, w, h = parts[0], parts[1], 0.0, 0.0
+            else:
+                return False
+        return 0.0 <= x <= frame_w and 0.0 <= y <= frame_h \
+            and x + w <= frame_w and y + h <= frame_h
+
+    @classmethod
+    def _clamp_point_dict(cls, value: dict | None, frame_w: int, frame_h: int) -> dict | None:
+        """dict 点/轨道出帧即置 None（legacy 单套字段用）。"""
+        return value if cls._in_frame(value, frame_w, frame_h) else None
+
+    @classmethod
+    def _clamp_bitmap_to_frame(
+        cls, tools: ToolBitmap, frame_w: int, frame_h: int
+    ) -> ToolBitmap:
+        """把落在截图帧外的控件坐标置 None（窗口缩小后旧帧坐标已不存在）。
+
+        宁缺勿错：出帧坐标点下去不是点空（fold 失效→标定跳过）就是画布上落墨
+        （滑杆轨道被画布吞掉），都不能伪装成可用能力。
+        """
+        return replace(
+            tools,
+            brush=tools.brush if cls._in_frame(tools.brush, frame_w, frame_h) else None,
+            eraser=tools.eraser if cls._in_frame(tools.eraser, frame_w, frame_h) else None,
+            slider=tools.slider if cls._in_frame(tools.slider, frame_w, frame_h) else None,
+            undo=tools.undo if cls._in_frame(tools.undo, frame_w, frame_h) else None,
+            fold=tools.fold if cls._in_frame(tools.fold, frame_w, frame_h) else None,
+        )
+
+    @staticmethod
+    def _clamp_dict_to_frame(raw: dict | None, frame_w: int, frame_h: int) -> dict | None:
+        """dict 形态（tools_collapsed / legacy 单套字段）的帧内裁剪。"""
+        if not raw:
+            return raw
+        out = dict(raw)
+        for key in ("brush", "eraser", "undo", "fold"):
+            if not ExecutorService._in_frame(out.get(key), frame_w, frame_h):
+                out[key] = None
+        if not ExecutorService._in_frame(out.get("slider"), frame_w, frame_h):
+            out["slider"] = None
+        return out
 
     def _merge_partial_bitmap(
         self,
@@ -1810,17 +1929,22 @@ class ExecutorService:
         # 自动变粗：首绘先用行为探测补齐控件坐标（上方），再标定笔宽表（刻度带
         # 测试线→清空画布），续画复用已回写的宽度表，保证分桶笔序与首绘逐次一致。
         if rendering_calibration:
+            width_blocked = False
             if slider_open is None:
+                width_blocked = True
                 self._emit(task_id, "task.warning", {
                     "message": "未标定粗细滑杆，已回退单细笔绘制"
-                               "（清空画布后重新开始将自动探测，或到校准页框选滑杆轨道）"
+                               "（清空画布后重新开始将自动探测，或到校准页框选滑杆轨道）",
+                    "code": "width_unknown_fallback",
                 })
             elif undo_open is None and canvas_blank is False:
                 # 标定要在刻度带画测试线；没有撤销标记就清不掉，而画布已有用户
                 # 墨迹时更不能冒险——与其留下脏线，不如保持单细笔。
+                width_blocked = True
                 self._emit(task_id, "task.warning", {
                     "message": "画布已有笔迹且未标记撤销按钮，无法安全清空标定测试线，"
-                               "本次回退单细笔绘制（清空画布后重新开始可启用自动变粗）"
+                               "本次回退单细笔绘制（清空画布后重新开始可启用自动变粗）",
+                    "code": "width_unknown_fallback",
                 })
             else:
                 if panel is not None and panel_open is not True:
@@ -1830,10 +1954,12 @@ class ExecutorService:
                         panel_open = True
                     else:
                         # 展开失败时滑杆可能被画布覆盖，点下去就是墨点：跳过标定。
+                        width_blocked = True
                         self._emit(task_id, "task.warning", {
-                            "message": "工具面板无法展开，跳过笔宽标定（本次单细笔绘制）"
+                            "message": "工具面板无法展开，跳过笔宽标定（本次单细笔绘制）",
+                            "code": "width_unknown_fallback",
                         })
-                if panel is None or panel_open is True:
+                if not width_blocked and (panel is None or panel_open is True):
                     params = self._run_pen_calibration(
                         task_id, params, mouse, target, client, image_size,
                         new_rect, slider_open, undo_open, handle,
@@ -1841,6 +1967,42 @@ class ExecutorService:
                     )
                     if params is None:  # 标定被停止，已落 STOPPED
                         return
+                    width_blocked = False
+            # B4 宽度门禁：以上任何降级路径都意味着笔宽 = 滑杆当前停留位置，
+            # 而停留位置可能停在任意档（探测/标定中途退出就会留下粗档）。
+            # 「单细笔」不能只是话术——轨道可见时先点最左端归位（点击可靠），
+            # 轨道不可见/不可知则阻断，绝不以不可知的宽度落笔。
+            if width_blocked:
+                track_visible = slider_open is not None and (
+                    panel is None or panel_open is True
+                )
+                homed = False
+                if track_visible:
+                    hx = slider_open["x"] + 2.0
+                    hy = slider_open["y"] + slider_open["h"] / 2.0
+                    homed = self._click_image_point(
+                        mouse, target, (hx, hy), image_size, client, canvas=new_rect,
+                    )
+                    if homed:
+                        if handle.stop_event.wait(0.25):
+                            self._finish_stopped(task_id, cursor, total, started, handle)
+                            return
+                        # 尽力保持细档：把面板折回，避免展开态遮挡画布下部。
+                        if panel is not None and panel_open is True:
+                            if panel.fold(slider_open, self._button_chain(fold_open)):
+                                panel_open = False
+                if homed:
+                    self._emit(task_id, "task.warning", {
+                        "message": "本次按固定笔宽绘制：已把粗细滑杆归位到最细档。"
+                                   "如需自动变粗，请完成校准后重新开始",
+                        "code": "width_homed_finest",
+                    })
+                else:
+                    raise TaskError(409, "E_WIDTH_UNKNOWN", (
+                        "自动变粗未生效（原因见上一条告警），且粗细滑杆无法归位——"
+                        "笔宽将停留在滑杆当前位置（可能是最粗档）。"
+                        "请在小程序里手动把大小滑杆拖到最左，或完成校准后重新开始"
+                    ))
 
         # 宽度表存在即视为自动变粗生效（哪怕只有 1 档）：面板必须收起，否则
         # 会遮住画布下部。多档才涉及换笔与分桶。
@@ -1918,12 +2080,22 @@ class ExecutorService:
         point_delay_s = max(0.0, params.point_delay_ms) / 1000
         stroke_delay_s = max(0.0, params.stroke_delay_ms) / 1000
         active_bucket: int | None = None
+        # 落笔诊断（CUPDRAW_INK_DEBUG=前N笔）：换笔链路疑似把画布/工具切到
+        # 异常态导致整段零墨。开对前 N 笔逐笔量「落笔前后画布墨量差」并随
+        # 画笔格亮度上报，用于事后定位「注入发生但不落墨」的真凶。未设环境变量
+        # 时 ink_dbg_budget=0，零额外截图、零行为改变。
+        ink_dbg_budget = 0
+        try:
+            ink_dbg_budget = max(0, int(os.environ.get("CUPDRAW_INK_DEBUG", "0")))
+        except (TypeError, ValueError):
+            ink_dbg_budget = 0
         # 画布差分守护只对 mirror 目标启用：PC 目标上用户鼠标笔画同样是注入
         # 事件，画面差分与注入墨迹不可区分，强开只会把正常绘制误停。
         canvas_guard_active = params.canvas_guard and target.kind == "mirror"
         guard_scale_x = mapping_rect.w / max(1, calibration.rect_w)
         guard_scale_y = mapping_rect.h / max(1, calibration.rect_h)
         guard_region = (mapping_rect.x, mapping_rect.y, mapping_rect.w, mapping_rect.h)
+        ink_dbg_region = guard_region
 
         for index in range(cursor, total):
             if handle.stop_event.is_set():
@@ -1962,6 +2134,14 @@ class ExecutorService:
                             canvas=guard_canvas,
                         )
                         # 点位取桶下缘（target_frac 即 bucket*tol），保证实际不粗于计划。
+                        # 必须钳制到宽度表实测行程区间：标定点击在轨道两端内缩
+                        # 12%（PenCalibrator.TRACK_EDGE_INSET），表外行程从未被
+                        # 验证——真机实测 frac<0.12 落到轨道左缘外（x≈98），笔宽
+                        # ≈0，绘制期整桶零墨（最细档恰好全是细线=只见零星点）。
+                        if params.width_table:
+                            table_fracs = [f for f, _w in params.width_table]
+                            target_frac = min(max(target_frac, min(table_fracs)),
+                                              max(table_fracs))
                         sx = slider_open["x"] + slider_open["w"] * target_frac
                         sy = slider_open["y"] + slider_open["h"] / 2.0
                         if self._click_image_point(
@@ -2013,34 +2193,43 @@ class ExecutorService:
             # 差分守护的 P 帧：换宽/换笔的收尾（面板折回）已完成，此刻起画布上
             # 出现任何注入笔迹邻域外的新墨都是预期外（手指误触）。
             guard_before = target.capture_image() if canvas_guard_active else None
-            if len(screen_path) == 1 or path_length(screen_path) < params.short_stroke_threshold_px:
-                hold = max(0.010, params.click_hold_ms / 1000)
-                if params.short_stroke_protect:
-                    hold = max(hold, 0.022)
-                handle.stroking.set()
-                mouse.click(*screen_path[0], hold=hold)  # type: ignore[attr-defined]
-                # 先落静置点再解除笔画标志：反过来会留出「旧静置点 vs 新光标」的误判窗口。
-                handle.settled_cursor = (round(screen_path[0][0]), round(screen_path[0][1]))
+            dbg_before_frame = None
+            dbg_before_ink: int | None = None
+            if index - cursor < ink_dbg_budget:
+                dbg_before_frame = target.capture_image()
+                if dbg_before_frame is not None:
+                    dbg_before_ink = ink_pixels(dbg_before_frame, ink_dbg_region)
+            # 短于最小行程的笔（含单点）先拉伸再画：该画板对行程 <8px 的
+            # 笔画完全不出墨（AB 实测，click/微拖/笔宽/delay 全试过），零散
+            # 点就是这么丢的。足够长的笔原样通过，统一走 drag 通道。
+            screen_path = _extend_short_stroke(
+                screen_path, params.min_stroke_travel_px
+            )
+            handle.stroking.set()
+            completed = mouse.drag_polyline(  # type: ignore[attr-defined]
+                screen_path,
+                event_step_px=params.event_step_px,
+                point_delay_s=point_delay_s,
+                should_stop=handle.stop_event.is_set,
+                no_coalesce=params.no_coalesce,
+                short_stroke_protect=params.short_stroke_protect,
+            )
+            if completed:
+                handle.settled_cursor = (
+                    round(screen_path[-1][0]), round(screen_path[-1][1])
+                )
                 handle.stroking.clear()
             else:
-                handle.stroking.set()
-                completed = mouse.drag_polyline(  # type: ignore[attr-defined]
-                    screen_path,
-                    event_step_px=params.event_step_px,
-                    point_delay_s=point_delay_s,
-                    should_stop=handle.stop_event.is_set,
-                    no_coalesce=params.no_coalesce,
-                    short_stroke_protect=params.short_stroke_protect,
-                )
-                if completed:
-                    handle.settled_cursor = (round(screen_path[-1][0]), round(screen_path[-1][1]))
-                    handle.stroking.clear()
-                else:
-                    self._finish_stopped(task_id, index, total, started, handle)
-                    return
+                self._finish_stopped(task_id, index, total, started, handle)
+                return
 
             done = index + 1
             self._store.update_task(task_id, cursor_path=done)
+            if dbg_before_ink is not None:
+                self._emit_ink_debug(
+                    task_id, index, bucket, screen_path, dbg_before_frame,
+                    dbg_before_ink, tools_open, target, ink_dbg_region,
+                )
             if canvas_guard_active and guard_before is not None:
                 stop_reason = self._canvas_diff_reason(
                     guard_before, target, canvas_path, guard_region,
@@ -2068,6 +2257,68 @@ class ExecutorService:
             "status": "DONE", "donePaths": total, "totalPaths": total,
             "elapsedMs": int((time.monotonic() - started) * 1000),
         })
+
+    def _emit_ink_debug(
+        self,
+        task_id: str,
+        index: int,
+        bucket: int,
+        screen_path: list[tuple[float, float]],
+        before_frame: object,
+        before_ink: int,
+        tools: ToolBitmap | None,
+        target: DrawingTarget,
+        region: tuple[int, int, int, int],
+    ) -> None:
+        """落笔诊断（CUPDRAW_INK_DEBUG）：量这一笔的真实落墨并上报。
+
+        delta=0 且光标读数确认按下发生在画布内 → 注入不落墨；bbox 偏离起终点
+        → 映射/画布基准错位。任何截图失败静默跳过：诊断绝不允许伤及绘制。
+        """
+        try:
+            time.sleep(0.12)
+            after = target.capture_image()
+            if after is None or before_frame is None:
+                return
+            after_ink = ink_pixels(after, region)
+            added_bbox = None
+            if after_ink != before_ink:
+                gray_a = after[..., 0] if after.ndim == 3 else after
+                gray_b = (before_frame[..., 0]
+                          if before_frame.ndim == 3 else before_frame)
+                x0, y0 = region[0], region[1]
+                mask = (gray_a < INK_THRESHOLD) & ~(gray_b < INK_THRESHOLD)
+                mask = mask[y0:y0 + region[3], x0:x0 + region[2]]
+                ys, xs = np.where(mask)
+                if len(xs):
+                    added_bbox = (int(xs.min()) + x0, int(ys.min()) + y0,
+                                  int(xs.max()) + x0, int(ys.max()) + y0)
+            brush_lum = None
+            if tools is not None and tools.brush is not None:
+                gray = after[..., 0] if after.ndim == 3 else after
+                bx, by = int(tools.brush[0]), int(tools.brush[1])
+                crop = gray[max(0, by - 4):by + 5, max(0, bx - 4):bx + 5]
+                if crop.size:
+                    brush_lum = round(float(crop.mean()), 1)
+            found = detect_canvas_rect(after)
+            p0 = screen_path[0]
+            p1 = screen_path[-1]
+            self._emit(task_id, "task.warning", {
+                "code": "ink_debug",
+                "message": (
+                    f"[ink_dbg] #{index} b{bucket} "
+                    f"Δ墨={after_ink - before_ink} "
+                    f"新墨bbox={added_bbox} "
+                    f"起终点=({round(p0[0])},{round(p0[1])})→"
+                    f"({round(p1[0])},{round(p1[1])}) "
+                    f"画笔lum={brush_lum} "
+                    f"画布检测={None if found is None else tuple(found)} "
+                    f"光标={target.cursor_position() if hasattr(target, 'cursor_position') else None} "
+                    f"左键={target.left_button_pressed() if hasattr(target, 'left_button_pressed') else None}"
+                ),
+            })
+        except Exception:  # noqa: BLE001 - 诊断路径绝不允许打断绘制
+            return
 
     def _canvas_diff_reason(
         self,
@@ -2231,7 +2482,7 @@ class ExecutorService:
         """
         if params.width_table is None or len(params.width_table) < 2:
             return [(0, 0.0, p) for p in paths]
-        buckets = width_buckets(paths, params.width_tolerance)
+        buckets = width_buckets(paths, params.width_tolerance, params.width_table)
         return [
             (bucket, edge, path)
             for bucket, edge, group in buckets
@@ -2400,9 +2651,21 @@ class ExecutorService:
             })
             return
         if tools.brush_selected_lum is None or tools.brush_idle_lum is None:
+            # 指纹不完整 ≠ 可以跳过：用户手动擦画布后工具常停在橡皮态，
+            # 跳过校验会让标定测试线全变成擦除（E_CALIBRATION_NO_INK）、
+            # 绘制期整段零墨。画笔格点击是幂等的（已选中再点无副作用），
+            # 盲点一次 + 告警，好过在橡皮态下落笔。
             self._emit(task_id, "task.warning", {
-                "message": "画笔选中指纹不完整，本次跳过画笔校验"
+                "message": "画笔选中指纹不完整，已盲点画笔格以确保画笔态"
             })
+            if not self._click_image_point(
+                mouse, target, tools.brush, image_size, client, canvas=canvas,
+            ):
+                raise TaskError(
+                    409, "E_NOT_BRUSH",
+                    "画笔按钮坐标落在画布内，无法确认画笔态；已停止以免误擦画面",
+                )
+            time.sleep(0.25)
             return
         if self._brush_selected(tools, target):
             return
@@ -2599,20 +2862,62 @@ class ExecutorService:
 
         基线失效（整幅翻转）先作废；判空白且尚无基线时快照一张。基线读写
         失败都不影响判定结论——它是增强层，不是正确性依赖。
+
+        常驻悬浮撤销按钮锚定画布左下，每次截图都贡献上千墨像素，真空白画布
+        会被 L1 误判为脏（B5）。判定前按校准里的撤销坐标从墨量统计中挖掉该
+        矩形；豁免区宁小勿大，漏判脏只是多一次人工确认，误豁免真笔画会让
+        盲点探测敢于误触清空类控件。
         """
+        exclude = self._hover_exclude_rects(calibration, region)
         baseline = calibration.blank_baseline
         try:
-            if canvas_blankness.baseline_is_stale(image, region, baseline):
+            if canvas_blankness.baseline_is_stale(image, region, baseline, exclude):
                 self._persist_blank_baseline(calibration, None)
                 baseline = None
-            blank = canvas_blankness.is_blank(image, region, baseline)
+            blank = canvas_blankness.is_blank(image, region, baseline, exclude)
             if blank and baseline is None:
                 self._persist_blank_baseline(
-                    calibration, canvas_blankness.learn_baseline(image, region)
+                    calibration,
+                    canvas_blankness.learn_baseline(image, region, exclude),
                 )
             return blank
         except Exception:  # 掩码编解码等任何异常退回无基线的 L1 直判
-            return canvas_blankness.is_blank(image, region, None)
+            return canvas_blankness.is_blank(image, region, None, exclude)
+
+    # 悬浮撤销/重做按钮组豁免区（相对撤销按钮中心）：撤销在左、重做在右、
+    # 中心距 ~76px、按钮直径 ~34（真机实测：撤销 70 / 重做 146，宽 33）。
+    # 撤销可用性与画布状态无关（重做历史独立存在），只豁免撤销钮会把
+    # 「空画布+可重做」的正常态误判为脏（脏源正是右侧重做按钮 420px）。
+    HOVER_UNDO_EXCLUDE = (-20, -22, 116, 44)
+
+    def _hover_exclude_rects(
+        self, calibration: CanvasProfile, region: tuple[int, int, int, int]
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        """常驻悬浮撤销/重做按钮组在当前画布帧下的豁免矩形（可能 0-2 个）。
+
+        撤销按钮随面板态有两种锚定位置；两套位图入库时都反平移到 saved_rect
+        帧，因此统一按 saved_rect → 当前画布帧平移。与画布无交集的不豁免。
+        """
+        ex, ey, ew, eh = self.HOVER_UNDO_EXCLUDE
+        saved = (float(calibration.rect_x), float(calibration.rect_y))
+        collapsed = calibration.tools_collapsed or {}
+        sources = (
+            (calibration.undo, saved),
+            ((calibration.tools_open or {}).get("undo"), saved),
+            (collapsed.get("undo"), saved),
+        )
+        rects: list[tuple[int, int, int, int]] = []
+        for raw, origin in sources:
+            point = self._point_dict(raw)
+            if point is None:
+                continue
+            x = point["x"] + region[0] - origin[0]
+            y = point["y"] + region[1] - origin[1]
+            # 撤销钮常半悬在画布左缘外（撤销点 x 可小于画布左缘）；不能因撤销点
+            # 落在画布外就跳过整组豁免——脏源往往是画布内的重做钮。豁免框越界
+            # 部分交给 _zero_excluded 裁到画布边界即可。
+            rects.append((int(x + ex), int(y + ey), ew, eh))
+        return tuple(rects)
 
     def _persist_blank_baseline(
         self, calibration: CanvasProfile, baseline: dict | None
@@ -2716,6 +3021,16 @@ class ExecutorService:
         except ProbeError as exc:
             if exc.code == "E_STOPPED":
                 return None
+            if exc.code == "E_PROBE_UNCLEANED" and task_id is not None:
+                # B6：探测自己画的线没撤干净，继续落笔会把残留线焊进成品。
+                # 绘制流程必须停笔等人工清理；清空画布流程（task_id=None）
+                # 本来就要清掉全部墨迹，残留无害，只警告。
+                residual = (exc.detail or {}).get("residualPx")
+                region = (exc.detail or {}).get("region")
+                raise TaskError(409, "E_PROBE_UNCLEANED", (
+                    f"探测笔迹未能撤销干净（残留约 {residual}px，位置 {region}），"
+                    "已停笔避免把残留线画进成品；请在小程序画板上手动擦除后重新开始"
+                ))
             warn({
                 "message": f"工具条自动探测失败（{exc.code}），沿用旧校准坐标",
                 "code": "probe_failed",
@@ -2745,6 +3060,7 @@ class ExecutorService:
         dy: float,
         *,
         rect: Rect | None = None,
+        hwnd: int | None = None,
         window_title: str | None = None,
         capture_method: str | None = None,
         snapshot_id: str | None = None,
@@ -2774,9 +3090,17 @@ class ExecutorService:
             legacy_slider = stored.slider
             legacy_undo = self._point_dict(stored.undo)
             legacy_fold = self._point_dict(stored.fold)
+        # B1：窗口缩小时旧帧遗留坐标可能已出当前帧，入库前统一裁剪。
+        fw = frame_w or int(getattr(calibration, "frame_w", 0) or 0)
+        fh = frame_h or int(getattr(calibration, "frame_h", 0) or 0)
+        if fw > 0 and fh > 0:
+            legacy_slider = self._clamp_point_dict(legacy_slider, fw, fh)
+            legacy_undo = self._clamp_point_dict(legacy_undo, fw, fh)
+            legacy_fold = self._clamp_point_dict(legacy_fold, fw, fh)
+            stored_collapsed = self._clamp_dict_to_frame(stored_collapsed, fw, fh)
         self._store.save_calibration(
             project_id=project_id,
-            hwnd=calibration.hwnd,  # type: ignore[attr-defined]
+            hwnd=hwnd if hwnd is not None else calibration.hwnd,  # type: ignore[attr-defined]
             window_title=(
                 window_title
                 if window_title is not None

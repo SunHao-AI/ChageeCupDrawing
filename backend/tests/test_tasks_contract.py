@@ -24,6 +24,40 @@ SESSION_TOKEN = "task-test-token"
 WRITE_HEADERS = {"X-Requested-With": "cupdraw"}
 GOOD_HWND = 1234
 
+# 校准里滑杆轨道的截图坐标（画布下方工具条区，与 _screenshot 底图不冲突）。
+SLIDER_TRACK = {"x": 200, "y": 720, "w": 200, "h": 10}
+
+
+class _ContractCalibrator:
+    """契约测试用假标定器：直接给出单档宽度表，不做真实测宽。
+
+    本文件的职责是任务 API / 生命周期契约；笔宽标定由 test_exec_tiered_width
+    专测。B4 宽度门禁上线后，autoWidth=true 且无滑杆坐标会阻断落笔，这里连同
+    滑杆坐标一起在 _ready_project 里补齐，走「标定成功」的正路。
+    """
+
+    TEST_MARGIN = 6
+    TEST_LINE_LEN = 46
+    MIN_SPREAD_RATIO = 0.18
+    TRACK_EDGE_INSET = 0.12
+
+    def __init__(self, **_kwargs) -> None:
+        pass
+
+    def run(self, **_kwargs):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            table=SimpleNamespace(tiers=[[0.0, 6.0]]), width_spread=0.5
+        )
+
+
+@pytest.fixture(autouse=True)
+def _fake_pen_calibrator(monkeypatch):
+    import app.executor.service as service_module
+
+    monkeypatch.setattr(service_module, "PenCalibrator", _ContractCalibrator)
+
 
 def _screenshot(shift: int = 0) -> np.ndarray:
     image = Image.new("RGB", (600, 900), (200, 200, 200))
@@ -237,7 +271,8 @@ def _ready_project(client: TestClient) -> str:
     ).json()
     cal = client.post(
         f"/api/projects/{project['projectId']}/calibration",
-        json={"hwnd": GOOD_HWND, "mode": "manual", "rect": {"x": 155, "y": 205, "w": 291, "h": 441}},
+        json={"hwnd": GOOD_HWND, "mode": "manual", "rect": {"x": 155, "y": 205, "w": 291, "h": 441},
+              "slider": SLIDER_TRACK},
         headers=WRITE_HEADERS,
     )
     assert cal.status_code == 200, cal.text
@@ -734,7 +769,8 @@ def _ready_project_with_ids(client: TestClient) -> tuple[str, str]:
     ).json()
     client.post(
         f"/api/projects/{project['projectId']}/calibration",
-        json={"hwnd": GOOD_HWND, "mode": "manual", "rect": {"x": 155, "y": 205, "w": 291, "h": 441}},
+        json={"hwnd": GOOD_HWND, "mode": "manual", "rect": {"x": 155, "y": 205, "w": 291, "h": 441},
+              "slider": SLIDER_TRACK},
         headers=WRITE_HEADERS,
     )
     plan = client.post(
@@ -750,6 +786,7 @@ def _mark_undo(client: TestClient, project_id: str, point: dict) -> None:
             "hwnd": GOOD_HWND, "mode": "manual",
             "rect": {"x": 155, "y": 205, "w": 291, "h": 441},
             "undo": point,
+            "slider": SLIDER_TRACK,
         },
         headers=WRITE_HEADERS,
     )
@@ -1238,6 +1275,7 @@ def test_create_task_accepts_frontend_exec_payload(
         "noCoalesce": True,
         "shortStrokeProtect": True,
         "shortStrokeThresholdPx": 1.2,
+        "minStrokeTravelPx": 10,
         "focusGuard": True,
         "cursorTakeoverPx": 6,
         "guardPollMs": 50,

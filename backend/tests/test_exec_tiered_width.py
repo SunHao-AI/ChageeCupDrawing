@@ -326,7 +326,7 @@ def test_slider_click_uses_current_frame_canvas(monkeypatch) -> None:
 
     monkeypatch.setattr(service, "detect_canvas_rect", detect)
     monkeypatch.setattr(panel_control, "detect_canvas_rect", detect)
-    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths, _table=None: BUCKET_EDGES)
     calibration = _calibration(tools_open=_tools(slider=SLIDER_LOW))
     # 校准矩形与折叠态画布一致，避免漂移拦截（本用例只关心守卫矩形）。
     calibration.rect_x, calibration.rect_y = 0, 0
@@ -425,7 +425,7 @@ def test_fold_failure_after_width_switch_rechecks_mapping(monkeypatch) -> None:
 
     monkeypatch.setattr(service, "detect_canvas_rect", detect)
     monkeypatch.setattr(panel_control, "detect_canvas_rect", detect)
-    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths, _table=None: BUCKET_EDGES)
     real_fold = panel_control.PanelController.fold
     folds = {"n": 0}
 
@@ -494,7 +494,7 @@ def test_calibration_stop_reports_cursor_and_total(monkeypatch) -> None:
 def test_buckets_switch_only_when_crossing(monkeypatch) -> None:
     # 0.95 → 桶 19（第 20 档）；0.93 与 0.90 同落桶 18（第 19 档）：只换一次宽。
     # 先细后粗：桶 18 先画（点位 0.90），桶 19 最后画（点位 0.95）。
-    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths, _table=None: BUCKET_EDGES)
     store = FakeStore(_calibration(tools_open=_tools(brush=None)))
     board = FakeBoard(open_=True)
     params = ExecParams(auto_width=True, width_table=TABLE_3, width_tolerance=0.05)
@@ -512,6 +512,56 @@ def test_buckets_switch_only_when_crossing(monkeypatch) -> None:
     assert store.status == "DONE"
     assert any("已切换第 20 档笔宽（目标行程 0.95）" in m for m in store.warnings())
     assert any("已切换第 19 档笔宽（目标行程 0.90）" in m for m in store.warnings())
+
+
+def test_slider_click_clamped_to_width_table_span(monkeypatch) -> None:
+    """B7：桶下缘行程低于宽度表实测行程时，点击必须钳到表内最小行程。
+
+    真机复现：标定点击在轨道两端内缩 12%（宽度表行程 0.12~0.88），执行器却按
+    裸桶下缘 0.00/0.05 点到 x≈98/127（轨道左缘外），笔宽≈0，最细两档整段零墨
+    （画布上只出零星点）。行程高于表内最大值时同理钳上缘。
+    """
+    narrow = ((0.12, 6.0), (0.31, 8.0))
+    # 桶 0/1/2（下缘 0.00/0.05/0.10）全部低于 0.12；桶 7 下缘 0.35 高于 0.31。
+    monkeypatch.setattr(
+        pen_order, "target_fractions", lambda _paths, _table=None: [0.0, 0.05, 0.1, 0.35]
+    )
+    store = FakeStore(_calibration(tools_open=_tools(brush=None)))
+    board = FakeBoard(open_=True)
+    params = ExecParams(auto_width=True, width_table=narrow, width_tolerance=0.05)
+
+    mouse = _run(store, board, _paths(4), params)
+
+    clicks = _slider_clicks(mouse)
+    lo = TRACK["x"] + TRACK["w"] * 0.12
+    hi = TRACK["x"] + TRACK["w"] * 0.31
+    assert [round(x, 3) for x, _ in clicks] == [
+        round(lo, 3), round(lo, 3), round(lo, 3), round(hi, 3),
+    ]
+    warnings = store.warnings()
+    assert any("已切换第 1 档笔宽（目标行程 0.12）" in m for m in warnings)
+    assert any("已切换第 8 档笔宽（目标行程 0.31）" in m for m in warnings)
+    assert len(mouse.drags) == 4
+
+
+def test_incomplete_fingerprint_blind_clicks_brush() -> None:
+    """B7b：指纹不完整时盲点画笔格（幂等），绝不在橡皮态落笔。
+
+    真机复现：用户手擦画布后工具停在橡皮态，折叠态学到的位图无画笔指纹
+    → 旧逻辑直接跳过校验 → 标定测试线全变成擦除（E_CALIBRATION_NO_INK）。
+    """
+    store = FakeStore(
+        _calibration(tools_open=_tools(selected_lum=None, idle_lum=None))
+    )
+    board = FakeBoard(open_=True, tool="eraser")
+    params = ExecParams(auto_width=True, width_table=((0.0, 3.0),))
+
+    mouse = _run(store, board, _paths(1), params)
+
+    assert BRUSH_OPEN in mouse.clicks  # 盲点过一次画笔格
+    assert board.tool == "brush"  # 落笔前已回到画笔态
+    assert len(mouse.drags) == 1
+    assert any("已盲点画笔格" in m for m in store.warnings())
 
 
 def test_brush_state_enforced_before_first_stroke() -> None:
@@ -584,7 +634,7 @@ def test_unfold_failure_skips_brush_guard() -> None:
 
 
 def test_never_clicks_eraser_during_draw(monkeypatch) -> None:
-    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths, _table=None: BUCKET_EDGES)
     store = FakeStore(_calibration(tools_open=_tools()))
     board = FakeBoard(open_=True, tool="brush")
     params = ExecParams(auto_width=True, width_table=TABLE_3)
@@ -654,7 +704,7 @@ def test_missing_collapsed_bitmap_triggers_rescan(monkeypatch) -> None:
 
     monkeypatch.setattr(service, "ToolbarProber", RescanProber)
     monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
-    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths, _table=None: BUCKET_EDGES)
     _CALIBRATOR_INSTANCES.clear()
     calibration = _calibration(tools_open=_tools())
     store = FakeStore(calibration)
@@ -738,7 +788,7 @@ def test_probed_bitmap_persisted_in_saved_rect_frame(monkeypatch) -> None:
     滑杆点击位置就会偏移同样距离。
     """
     dx, dy = 2, 1
-    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths, _table=None: BUCKET_EDGES)
     monkeypatch.setattr(service, "ToolbarProber", _FakeProber)
     calibration = _calibration()
     calibration.rect_x = RECT_X - dx
@@ -843,7 +893,7 @@ def test_coarse_first_breakpoint_resume_resets_cursor(monkeypatch) -> None:
     assert any("旧版笔序" in m for m in store.warnings())
     assert store.task.cursor_path == 0
     assert spawn_cursors == [0]
-    assert store.task.exec_params["widthOrder"] == 2
+    assert store.task.exec_params["widthOrder"] == service.WIDTH_ORDER_VERSION
 
     # 单档宽度表不涉及重排，旧断点仍可安全续画（不重置）。
     store.task.status = "STOPPED"
@@ -858,7 +908,7 @@ def test_coarse_first_breakpoint_resume_resets_cursor(monkeypatch) -> None:
 
 
 def test_resume_recomputes_identical_sequence(monkeypatch) -> None:
-    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths, _table=None: BUCKET_EDGES)
     store = FakeStore(_calibration(tools_open=_tools()))
     svc = _service(store, FakeMouse(FakeBoard()))
     params = ExecParams(auto_width=True, width_table=TABLE_3, width_tolerance=0.05)
@@ -907,7 +957,7 @@ def test_legacy_profile_single_bitmap_fallback(monkeypatch) -> None:
             raise ProbeError("E_PROBE_NO_TOOLBAR", "工具条区域未探到任何控件")
 
     monkeypatch.setattr(service, "ToolbarProber", FailingProber)
-    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths, _table=None: BUCKET_EDGES)
     store = FakeStore(_calibration())  # 旧校准：无 tools_open / tools_collapsed
     board = FakeBoard(open_=True)
     params = ExecParams(auto_width=True, width_table=TABLE_3)
@@ -943,7 +993,7 @@ def test_probe_bootstraps_calibration_without_manual_anchors(monkeypatch) -> Non
     """全新用户：校准只有画布矩形，探测须先跑，标定才有滑杆坐标可用。"""
     monkeypatch.setattr(service, "ToolbarProber", _FakeProber)
     monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
-    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths, _table=None: BUCKET_EDGES)
     _CALIBRATOR_INSTANCES.clear()
     calibration = _calibration(tools_open=None, slider=None, fold=None)
     store = FakeStore(calibration)
@@ -1002,7 +1052,7 @@ def test_probe_runs_before_brush_guard_and_calibration(monkeypatch) -> None:
     monkeypatch.setattr(service, "ToolbarProber", EventProber)
     monkeypatch.setattr(service, "PenCalibrator", EventCalibrator)
     # 保证绘制期跨桶换宽，从而产生「标定之后」的滑杆点击。
-    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths: BUCKET_EDGES)
+    monkeypatch.setattr(pen_order, "target_fractions", lambda _paths, _table=None: BUCKET_EDGES)
     calibration = _calibration(tools_open=None, slider=None, fold=None)
     store = FakeStore(calibration)
     params = ExecParams(auto_width=True, width_table=None, width_tolerance=0.05)
@@ -1042,15 +1092,15 @@ def test_probe_skipped_when_canvas_not_blank(monkeypatch) -> None:
     board = _InkedBoard(open_=True)
     params = ExecParams(auto_width=True, width_table=None, width_tolerance=0.05)
 
-    mouse = _run(store, board, _paths(1), params)
-
+    # B4 宽度门禁：无滑杆坐标 → 笔宽 = 滑杆停留位置（不可知），必须阻断而非
+    # 静默「单细笔」画完（真机曾以 23px 最粗档画废整幅）。
+    with pytest.raises(TaskError) as excinfo:
+        _run(store, board, _paths(1), params)
+    assert excinfo.value.code == "E_WIDTH_UNKNOWN"
     assert prober_calls == []  # 探测根本未启动
     assert store.saved == []  # 没有写入任何探测结果
     assert any("画布上已有笔迹，已跳过工具条自动探测" in m for m in store.warnings())
-    # 沿用既有降级：无滑杆 → 单细笔绘制，仍完成任务。
     assert any("未标定粗细滑杆" in m for m in store.warnings())
-    assert len(mouse.drags) == 1
-    assert store.status == "DONE"
 
 
 def _warning_codes(store: FakeStore) -> list[str | None]:
@@ -1084,6 +1134,100 @@ def test_probe_runs_without_auto_width(monkeypatch) -> None:
     assert board.open is False  # 探测展开的面板已就地折回
     assert len(mouse.drags) == 2
     assert store.status == "DONE"
+
+
+def test_b4_width_gate_homes_slider_when_track_visible(monkeypatch) -> None:
+    """B4：标定被跳过但轨道可见 → 点轨道最左归位细档、带告警继续绘制。"""
+    monkeypatch.setattr(service, "ToolbarProber", _FakeProber)
+    monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
+    _CALIBRATOR_INSTANCES.clear()
+    # undo=None + 脏画布 → 标定跳过（不敢画测试线），进入 B4 归位分支。
+    calibration = _calibration(tools_open=_tools(undo=None))
+    calibration.undo = None
+    store = FakeStore(calibration)
+    board = _InkedBoard(open_=True)
+    params = ExecParams(auto_width=True, width_table=None, width_tolerance=0.05)
+
+    mouse = _run(store, board, _paths(2), params)
+
+    assert any("未标记撤销按钮" in m for m in store.warnings())
+    assert any("已把粗细滑杆归位到最细档" in m for m in store.warnings())
+    homing = [(x, y) for x, y in mouse.clicks
+              if TRACK["y"] <= y <= TRACK["y"] + TRACK["h"]]
+    assert homing and abs(homing[0][0] - (TRACK["x"] + 2.0)) < 1.0  # 轨道最左端
+    assert store.status == "DONE"
+    assert len(mouse.drags) == 2  # 归位后继续正常绘制
+
+
+def test_b4_width_gate_blocks_when_track_invisible(monkeypatch) -> None:
+    """B4：标定被跳过且面板无法展开（轨道不可见）→ 阻断 E_WIDTH_UNKNOWN。
+
+    真机即此场景：fold 坐标出帧导致展开失败，若放行则全程按滑杆停留的
+    最粗档落笔（23px 黑块）。必须阻断而不是静默「单细笔」。
+    """
+
+    class _StuckFoldBoard(FakeBoard):
+        def image(self) -> np.ndarray:
+            grid = super().image()
+            if not self.open:
+                l, t, r, b = CANVAS
+                grid[t:b, l:r] = 255  # 折叠态画布扩大，盖住滑杆轨道
+            return grid
+
+    board = _StuckFoldBoard(open_=False, toggle_enabled=False)
+    monkeypatch.setattr(service, "ToolbarProber", _FakeProber)
+    monkeypatch.setattr(service, "PenCalibrator", _FakeCalibrator)
+    _CALIBRATOR_INSTANCES.clear()
+    calibration = _calibration(tools_open=_tools())
+    calibration.tools_collapsed = _tools(fold=FOLD)
+    store = FakeStore(calibration)
+    params = ExecParams(auto_width=True, width_table=None, width_tolerance=0.05)
+    mouse = FakeMouse(board)
+
+    with pytest.raises(TaskError) as excinfo:
+        _run(store, board, _paths(2), params, mouse=mouse)
+    assert excinfo.value.code == "E_WIDTH_UNKNOWN"
+    assert any("面板无法展开" in m for m in store.warnings())
+    assert store.status != "DONE"
+    # 阻断必须发生在任何落笔之前。
+    assert mouse.drags == []
+
+
+def test_hover_exclude_rects_cover_undo_redo_pair() -> None:
+    """B5：豁免区必须盖住悬浮撤销+重做整组（真机判脏源是右侧重做按钮）。"""
+    calibration = _calibration(tools_open=_tools())
+    calibration.rect_x, calibration.rect_y = 96, 203
+    calibration.undo = {"x": 98.0, "y": 920.0}  # saved_rect 帧
+    calibration.tools_collapsed = None
+    region = (96, 203, 530, 796)  # 与 saved_rect 同帧 → 平移量 0
+    rects = service.ExecutorService._hover_exclude_rects(
+        service.ExecutorService.__new__(service.ExecutorService), calibration, region
+    )
+    assert rects
+    x, y, w, h = rects[0]
+    assert x <= 98 - 17 and x + w >= 146 + 17  # 撤销钮左缘到重做钮右缘
+    assert y <= 920 - 17 and y + h >= 920 + 17
+
+
+def test_hover_exclude_survives_undo_outside_canvas_left_edge() -> None:
+    """B5 真机回归：撤销钮 x=70 悬在画布左缘(96)外，画布内重做钮仍须被豁免。
+
+    旧实现在撤销点落在画布外时 continue 跳过整组豁免，导致画布内重做钮 420px
+    未被挖掉 → 空画布误判 E_CANVAS_DIRTY，校准死锁。
+    """
+    calibration = _calibration(tools_open=_tools())
+    calibration.rect_x, calibration.rect_y = 96, 203
+    calibration.undo = {"x": 70.0, "y": 920.0}  # 撤销点 x 小于画布左缘
+    calibration.tools_collapsed = None
+    region = (96, 203, 530, 765)
+    rects = service.ExecutorService._hover_exclude_rects(
+        service.ExecutorService.__new__(service.ExecutorService), calibration, region
+    )
+    assert rects
+    x, y, w, h = rects[0]
+    # 平移到当前帧后撤销点在 70,920；重做钮中心约 146,920（真机 bbox 130-163,901-936）。
+    assert x <= 96 and x + w >= 163  # 覆盖到画布内的重做钮右缘
+    assert y <= 901 and y + h >= 936
 
 
 def test_probe_skipped_dirty_warning_carries_code(monkeypatch) -> None:
@@ -1148,3 +1292,33 @@ def test_canvas_blank_gate_uses_pixels_not_fraction() -> None:
     residue = blank.copy()
     residue[250:253, 250:296] = 0  # 46×3 = 138 px，正是探测测试线的量级
     assert svc._canvas_is_blank(_ImageTarget(residue), rect, calibration) is False
+
+
+def test_short_strokes_stretched_to_min_travel() -> None:
+    """F3: strokes shorter than the board's min travel are stretched in-place.
+
+    The real board drops every stroke under ~8px of travel (AB-proven); the
+    executor must extend them along their own direction before dragging, and
+    single-point strokes must never go through a zero-displacement click.
+    """
+    board = FakeBoard()
+    store = FakeStore(_calibration(tools_open=_tools()))
+    params = ExecParams(auto_width=False)
+    paths = [[(300.0, 300.0)], [(400.0, 400.0), (401.0, 401.0)]]
+
+    mouse = _run(store, board, paths, params)
+
+    canvas_clicks = [
+        c for c in mouse.clicks
+        if CANVAS[1] <= c[1] <= CANVAS[3] and CANVAS[0] <= c[0] <= CANVAS[2]
+    ]
+    assert canvas_clicks == []  # no zero-disp click inside the canvas
+    strokes = [d for d in mouse.drags if CANVAS[1] <= d[0][1] <= CANVAS[3]]
+    assert len(strokes) == 2
+    for d in strokes:
+        assert len(d) == 2
+        travel = ((d[1][0] - d[0][0]) ** 2 + (d[1][1] - d[0][1]) ** 2) ** 0.5
+        assert travel >= params.min_stroke_travel_px - 1e-6
+    # The diagonal stub keeps its 45-degree direction after stretching.
+    d = strokes[1]
+    assert abs((d[1][0] - d[0][0]) - (d[1][1] - d[0][1])) < 1e-6

@@ -123,6 +123,8 @@ class ExecParamsModel(CamelModel):
     no_coalesce: bool = True
     short_stroke_protect: bool = True
     short_stroke_threshold_px: float = Field(default=1.2, ge=0.0, le=20.0)
+    # 落笔最小行程（屏幕 px）：短于此的笔画沿方向拉伸后再画（画布对超短笔不出墨）。
+    min_stroke_travel_px: float = Field(default=10.0, ge=0.0, le=40.0)
     focus_guard: bool = True
     cursor_takeover_px: float = Field(default=6.0, ge=2.0, le=100.0)
     guard_poll_ms: float = Field(default=50.0, ge=10.0, le=500.0)

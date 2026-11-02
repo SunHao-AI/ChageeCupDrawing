@@ -58,6 +58,9 @@ class ProbeError(Exception):
         self.code = code
         self.message = message
         self.partial: "ToolBitmap | None" = None
+        # E_PROBE_UNCLEANED 的结构化残留信息（B6）：{"residualPx": int,
+        # "region": (x, y, w, h)}，前端据此引导用户手擦残留线。
+        self.detail: dict | None = None
 
 
 class SliderProbe(Protocol):
@@ -1685,8 +1688,7 @@ class ToolbarProber:
         # 行级横向跨度门：画布左缘投影是 ~12px 宽、纵贯画布全高的暗列，若按
         # 单候选邻域 ink 计数会被逐行整列误登记（真机阴影列 ink 125~236）；
         # 撤销胶囊整行（撤销+重做两图标）横占 ~80 列，要求该行全宽内容列总数
-        # 达 STRIP_ROW_MIN_COLS 才登记（登记点仍只取左半 x < strip_left，
-        # 重做半区永不成为候选），阴影行被整体滤除。
+        # 达 STRIP_ROW_MIN_COLS 才登记，阴影行被整体滤除。
         strip: list[tuple[int, int]] = []
         strip_left = int(float(canvas[0]) + self.CANDIDATE_STEP)
         for k in range(1, self.CAPSULE_STRIP_ROWS + 1):
@@ -1704,7 +1706,21 @@ class ToolbarProber:
             )
             if content_cols.size < self.STRIP_ROW_MIN_COLS:
                 continue
+            # 撤销半区门：胶囊 = 撤销（左半）+ 重做（右半），以本行内容跨度的
+            # 中点为分界只登记左半候选。真机胶囊内容 x≈23..120：撤销图标
+            # （x≈23..78）的网格点全在跨度中点（≈71）之左照常登记，重做中心
+            # （x≈98）出界——重做一旦进候选面 + 画布内豁免，点它=「复活已撤
+            # 笔迹」（真机误学 (98,920) 后清理越清越多、用户旧稿整叠复活，
+            # 全链瘫痪）。clamp 到 [1,2] 网格步长：跨度被杂点拉宽时不放行右半，
+            # 单图标窄行时不砍掉撤销自身。
+            left_edge = int(content_cols.min())
+            half_span = (int(content_cols.max()) - left_edge) / 2.0
+            undo_right = left_edge + min(
+                2 * self.CANDIDATE_STEP, max(self.CANDIDATE_STEP, half_span)
+            )
             for x in range(self.CANDIDATE_STEP // 2, strip_left, self.CANDIDATE_STEP):
+                if x > undo_right:
+                    break
                 crop = gray[max(0, y - half) : y + half + 1, max(0, x - half) : x + half + 1]
                 delta = np.abs(crop.astype(np.int16) - background)
                 ink = int((delta > self.CONTENT_ROW_DELTA).sum())
@@ -2179,7 +2195,11 @@ class ToolbarProber:
         整个底部栏，旧帧候选网格随之失效（撤销胶囊上移进画布内，再也选不中）。
         """
         tried = self._undo_tried
-        strip = [p for p in self._strip_candidates if p not in tried]
+        # 胶囊带行内按 x 升序：撤销恒在重做之左，先左后右让撤销恒先命中（带内
+        # 点数个位数，不改变覆盖面）。
+        strip = sorted(
+            (p for p in self._strip_candidates if p not in tried), key=lambda p: p[0]
+        )
         left_limit = float(self._canvas[0]) + self.CANDIDATE_STEP
         left_col = [
             p
@@ -2286,6 +2306,22 @@ class ToolbarProber:
                     f"default_order={default_order} canvas={self._canvas}",
                     flush=True,
                 )
+            if (
+                self._band_ink_pixels(after)
+                >= self._band_ink_pixels(before_frame) + self.BAND_LINE_MIN_NEW_PX
+            ):
+                # 复活点击：带内墨量明显上涨。撤销只会让墨量不增，唯一能涨的
+                # 是「重做」把刚撤掉的笔迹补回——撤销锚点尚未建立时镜像半区
+                # 剔除不生效，胶囊带的重做图标可能先进候选面（真机误学重做位后
+                # 反应复验同样二次通过：重做图标每次点击都明暗互换，行带反应判据
+                # 对它无判别力）。当场证伪：本格 + 同行右邻镜像半区一并烧进
+                # 已试集合，绝不让「墨量涨回基线」流进反应复验被误认成撤销。
+                self._undo_tried.add(point)
+                for dx_step in range(1, self.UNDO_MIRROR_EXCLUDE_STEPS + 1):
+                    self._undo_tried.add(
+                        (point[0] + dx_step * self.CANDIDATE_STEP, point[1])
+                    )
+                continue
             if occupied < baseline * self.UNDO_DROP_RATIO:
                 # 这一击已消耗掉一笔探测笔迹，清理时不再重复撤销。
                 self._probe_undos += 1
@@ -2367,11 +2403,17 @@ class ToolbarProber:
                         f"occ2={ink_occupied_fraction(after2, self._band):.4f}",
                         flush=True,
                     )
-                # 只认「行带二次反应」，不认「二次点击后墨量跌落」：橡皮类
-                # 干扰控件连点两次同样会把墨量砍下阈值，跌落判据对它无判别力；
-                # 撤销/重做图标每次点击都明暗互换，行带反应才是撤销专属指纹。
-                if self._rowband_changed_px(after, after2, point[1]) >= (
-                    self.UNDO_REACTIVE_MIN_PX
+                # 二次证据二选一：①行带二次反应（撤销/重做图标明暗互换）；
+                # ②墨量跌到撤销阈值——撤销撤到底后按钮置灰、行带不再反应，
+                # 真机实测 (70,920) 三次「一击有反应、二击墨归零但二次无反应」
+                # 被纯反应判据误杀，真撤销学不到、带空后陈旧基线又把重做位
+                # (98,920) 撞成假命中。该窗口原地 click 对橡皮/画笔态完全
+                # 无效（零位移点击不落墨），墨量暴跌只可能来自撤销，安全。
+                occupied2 = ink_occupied_fraction(after2, self._band)
+                if (
+                    self._rowband_changed_px(after, after2, point[1])
+                    >= self.UNDO_REACTIVE_MIN_PX
+                    or occupied2 < baseline * self.UNDO_DROP_RATIO
                 ):
                     self._probe_undos += 2
                     found = (float(point[0]), float(point[1]))
@@ -2387,7 +2429,11 @@ class ToolbarProber:
                 # 重画一条线，不能再叠加一笔，否则撤销一次只掉一层、判据失真。
                 if not self._ensure_drawing_tool(skip, check_stop, allowed=allowed):
                     return None
-                baseline = max(baseline, self._band_occupied())
+                # 按重描后的实际墨量重新锚定基线：带内墨已被撤销/橡皮带走时，
+                # 旧基线里含已被撤掉的残留墨，陈旧的大基线会让后续候选点拿
+                # 「假跌落」撞成撤销假命中（真机带撤空后 (98,920) 因此被误学，
+                # 清理点重做又把用户旧稿整叠复活）。
+                baseline = self._band_occupied()
         return None
 
     def _ensure_drawing_tool(
@@ -2626,10 +2672,12 @@ class ToolbarProber:
         if undo is None:
             if self._band_ink_pixels() <= tolerance:
                 return
-            raise ProbeError(
+            exc = ProbeError(
                 "E_PROBE_UNCLEANED",
                 "探测笔迹无法清理（未识别撤销按钮），请人工清空刻度带或补标撤销",
             )
+            exc.detail = self._residual_detail(tolerance)
+            raise exc
         remaining = max(0, self._probe_strokes - self._probe_undos)
         sx, sy = self._to_screen(float(undo[0]), float(undo[1]))
         print(
@@ -2657,9 +2705,19 @@ class ToolbarProber:
                 f"[DBG-CLEAR] FAIL ink={self._band_ink_pixels()} > tolerance={tolerance}",
                 flush=True,
             )
-            raise ProbeError(
+            exc = ProbeError(
                 "E_PROBE_UNCLEANED", "探测笔迹未能撤销干净（撤销点击无效或笔迹过多）"
             )
+            exc.detail = self._residual_detail(tolerance)
+            raise exc
+
+    def _residual_detail(self, tolerance: int) -> dict:
+        """B6：残留墨量与所在区域（截图坐标），供上层引导用户精准手擦。"""
+        x0, y0, w, h = self._band
+        return {
+            "residualPx": self._band_ink_pixels() - tolerance,
+            "region": (int(x0), int(y0), int(w), int(h)),
+        }
 
     # ---------- 底层动作（可由子类替换以便测试） ----------
 

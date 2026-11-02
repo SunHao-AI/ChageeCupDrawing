@@ -47,9 +47,11 @@ def _near(rect, point, tol=8):
 class FakeDevice:
     def __init__(self, board: ToolbarBoard) -> None:
         self.board = board
+        # 存活句柄集合；重绑定用例把它换成新句柄模拟画板页重进。
+        self.alive_handles = {HWND}
 
     def alive(self, hwnd: int) -> bool:
-        return hwnd == HWND
+        return hwnd in self.alive_handles
 
     def capture(self, hwnd: int, prefer: str | None = None) -> CaptureResult:
         return CaptureResult(image=self.board.image(), method="maa")
@@ -58,10 +60,15 @@ class FakeDevice:
         return ClientArea(0, 0, 600, 700)  # 与图像同尺寸 → to_screen 恒等
 
     def title(self, hwnd: int) -> str:
-        return "霸王茶姬"
+        return "霸王茶姬" if hwnd in self.alive_handles else ""
 
     def dpi_scale(self, hwnd: int) -> float:
         return 1.0
+
+    def list_windows(self):
+        return [
+            SimpleNamespace(hwnd=h, title="霸王茶姬") for h in sorted(self.alive_handles)
+        ]
 
 
 class FakeProbe:
@@ -387,6 +394,79 @@ def test_partial_probe_failure_persists_success(tmp_path, monkeypatch):
 
 
 # ---------- 并发与中止 ----------
+
+
+def test_partial_probe_clamps_out_of_frame_and_reports_honestly(tmp_path, monkeypatch):
+    """B1+B2：窗口缩小后旧帧 fold 已出帧——落库前裁剪，savedSteps 不虚报。
+
+    真机翻车链：半残 fold 坐标伪装成能力入库 → 绘制期展开面板点空 → 标定跳过
+    → 整幅按滑杆停留档（23px 最粗）画废。修复后出帧坐标必须置 None，且
+    savedSteps 只列本轮学到且帧内有效的字段，与 failedSteps 互斥。
+    """
+    board = ToolbarBoard()
+    store, svc = _make(tmp_path, board, monkeypatch)
+    stale_fold = [40.0, 1291.0]  # 旧窗口（1353 高）的折叠钮，当前帧 700 高已出帧
+    _seed_calibration(
+        store,
+        fold={"x": stale_fold[0], "y": stale_fold[1]},
+        tools_open={
+            "brush": list(_center(ToolbarBoard.BRUSH)),
+            "eraser": list(_center(ToolbarBoard.ERASER)),
+            "slider": {"x": ToolbarBoard.SLIDER[0], "y": ToolbarBoard.SLIDER[1],
+                       "w": ToolbarBoard.SLIDER[2], "h": ToolbarBoard.SLIDER[3]},
+            "undo": list(_center(ToolbarBoard.UNDO)),
+            "fold": stale_fold,
+            "brush_selected_lum": 180.0,
+            "brush_idle_lum": 250.0,
+        },
+    )
+
+    class FailingProber(toolbar_probe.ToolbarProber):
+        def run(self, **_kwargs):
+            exc = toolbar_probe.ProbeError(
+                "E_PROBE_UNCLEANED", "模拟：半途失败，只学到撤销")
+            exc.partial = toolbar_probe.ToolBitmap(
+                brush=None, eraser=None, slider=None,
+                undo=_center(ToolbarBoard.UNDO), fold=None,
+                brush_selected_lum=None, brush_idle_lum=None,
+            )
+            raise exc
+
+    monkeypatch.setattr(service, "ToolbarProber", FailingProber)
+    with pytest.raises(TaskError) as exc:
+        svc.auto_calibrate("p1", hwnd=HWND)
+    detail = exc.value.detail
+    assert detail["saved"] is True
+    assert "canvas" in detail["savedSteps"]
+    assert "undo" in detail["savedSteps"]  # 本轮学到且帧内
+    assert "fold" not in detail["savedSteps"]  # 回落的旧帧值不算学到（B2）
+    assert "fold" in detail["failedSteps"]
+    assert set(detail["savedSteps"]) & set(detail["failedSteps"]) == set()
+
+    after = store.latest_calibration("p1")
+    assert after is not None
+    assert after.fold is None  # 出帧回落值不得入库（B1）
+    assert after.tools_open and after.tools_open.get("fold") is None
+    assert after.tools_open.get("undo") is not None
+
+
+def test_calibration_persists_live_hwnd_after_rebind(tmp_path, monkeypatch):
+    """B3：画板页重进句柄变化后，校准必须按本轮实际句柄落库。
+
+    旧实现存的是上一条记录的句柄 + 空标题，后续 clear-canvas 按死句柄找窗口
+    直接 E_WINDOW_LOST，且标题为空连按标题重绑的自救都走不了。
+    """
+    board = ToolbarBoard()
+    store, svc = _make(tmp_path, board, monkeypatch)
+    _seed_calibration(store)
+    new_hwnd = 9999
+    svc._device.alive_handles = {new_hwnd}  # 老句柄死亡，只剩同名新窗口
+
+    result = svc.auto_calibrate("p1")
+    assert result["calibrationId"] is not None
+    after = store.latest_calibration("p1")
+    assert after.hwnd == new_hwnd
+    assert after.window_title == "霸王茶姬"
 
 
 def test_concurrent_auto_calibrate_conflicts(tmp_path, monkeypatch):

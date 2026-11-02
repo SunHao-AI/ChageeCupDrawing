@@ -66,6 +66,33 @@ def test_adaptive_detects_faint_ink_on_textured_background() -> None:
     assert not is_blank(textured, REGION, None)
 
 
+def test_hover_undo_button_excluded_from_blankness() -> None:
+    """B5：常驻悬浮撤销按钮（锚定画布左下）不再把空白画布误判为脏。"""
+    image = _blank_canvas()
+    # 悬浮撤销按钮：深灰圆钮，直径 ~34px → 墨像素 ~900 ≫ BLANK_MIN_PIXELS
+    cy, cx = 250, 40
+    yy, xx = np.ogrid[:300, :400]
+    button = (yy - cy) ** 2 + (xx - cx) ** 2 <= 17 ** 2
+    image[button] = (70, 70, 70)
+    assert not is_blank(image, REGION, None)  # 无豁免：判脏（真机现场）
+
+    exclude = ((cx - 16, cy - 16, 32, 32),)
+    assert is_blank(image, REGION, None, exclude)  # 豁免后：判空白
+    # 基线学习同样豁免：按钮不进基线掩码。
+    baseline = learn_baseline(image, REGION, exclude)
+    assert is_blank(image, REGION, baseline, exclude)
+    # 豁免区之外的真墨线仍必须判脏（宁小勿大不被滥用）。
+    image[100:104, 150:250] = 30
+    assert not is_blank(image, REGION, None, exclude)
+    assert not is_blank(image, REGION, baseline, exclude)
+
+
+def test_excluded_region_outside_canvas_is_harmless() -> None:
+    """豁免矩形与画布无交集时不影响判定（矩形坐标按画布系换算）。"""
+    image = _with_ink(2)
+    assert not is_blank(image, REGION, None, ((1000, 1000, 32, 32),))
+
+
 def test_baseline_learns_watermark_and_tolerates_it() -> None:
     """常驻浅色水印进基线后不再让画布被判有墨。
 
